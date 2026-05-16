@@ -658,19 +658,15 @@ def _earnings_score(ticker_obj: yf.Ticker) -> float | None:
 
 
 def _get_sentiment_score(ticker: str) -> float | None:
-    """Return 0–100 sentiment score from cache or Alpha Vantage. Fails fast if rate-limited."""
+    """Return 0–100 sentiment score from cache or Alpha Vantage.
+    No local rate-limiter here — the per-request guard lives in get_sentiment().
+    Alpha Vantage returns a Note/Information key when over-limit; we handle it gracefully."""
     api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
     if not api_key:
         return None
     cached, ts = _SENTIMENT_CACHE.get(ticker, ({}, 0.0))
     if cached and cached.get("available") and (time.time() - ts) < _SENTIMENT_TTL:
         return cached.get("sentiment_score")
-    global _SENTIMENT_LAST_CALL
-    with _SENTIMENT_LOCK:
-        now = time.time()
-        if now - _SENTIMENT_LAST_CALL < _SENTIMENT_MIN_INTERVAL:
-            return None
-        _SENTIMENT_LAST_CALL = now
     try:
         url = (
             f"https://www.alphavantage.co/query"
