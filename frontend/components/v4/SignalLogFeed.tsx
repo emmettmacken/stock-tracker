@@ -19,6 +19,26 @@ function ActionPill({ action }: { action: string }) {
   );
 }
 
+const SKIP_LABELS: Record<string, string> = {
+  hold_or_below_threshold: "Hold / below threshold",
+  already_in_position:     "Already in position",
+  earnings_within_2d:      "Earnings within 2 days",
+  data_unavailable:        "Data unavailable",
+  friday_no_entry:         "No entries on Fridays",
+  low_volume:              "Volume < 1.2× 20-day avg",
+  overextended:            "Price >15% above MA20",
+  sector_concentration:    "Sector limit (max 2)",
+  sell_signal:             "Sell signal triggered",
+  score_deterioration:     "Score fell below 40",
+};
+
+function formatSkipReason(reason: string): string {
+  if (reason.startsWith("vix_too_high:")) return `VIX too high (${reason.split(":")[1]})`;
+  if (reason.startsWith("order_failed:")) return "Order failed";
+  if (reason.startsWith("close_failed:")) return "Close failed";
+  return SKIP_LABELS[reason] ?? reason.replace(/_/g, " ");
+}
+
 function relTime(ts: string) {
   try {
     const diff = (Date.now() - new Date(ts + "Z").getTime()) / 1000;
@@ -87,7 +107,7 @@ export function SignalLogFeed({ refreshTrigger }: Props) {
             </div>
             {e.skip_reason && (
               <div className="text-zinc-600 text-[10px] mt-0.5 truncate">
-                {e.skip_reason.replace(/_/g, " ")}
+                {formatSkipReason(e.skip_reason)}
               </div>
             )}
           </div>

@@ -52,6 +52,22 @@ def init_db() -> None:
                 exit_timestamp           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+    _run_migrations()
+
+
+def _run_migrations() -> None:
+    """Add new columns to existing tables; safe to run on every startup."""
+    new_columns = [
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN current_stop REAL"),
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN stop_updated_at TIMESTAMP"),
+        ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN entry_score REAL"),
+    ]
+    with _conn() as conn:
+        for _, sql in new_columns:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass  # column already exists
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -114,6 +130,14 @@ def get_signal_log(limit: int = 50) -> list[dict]:
             "SELECT * FROM signal_log ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def update_trailing_stop(signal_id: int, new_stop: float) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE signal_log SET current_stop = ?, stop_updated_at = ? WHERE id = ?",
+            (new_stop, datetime.utcnow().isoformat(), signal_id),
+        )
 
 
 def get_last_buy_signal(ticker: str) -> Optional[dict]:

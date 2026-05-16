@@ -57,15 +57,16 @@ export function PositionsTable() {
         <table className="w-full text-xs">
           <thead>
             <tr className="border-b border-zinc-800 text-left">
-              {["Ticker", "Entry", "Current", "P&L", "Score", "ATR Stop", "Days", "Value"].map((h) => (
+              {["Ticker", "Entry", "Current", "P&L", "Score", "Trail Stop", "Days", "Value"].map((h) => (
                 <th key={h} className="py-2 pr-4 text-zinc-500 font-medium whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {positions.map((p) => {
-              const pnlPos = p.pnl_pct >= 0;
-              const atRisk = p.atr_stop != null && p.current_price < p.atr_stop * 1.05;
+              const pnlPos     = p.pnl_pct >= 0;
+              const stopPrice  = p.trailing_stop ?? p.atr_stop;
+              const atRisk     = stopPrice != null && p.current_price < stopPrice * 1.05;
               return (
                 <tr key={p.ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
                   <td className="py-2.5 pr-4 font-bold text-zinc-200">{p.ticker}</td>
@@ -82,7 +83,7 @@ export function PositionsTable() {
                     ) : <span className="text-zinc-700">—</span>}
                   </td>
                   <td className={`py-2.5 pr-4 tabular-nums ${atRisk ? "text-amber-400" : "text-zinc-500"}`}>
-                    {p.atr_stop != null ? `$${fmt(p.atr_stop)}` : "—"}
+                    {stopPrice != null ? `$${fmt(stopPrice)}` : "—"}
                     {atRisk && <span className="ml-1 text-amber-500 text-[9px]">⚠ near stop</span>}
                   </td>
                   <td className={`py-2.5 pr-4 tabular-nums ${p.days_held > 18 ? "text-amber-400" : "text-zinc-400"}`}>

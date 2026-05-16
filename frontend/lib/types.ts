@@ -181,6 +181,7 @@ export interface PaperPosition {
   pnl_pct: number;
   composite_score: number | null;
   atr_stop: number | null;
+  trailing_stop: number | null;
   days_held: number;
   qty: number;
   market_value: number;

@@ -107,6 +107,8 @@ _SENTIMENT_TTL = 900  # 15 minutes
 _SENTIMENT_LOCK = threading.Lock()
 _SENTIMENT_LAST_CALL = 0.0
 _SENTIMENT_MIN_INTERVAL = 13.0  # ~4.5 req/min, safely under the 5/min AV free-tier limit
+_SECTOR_CACHE: dict[str, tuple[str, float]] = {}  # ticker → (sector, timestamp)
+_SECTOR_TTL = 86400  # 24 hours
 
 # ── State helpers ─────────────────────────────────────────────────────────────
 
@@ -731,6 +733,19 @@ def _get_insider_score(ticker: str) -> float | None:
         return None
 
 
+def _get_sector(ticker: str) -> str:
+    """Return the sector string for a ticker, cached for 24 h."""
+    cached_sector, ts = _SECTOR_CACHE.get(ticker, ("", 0.0))
+    if cached_sector and (time.time() - ts) < _SECTOR_TTL:
+        return cached_sector
+    try:
+        sector = yf.Ticker(ticker).info.get("sector", "Unknown") or "Unknown"
+        _SECTOR_CACHE[ticker] = (sector, time.time())
+        return sector
+    except Exception:
+        return "Unknown"
+
+
 def _compute_factors(ticker: str) -> Optional[dict]:
     """Core factor computation shared by the API endpoint and the scheduler."""
     try:
@@ -771,6 +786,13 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     sent_score    = _get_sentiment_score(ticker)
     insider_score = _get_insider_score(ticker)
 
+    # Volume and overextension signals used by the signal job
+    current_vol  = float(vol[-1]) if len(vol) > 0 else 0.0
+    avg_vol_20d  = float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0
+    volume_ok    = current_vol > 1.2 * avg_vol_20d if avg_vol_20d > 0 else True
+    ma20         = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes[-1])
+    overextended = float(closes[-1]) > ma20 * 1.15
+
     factors: dict[str, Any] = {
         "hmm":       {"score": round(hmm_score, 2), "weight": 0.10, "null": False},
         "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.35, "null": mom_score is None},
@@ -791,6 +813,8 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "hmm_signal":     sig["signal"],
         "hmm_confidence": sig["confidence"],
         "current_price":  float(closes[-1]),
+        "volume_ok":      volume_ok,
+        "overextended":   overextended,
     }
 
 
@@ -1377,8 +1401,8 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
         return False
 
 
-def _position_dollars(ticker: str, equity: float, current_price: float) -> float:
-    """Vol-targeted position size in $, capped at 10 % of account equity."""
+def _position_dollars(ticker: str, equity: float, current_price: float, score: float = 75.0) -> float:
+    """Vol-targeted position size scaled by conviction score, capped at 15% of equity."""
     try:
         df = fetch_ohlcv(ticker, days=30, min_bars=22)
         c = df["Close"].values.astype(float)
@@ -1390,7 +1414,9 @@ def _position_dollars(ticker: str, equity: float, current_price: float) -> float
             weight = 0.05
     except Exception:
         weight = 0.05
-    return weight * equity
+    # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5× (capped)
+    multiplier = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
+    return weight * equity * multiplier
 
 
 def _trading_days_between(start: datetime, end: datetime) -> int:
@@ -1433,14 +1459,17 @@ def _run_signal_job() -> None:
         logger.warning("Signal job aborted: %s", err)
         return
 
+    et_now    = datetime.now(ZoneInfo("America/New_York"))
+    is_friday = et_now.weekday() == 4
+
     watchlist = [r["ticker"] for r in db.get_watchlist()]
     if not watchlist:
         logger.info("Signal job: watchlist empty")
         return
 
     try:
-        account  = api.get_account()
-        equity   = float(account.equity)
+        account   = api.get_account()
+        equity    = float(account.equity)
         positions = {p.symbol: p for p in api.get_all_positions()}
     except Exception as e:
         logger.error("Signal job: Alpaca account fetch failed: %s", e)
@@ -1448,8 +1477,15 @@ def _run_signal_job() -> None:
 
     spy_above, vix = _macro_regime()
     high_vix      = vix > 30
-    buy_threshold = 75.0 if not spy_above else 65.0
-    logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f", spy_above, vix, buy_threshold)
+    buy_threshold = 85.0 if not spy_above else 75.0
+    logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f friday=%s",
+                spy_above, vix, buy_threshold, is_friday)
+
+    # Sector counts of currently open positions
+    open_sector_counts: dict[str, int] = {}
+    for sym in positions:
+        sec = _get_sector(sym)
+        open_sector_counts[sec] = open_sector_counts.get(sec, 0) + 1
 
     for ticker in watchlist:
         try:
@@ -1463,11 +1499,25 @@ def _run_signal_job() -> None:
                 db.log_signal(ticker, None, None, "skipped", "data_unavailable", None, None)
                 continue
 
-            composite   = result["composite_score"]
-            hmm_signal  = result["hmm_signal"]
-            price       = result["current_price"]
-            atr         = _compute_atr(ticker)
-            in_pos      = ticker in positions
+            composite  = result["composite_score"]
+            hmm_signal = result["hmm_signal"]
+            price      = result["current_price"]
+            atr        = _compute_atr(ticker)
+            in_pos     = ticker in positions
+
+            # Score deterioration — close regardless of HMM signal
+            if in_pos and composite < 40.0:
+                pos = positions[ticker]
+                entry_log = db.get_last_buy_signal(ticker)
+                try:
+                    _close_and_record(api, ticker, price, float(pos.avg_entry_price),
+                                      "score_deterioration", entry_log)
+                    db.log_signal(ticker, composite, hmm_signal, "closed",
+                                  "score_deterioration", price, atr)
+                except Exception as e:
+                    db.log_signal(ticker, composite, hmm_signal, "skipped",
+                                  f"close_failed:{e}", price, atr)
+                continue
 
             if hmm_signal == "SELL" and composite < 45.0 and in_pos:
                 pos = positions[ticker]
@@ -1477,17 +1527,35 @@ def _run_signal_job() -> None:
                                       "sell_signal", entry_log)
                     db.log_signal(ticker, composite, "SELL", "closed", "sell_signal", price, atr)
                 except Exception as e:
-                    db.log_signal(ticker, composite, "SELL", "skipped", f"close_failed:{e}", price, atr)
+                    db.log_signal(ticker, composite, "SELL", "skipped",
+                                  f"close_failed:{e}", price, atr)
 
             elif hmm_signal == "BUY" and composite >= buy_threshold:
+                if is_friday:
+                    db.log_signal(ticker, composite, "BUY", "skipped",
+                                  "friday_no_entry", price, atr)
+                    continue
                 if high_vix:
                     db.log_signal(ticker, composite, "BUY", "skipped",
                                   f"vix_too_high:{vix:.1f}", price, atr)
                     continue
                 if in_pos:
-                    db.log_signal(ticker, composite, "BUY", "skipped", "already_in_position", price, atr)
+                    db.log_signal(ticker, composite, "BUY", "skipped",
+                                  "already_in_position", price, atr)
                     continue
-                dollars = _position_dollars(ticker, equity, price)
+                if not result.get("volume_ok", True):
+                    db.log_signal(ticker, composite, "BUY", "skipped", "low_volume", price, atr)
+                    continue
+                if result.get("overextended", False):
+                    db.log_signal(ticker, composite, "BUY", "skipped", "overextended", price, atr)
+                    continue
+                sector = _get_sector(ticker)
+                if sector != "Unknown" and open_sector_counts.get(sector, 0) >= 2:
+                    db.log_signal(ticker, composite, "BUY", "skipped",
+                                  "sector_concentration", price, atr)
+                    continue
+
+                dollars = _position_dollars(ticker, equity, price, composite)
                 try:
                     try:
                         api.submit_order(MarketOrderRequest(
@@ -1498,10 +1566,14 @@ def _run_signal_job() -> None:
                         api.submit_order(MarketOrderRequest(
                             symbol=ticker, qty=qty,
                             side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                    db.log_signal(ticker, composite, "BUY", "ordered", None, price, atr)
-                    logger.info("%s: BUY $%.0f score=%.1f", ticker, dollars, composite)
+                    signal_id = db.log_signal(ticker, composite, "BUY", "ordered", None, price, atr)
+                    if atr > 0:
+                        db.update_trailing_stop(signal_id, price - 1.5 * atr)
+                    open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
+                    logger.info("%s: BUY $%.0f score=%.1f sector=%s", ticker, dollars, composite, sector)
                 except Exception as e:
-                    db.log_signal(ticker, composite, "BUY", "skipped", f"order_failed:{e}", price, atr)
+                    db.log_signal(ticker, composite, "BUY", "skipped",
+                                  f"order_failed:{e}", price, atr)
             else:
                 db.log_signal(ticker, composite, hmm_signal, "skipped",
                               "hold_or_below_threshold", price, atr)
@@ -1533,12 +1605,25 @@ def _run_stoploss_job() -> None:
             entry_log   = db.get_last_buy_signal(ticker)
             if not entry_log:
                 continue
-            atr_entry  = entry_log.get("atr_at_signal") or 0.0
-            hold_days  = _trading_days_between(
+            atr_entry = entry_log.get("atr_at_signal") or 0.0
+            hold_days = _trading_days_between(
                 datetime.fromisoformat(entry_log["timestamp"]), now
             )
+
+            # Trailing stop: raise the floor as price rises
+            current_atr = _compute_atr(ticker)
+            atr_for_stop = current_atr if current_atr > 0 else atr_entry
+            stored_stop  = entry_log.get("current_stop")
+            if stored_stop is None and atr_entry > 0:
+                stored_stop = entry_price - 1.5 * atr_entry
+            if atr_for_stop > 0:
+                candidate = price - 1.5 * atr_for_stop
+                if stored_stop is None or candidate > stored_stop:
+                    stored_stop = candidate
+                    db.update_trailing_stop(entry_log["id"], stored_stop)
+
             exit_reason = None
-            if atr_entry > 0 and price < entry_price - 1.5 * atr_entry:
+            if stored_stop is not None and price < stored_stop:
                 exit_reason = "stop_loss"
             elif hold_days > 21:
                 exit_reason = "max_hold_exit"
@@ -1635,8 +1720,12 @@ def api_paper_positions():
         pnl_pct     = float(pos.unrealized_plpc) * 100
 
         entry_log = db.get_last_buy_signal(ticker)
-        atr_entry = (entry_log.get("atr_at_signal") or 0.0) if entry_log else 0.0
-        composite = (entry_log.get("composite_score")) if entry_log else None
+        atr_entry     = (entry_log.get("atr_at_signal") or 0.0) if entry_log else 0.0
+        composite     = (entry_log.get("composite_score")) if entry_log else None
+        trailing_stop = (entry_log.get("current_stop")) if entry_log else None
+        # Fall back to fixed ATR stop if trailing stop hasn't been set yet
+        if trailing_stop is None and atr_entry:
+            trailing_stop = entry_price - 1.5 * atr_entry
         hold_days = 0
         if entry_log:
             try:
@@ -1653,6 +1742,7 @@ def api_paper_positions():
             "pnl_pct":         round(pnl_pct, 2),
             "composite_score": composite,
             "atr_stop":        round(entry_price - 1.5 * atr_entry, 4) if atr_entry else None,
+            "trailing_stop":   round(trailing_stop, 4) if trailing_stop is not None else None,
             "days_held":       hold_days,
             "qty":             float(pos.qty),
             "market_value":    round(float(pos.market_value), 2),
