@@ -5,7 +5,7 @@ import {
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
 } from "./types";
 
-const BASE = "http://localhost:8000";
+const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export async function fetchSignal(ticker: string): Promise<SignalData> {
   const res = await fetch(`${BASE}/api/signal/${ticker}`);
