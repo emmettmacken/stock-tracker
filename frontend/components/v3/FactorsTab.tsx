@@ -14,11 +14,6 @@ const FACTOR_META: Record<string, { label: string; explanation: string }> = {
     explanation:
       "Average of 3-month and 12-month price returns, with the most recent month skipped to avoid short-term reversal. Z-scored against the trailing 252-day distribution.",
   },
-  mean_reversion: {
-    label: "Mean Reversion",
-    explanation:
-      "Inverted RSI(14) blended with how far the price is from its 252-day mean — high scores signal oversold or undervalued conditions where a bounce is historically likely.",
-  },
   vol_trend: {
     label: "Vol-Adjusted Trend",
     explanation:
@@ -29,14 +24,25 @@ const FACTOR_META: Record<string, { label: string; explanation: string }> = {
     explanation:
       "EPS surprise vs analyst consensus estimate over the last two reported quarters — consecutive positive beats score high; misses score low.",
   },
+  sentiment: {
+    label: "News Sentiment",
+    explanation:
+      "Aggregate sentiment score from recent news articles via Alpha Vantage. Bullish coverage scores high; bearish scores low. Shows N/A without an ALPHA_VANTAGE_KEY.",
+  },
+  insider: {
+    label: "Insider Activity",
+    explanation:
+      "Net insider buying vs selling over the past 30 days from SEC Form 4 filings. Net buying scores 70, net selling scores 30, no activity scores 50.",
+  },
 };
 
 const DEFAULT_WEIGHTS: Record<string, number> = {
-  hmm: 20,
-  momentum: 25,
-  mean_reversion: 15,
-  vol_trend: 20,
-  earnings: 20,
+  hmm: 35,
+  momentum: 30,
+  vol_trend: 15,
+  earnings: 5,
+  sentiment: 10,
+  insider: 5,
 };
 
 function loadWeights(ticker: string): Record<string, number> {

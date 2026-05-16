@@ -64,9 +64,10 @@ export interface FactorScoreData {
   factors: {
     hmm: FactorDetail;
     momentum: FactorDetail;
-    mean_reversion: FactorDetail;
     vol_trend: FactorDetail;
     earnings: FactorDetail;
+    sentiment: FactorDetail;
+    insider: FactorDetail;
   };
   composite_score: number;
   hmm_signal: string;

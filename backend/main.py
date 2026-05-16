@@ -185,9 +185,9 @@ def stationary(mat: np.ndarray, iters: int = 1000) -> np.ndarray:
 
 # ── HMM regime detection ──────────────────────────────────────────────────────
 
-def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int]:
+def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int, hmm.GaussianHMM]:
     """
-    2-state Gaussian HMM. Returns (regime_seq, bull_id).
+    2-state Gaussian HMM. Returns (regime_seq, bull_id, model).
     Bull = state with the higher mean return.
     """
     X = returns.reshape(-1, 1)
@@ -200,7 +200,7 @@ def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int]:
         model.fit(X)
     seq = model.predict(X)
     bull_id = int(np.argmax([model.means_[0][0], model.means_[1][0]]))
-    return seq.astype(int), bull_id
+    return seq.astype(int), bull_id, model
 
 # ── Signal with CI ────────────────────────────────────────────────────────────
 
@@ -346,7 +346,7 @@ def get_signal(ticker: str):
 
     # Fit HMM on full 2-year return series
     try:
-        regime_seq, bull_id = fit_regimes(returns)
+        regime_seq, bull_id, _ = fit_regimes(returns)
     except Exception as e:
         logger.warning("HMM failed for %s: %s — using single regime", ticker, e)
         regime_seq = np.zeros(len(returns), dtype=int)
@@ -434,13 +434,6 @@ def get_backtest(ticker: str):
     if n < TRAIN + TEST:
         raise HTTPException(status_code=400, detail="Need at least 2 years of history for backtest")
 
-    # Fit HMM once on full dataset
-    try:
-        regime_seq, bull_id = fit_regimes(returns)
-    except Exception:
-        regime_seq = np.zeros(n, dtype=int)
-        bull_id = 0
-
     # Walk-forward simulation
     portfolio   = 1.0
     bah_base    = float(closes[TRAIN])
@@ -454,14 +447,24 @@ def get_backtest(ticker: str):
     while test_start + TEST <= n:
         ts, te = test_start - TRAIN, test_start
 
-        tr_rets, tr_vol, tr_20d, tr_reg = returns[ts:te], vol[ts:te], vol_20d[ts:te], regime_seq[ts:te]
+        tr_rets, tr_vol, tr_20d = returns[ts:te], vol[ts:te], vol_20d[ts:te]
         tr_states, lo_t, hi_t = make_state_seq(tr_rets, tr_vol, tr_20d)
 
         mat_full, _, cnt_full = build_matrix(tr_states)
         stat_full = stationary(mat_full)
 
-        bull_tr = [s for s, r in zip(tr_states, tr_reg) if r == bull_id]
-        bear_tr = [s for s, r in zip(tr_states, tr_reg) if r != bull_id]
+        # Fit HMM on training window only — no future data in model parameters
+        try:
+            tr_regime_seq, tr_bull_id, tr_model = fit_regimes(tr_rets)
+            test_len = min(TEST, n - te)
+            test_regime_seq = tr_model.predict(returns[te:te + test_len].reshape(-1, 1))
+        except Exception:
+            tr_regime_seq = np.zeros(len(tr_rets), dtype=int)
+            test_regime_seq = np.zeros(min(TEST, n - te), dtype=int)
+            tr_bull_id = 0
+
+        bull_tr = [s for s, r in zip(tr_states, tr_regime_seq) if r == tr_bull_id]
+        bear_tr = [s for s, r in zip(tr_states, tr_regime_seq) if r != tr_bull_id]
 
         mat_bull, _, cnt_bull = build_matrix(bull_tr if len(bull_tr) >= 20 else tr_states, fallback=stat_full)
         mat_bear, _, cnt_bear = build_matrix(bear_tr if len(bear_tr) >= 20 else tr_states, fallback=stat_full)
@@ -472,9 +475,9 @@ def get_backtest(ticker: str):
             r_t    = returns[idx]
             ratio  = vol[idx] / max(vol_20d[idx], 1.0)
             cur_st = si(ret_bucket(r_t), vol_bucket(ratio, lo_t, hi_t))
-            reg_t  = int(regime_seq[idx])
+            reg_t  = int(test_regime_seq[idx - test_start])
 
-            if reg_t == bull_id:
+            if reg_t == tr_bull_id:
                 mat_a, cnt_a, stat_a = mat_bull, cnt_bull, stat_bull
             else:
                 mat_a, cnt_a, stat_a = mat_bear, cnt_bear, stat_bear
@@ -654,6 +657,84 @@ def _earnings_score(ticker_obj: yf.Ticker) -> float | None:
         return None
 
 
+def _get_sentiment_score(ticker: str) -> float | None:
+    """Return 0–100 sentiment score from cache or Alpha Vantage. Fails fast if rate-limited."""
+    api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+    if not api_key:
+        return None
+    cached, ts = _SENTIMENT_CACHE.get(ticker, ({}, 0.0))
+    if cached and cached.get("available") and (time.time() - ts) < _SENTIMENT_TTL:
+        return cached.get("sentiment_score")
+    global _SENTIMENT_LAST_CALL
+    with _SENTIMENT_LOCK:
+        now = time.time()
+        if now - _SENTIMENT_LAST_CALL < _SENTIMENT_MIN_INTERVAL:
+            return None
+        _SENTIMENT_LAST_CALL = now
+    try:
+        url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=NEWS_SENTIMENT&tickers={ticker}&apikey={api_key}"
+        )
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if "Note" in data or "Information" in data:
+            return None
+        feed = data.get("feed", [])
+        scores = [float(a["overall_sentiment_score"]) for a in feed if "overall_sentiment_score" in a]
+        if not scores:
+            return None
+        avg = sum(scores) / len(scores)
+        score = round((avg + 1) / 2 * 100, 1)
+        direction = "bullish" if score >= 60 else ("bearish" if score <= 40 else "neutral")
+        _SENTIMENT_CACHE[ticker] = (
+            {"available": True, "ticker": ticker, "sentiment_score": score, "direction": direction,
+             "article_count": int(data.get("items", len(feed))), "buzz_score": None,
+             "sector_vs_avg": None, "bearish_pct": None},
+            time.time(),
+        )
+        return score
+    except Exception:
+        return None
+
+
+def _get_insider_score(ticker: str) -> float | None:
+    """Return 0–100 insider score from SEC Form 4: 70=net buying, 50=neutral, 30=net selling."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        url = (
+            f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
+            f"&dateRange=custom&startdt={start}&enddt={today}&forms=4"
+        )
+        headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None
+        hits = resp.json().get("hits", {}).get("hits", [])
+        if not hits:
+            return 50.0
+        net = 0.0
+        for hit in hits:
+            src = hit.get("_source", {})
+            tx = src.get("transaction_type", "")
+            try:
+                shares = float(src.get("shares", 0) or 0)
+            except (ValueError, TypeError):
+                shares = 0.0
+            if tx == "P":
+                net += shares
+            elif tx == "S":
+                net -= shares
+        return 70.0 if net > 0 else (30.0 if net < 0 else 50.0)
+    except Exception:
+        return None
+
+
 def _compute_factors(ticker: str) -> Optional[dict]:
     """Core factor computation shared by the API endpoint and the scheduler."""
     try:
@@ -664,7 +745,7 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     closes, returns, vol, vol_20d = extract_features(df)
 
     try:
-        regime_seq, bull_id = fit_regimes(returns)
+        regime_seq, bull_id, _ = fit_regimes(returns)
     except Exception:
         regime_seq = np.zeros(len(returns), dtype=int)
         bull_id = 0
@@ -687,18 +768,20 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     cur_st = si(ret_bucket(float(rets_w[-1])), vol_bucket(float(ratios_w[-1]), lo_t, hi_t))
     sig = compute_signal(cnt_act[cur_st], mat_act[cur_st], stat_act)
 
-    hmm_score = _hmm_factor_score(sig["signal"], sig["confidence"])
-    mom_score = _momentum_score(closes)
-    mr_score  = _mean_reversion_score(closes)
-    vt_score  = _vol_trend_score(closes)
-    earn_score = _earnings_score(yf.Ticker(ticker))
+    hmm_score     = _hmm_factor_score(sig["signal"], sig["confidence"])
+    mom_score     = _momentum_score(closes)
+    vt_score      = _vol_trend_score(closes)
+    earn_score    = _earnings_score(yf.Ticker(ticker))
+    sent_score    = _get_sentiment_score(ticker)
+    insider_score = _get_insider_score(ticker)
 
     factors: dict[str, Any] = {
-        "hmm":            {"score": round(hmm_score, 2), "weight": 0.35, "null": False},
-        "momentum":       {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.25, "null": mom_score is None},
-        "mean_reversion": {"score": round(mr_score, 2)  if mr_score  is not None else None, "weight": 0.20, "null": mr_score  is None},
-        "vol_trend":      {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": 0.15, "null": vt_score  is None},
-        "earnings":       {"score": round(earn_score, 2) if earn_score is not None else None, "weight": 0.05, "null": earn_score is None},
+        "hmm":       {"score": round(hmm_score, 2), "weight": 0.35, "null": False},
+        "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.30, "null": mom_score is None},
+        "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": 0.15, "null": vt_score  is None},
+        "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": 0.05, "null": earn_score is None},
+        "sentiment": {"score": round(sent_score, 2) if sent_score is not None else None, "weight": 0.10, "null": sent_score is None},
+        "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": 0.05, "null": insider_score is None},
     }
 
     available = {k: v for k, v in factors.items() if not v["null"]}
@@ -1090,12 +1173,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             vol_20d = pd.Series(vol_series).rolling(20, min_periods=1).mean().values
             vol_aligned = vol_series[1:]
             vol_20d_aligned = vol_20d[1:]
-            try:
-                regime_seq, bull_id = fit_regimes(ret)
-            except Exception:
-                regime_seq = np.zeros(len(ret), dtype=int)
-                bull_id = 0
-            features[t] = (c, ret, vol_aligned, vol_20d_aligned, regime_seq, bull_id)
+            features[t] = (c, ret, vol_aligned, vol_20d_aligned)
 
         # Walk-forward
         portfolio_val = req.capital
@@ -1119,11 +1197,10 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             rvols: dict[str, float] = {}
             signals_window: dict[str, str] = {}
             for t in valid:
-                c, ret, vol, vol_20d, reg_seq, bull_id = features[t]
+                c, ret, vol, vol_20d = features[t]
                 tr_rets = ret[ts:te]
                 tr_vol  = vol[ts:te]
                 tr_20d  = vol_20d[ts:te]
-                tr_reg  = reg_seq[ts:te]
                 if len(tr_rets) < 22:
                     rvols[t] = 0.25
                     signals_window[t] = "HOLD"
@@ -1132,16 +1209,9 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 tr_states, lo_t, hi_t = make_state_seq(tr_rets, tr_vol, tr_20d)
                 mat_full, _, cnt_full = build_matrix(tr_states)
                 stat_full = stationary(mat_full)
-                active_id = int(tr_reg[-1])
-                active_st = [s for s, r in zip(tr_states, tr_reg) if r == active_id]
-                if len(active_st) >= 20:
-                    mat_act, _, cnt_act = build_matrix(active_st, fallback=stat_full)
-                else:
-                    mat_act, cnt_act = mat_full, cnt_full
-                stat_act = stationary(mat_act)
                 ratios = tr_vol / np.maximum(tr_20d, 1.0)
                 cur_st = si(ret_bucket(float(tr_rets[-1])), vol_bucket(float(ratios[-1]), lo_t, hi_t))
-                sig = compute_signal(cnt_act[cur_st], mat_act[cur_st], stat_act)
+                sig = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)
                 signals_window[t] = sig["signal"]
 
             # Vol-targeted weights (only allocate to BUY signals)
@@ -1316,7 +1386,8 @@ def _position_dollars(ticker: str, equity: float, current_price: float) -> float
     try:
         df = fetch_ohlcv(ticker, days=30, min_bars=22)
         c = df["Close"].values.astype(float)
-        daily_vol = c[-21:].std() / c[-1]  # approx daily vol as fraction of price
+        rets_21 = np.diff(c[-22:]) / c[-22:-1]
+        daily_vol = float(rets_21.std())
         if daily_vol > 0:
             weight = min(0.01 / daily_vol, 0.10)
         else:
@@ -1402,7 +1473,7 @@ def _run_signal_job() -> None:
             atr         = _compute_atr(ticker)
             in_pos      = ticker in positions
 
-            if hmm_signal == "SELL" and in_pos:
+            if hmm_signal == "SELL" and composite < 45.0 and in_pos:
                 pos = positions[ticker]
                 entry_log = db.get_last_buy_signal(ticker)
                 try:
