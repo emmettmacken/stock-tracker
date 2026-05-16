@@ -1,0 +1,8 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+stock_tracker.db
+stock_tracker.db-shm
+stock_tracker.db-wal

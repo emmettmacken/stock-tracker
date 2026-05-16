@@ -1,0 +1,152 @@
+import {
+  BacktestData, QuoteData, SignalData,
+  FactorScoreData, SentimentData, InsiderData, ShortInterestData,
+  SizingResult, PortfolioBacktestResult,
+  WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
+} from "./types";
+
+const BASE = "http://localhost:8000";
+
+export async function fetchSignal(ticker: string): Promise<SignalData> {
+  const res = await fetch(`${BASE}/api/signal/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch signal for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchQuote(ticker: string): Promise<QuoteData> {
+  const res = await fetch(`${BASE}/api/quote/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch quote for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchBacktest(ticker: string): Promise<BacktestData> {
+  const res = await fetch(`${BASE}/api/backtest/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to run backtest for ${ticker}`);
+  }
+  return res.json();
+}
+
+// ── V3 API ────────────────────────────────────────────────────────────────────
+
+export async function fetchFactors(ticker: string): Promise<FactorScoreData> {
+  const res = await fetch(`${BASE}/api/factors/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch factors for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchSentiment(ticker: string): Promise<SentimentData> {
+  const res = await fetch(`${BASE}/api/sentiment/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch sentiment for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchInsider(ticker: string): Promise<InsiderData> {
+  const res = await fetch(`${BASE}/api/insider/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch insider data for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchShortInterest(ticker: string): Promise<ShortInterestData> {
+  const res = await fetch(`${BASE}/api/shortinterest/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch short interest for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchPortfolioSizing(req: {
+  capital: number;
+  tickers: string[];
+  signals: Record<string, { composite_score: number; confidence: number }>;
+}): Promise<SizingResult> {
+  const res = await fetch(`${BASE}/api/portfolio/sizing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to compute portfolio sizing");
+  }
+  return res.json();
+}
+
+export async function fetchPortfolioBacktest(req: {
+  tickers: string[];
+  capital: number;
+}): Promise<PortfolioBacktestResult> {
+  const res = await fetch(`${BASE}/api/portfolio/backtest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to run portfolio backtest");
+  }
+  return res.json();
+}
+
+// ── V4 API ────────────────────────────────────────────────────────────────────
+
+export async function fetchWatchlistDB(): Promise<WatchlistTicker[]> {
+  const res = await fetch(`${BASE}/api/watchlist`);
+  if (!res.ok) throw new Error("Failed to fetch watchlist");
+  return res.json();
+}
+
+export async function addTickerDB(ticker: string): Promise<void> {
+  await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "POST" });
+}
+
+export async function removeTickerDB(ticker: string): Promise<void> {
+  await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "DELETE" });
+}
+
+export async function fetchPaperAccount(): Promise<PaperAccount> {
+  const res = await fetch(`${BASE}/api/paper/account`);
+  if (!res.ok) throw new Error("Failed to fetch account");
+  return res.json();
+}
+
+export async function fetchPaperPositions(): Promise<{ available: boolean; positions?: PaperPosition[]; error?: string }> {
+  const res = await fetch(`${BASE}/api/paper/positions`);
+  if (!res.ok) throw new Error("Failed to fetch positions");
+  return res.json();
+}
+
+export async function fetchTradeHistory(): Promise<TradeOutcome[]> {
+  const res = await fetch(`${BASE}/api/paper/history`);
+  if (!res.ok) throw new Error("Failed to fetch trade history");
+  return res.json();
+}
+
+export async function fetchSignalLog(limit = 50): Promise<SignalLogEntry[]> {
+  const res = await fetch(`${BASE}/api/signals/log?limit=${limit}`);
+  if (!res.ok) throw new Error("Failed to fetch signal log");
+  return res.json();
+}
+
+export async function triggerSignalJob(): Promise<{ status: string; message: string }> {
+  const res = await fetch(`${BASE}/api/paper/run-now`, { method: "POST" });
+  if (!res.ok) throw new Error("Failed to trigger signal job");
+  return res.json();
+}

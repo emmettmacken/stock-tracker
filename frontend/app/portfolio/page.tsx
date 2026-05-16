@@ -1,0 +1,265 @@
+"use client";
+import { useState, useEffect, useRef, useMemo } from "react";
+import { FactorScoreData, SizingResult } from "@/lib/types";
+import { fetchFactors, fetchPortfolioSizing } from "@/lib/api";
+import { loadWatchlist } from "@/lib/watchlist";
+import { AllocationTable } from "@/components/v3/portfolio/AllocationTable";
+import { PortfolioBacktestPanel } from "@/components/v3/portfolio/PortfolioBacktestPanel";
+import { scoreTextColor } from "@/components/v3/FactorScorePill";
+import { Skeleton } from "@/components/v3/Skeleton";
+
+export default function PortfolioPage() {
+  const [watchlist, setWatchlist] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [capital, setCapital] = useState(10000);
+  const [method, setMethod] = useState<"kelly" | "vol">("vol");
+
+  const [factorData, setFactorData] = useState<Record<string, FactorScoreData>>({});
+  const factorLoadingRef = useRef<Set<string>>(new Set());
+  const [factorLoadingTickers, setFactorLoadingTickers] = useState<Set<string>>(new Set());
+
+  const [sizing, setSizing] = useState<SizingResult | null>(null);
+  const [sizingLoading, setSizingLoading] = useState(false);
+  const [sizingError, setSizingError] = useState<string | null>(null);
+
+  // Load watchlist on mount
+  useEffect(() => {
+    const list = loadWatchlist();
+    setWatchlist(list);
+    setSelected(list);
+  }, []);
+
+  // Fetch factors for any selected ticker we don't have yet
+  useEffect(() => {
+    selected.forEach((ticker) => {
+      if (factorData[ticker] || factorLoadingRef.current.has(ticker)) return;
+      factorLoadingRef.current.add(ticker);
+      setFactorLoadingTickers((prev) => new Set([...prev, ticker]));
+      fetchFactors(ticker)
+        .then((data) => {
+          setFactorData((prev) => ({ ...prev, [ticker]: data }));
+        })
+        .catch(() => {})
+        .finally(() => {
+          factorLoadingRef.current.delete(ticker);
+          setFactorLoadingTickers((prev) => {
+            const next = new Set(prev);
+            next.delete(ticker);
+            return next;
+          });
+        });
+    });
+  }, [selected]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const selectedKey = useMemo(() => [...selected].sort().join(","), [selected]);
+  const allReady = useMemo(
+    () => selected.length > 0 && selected.every((t) => !!factorData[t]),
+    [selected, factorData]
+  );
+
+  // Recompute sizing when selection or capital changes and all factors are ready
+  useEffect(() => {
+    if (!allReady) return;
+    const signals: Record<string, { composite_score: number; confidence: number }> = {};
+    selected.forEach((t) => {
+      if (factorData[t]) {
+        signals[t] = {
+          composite_score: factorData[t].composite_score,
+          confidence: factorData[t].hmm_confidence,
+        };
+      }
+    });
+    setSizingLoading(true);
+    setSizingError(null);
+    fetchPortfolioSizing({ capital, tickers: selected, signals })
+      .then(setSizing)
+      .catch((e) => setSizingError(e instanceof Error ? e.message : "Sizing failed"))
+      .finally(() => setSizingLoading(false));
+  }, [allReady, selectedKey, capital]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function toggleTicker(ticker: string) {
+    setSelected((prev) =>
+      prev.includes(ticker) ? prev.filter((t) => t !== ticker) : [...prev, ticker]
+    );
+  }
+
+  const loadingCount = factorLoadingTickers.size;
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-white">
+      <div className="max-w-5xl mx-auto px-4 py-8">
+        <header className="mb-8">
+          <h1 className="text-2xl font-bold tracking-tight">Portfolio</h1>
+          <p className="mt-1 text-zinc-400 text-sm">
+            Size positions and backtest multi-ticker portfolios using composite factor signals.
+          </p>
+        </header>
+
+        <div className="flex gap-6 items-start">
+          {/* Sidebar */}
+          <aside className="w-44 shrink-0">
+            <h2 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-3">
+              Include in analysis
+            </h2>
+            {watchlist.length === 0 && (
+              <p className="text-zinc-600 text-xs">Add tickers to your watchlist first.</p>
+            )}
+            <div className="space-y-2">
+              {watchlist.map((ticker) => {
+                const fd = factorData[ticker];
+                const isLoading = factorLoadingTickers.has(ticker);
+                return (
+                  <label
+                    key={ticker}
+                    className="flex items-center gap-2 cursor-pointer group"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected.includes(ticker)}
+                      onChange={() => toggleTicker(ticker)}
+                      className="rounded accent-emerald-500 w-3.5 h-3.5 shrink-0"
+                    />
+                    <span className="text-sm text-zinc-300 group-hover:text-white transition-colors flex-1 min-w-0 truncate">
+                      {ticker}
+                    </span>
+                    {isLoading ? (
+                      <span className="inline-block w-3 h-3 border border-zinc-600 border-t-zinc-400 rounded-full animate-spin shrink-0" />
+                    ) : fd ? (
+                      <span className={`text-xs font-bold tabular-nums shrink-0 ${scoreTextColor(fd.composite_score)}`}>
+                        {Math.round(fd.composite_score)}
+                      </span>
+                    ) : null}
+                  </label>
+                );
+              })}
+            </div>
+
+            {/* Capital input */}
+            <div className="mt-6">
+              <label className="block text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-2">
+                Capital
+              </label>
+              <div className="relative">
+                <span className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-500 text-sm">€</span>
+                <input
+                  type="number"
+                  value={capital}
+                  onChange={(e) => setCapital(Math.max(100, parseInt(e.target.value) || 10000))}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-lg pl-6 pr-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-500"
+                  min={100}
+                  step={1000}
+                />
+              </div>
+            </div>
+
+            {/* Sizing method toggle */}
+            <div className="mt-4">
+              <label className="block text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-2">
+                Sizing Method
+              </label>
+              <div className="flex rounded-lg overflow-hidden border border-zinc-700 text-xs">
+                <button
+                  onClick={() => setMethod("vol")}
+                  className={`flex-1 py-1.5 transition-colors ${
+                    method === "vol" ? "bg-zinc-700 text-white font-medium" : "text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  Vol-target
+                </button>
+                <button
+                  onClick={() => setMethod("kelly")}
+                  className={`flex-1 py-1.5 transition-colors ${
+                    method === "kelly" ? "bg-zinc-700 text-white font-medium" : "text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  Kelly
+                </button>
+              </div>
+            </div>
+          </aside>
+
+          {/* Main content */}
+          <main className="flex-1 min-w-0 space-y-8">
+            {/* Allocation section */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-sm font-semibold text-zinc-300">
+                  Position Sizing
+                </h2>
+                {loadingCount > 0 && (
+                  <span className="text-zinc-500 text-xs flex items-center gap-1.5">
+                    <span className="inline-block w-3 h-3 border border-zinc-600 border-t-zinc-400 rounded-full animate-spin" />
+                    Loading {loadingCount} ticker{loadingCount !== 1 ? "s" : ""}…
+                  </span>
+                )}
+              </div>
+
+              {selected.length === 0 && (
+                <p className="text-zinc-600 text-sm py-6 text-center">
+                  Select at least one ticker from the sidebar.
+                </p>
+              )}
+
+              {selected.length > 0 && !allReady && !sizingLoading && (
+                <div className="space-y-2">
+                  {[1, 2, 3].map((i) => (
+                    <Skeleton key={i} className="h-10 w-full" />
+                  ))}
+                </div>
+              )}
+
+              {sizingLoading && (
+                <div className="flex items-center gap-2 py-4 text-zinc-500 text-sm">
+                  <span className="inline-block w-4 h-4 border-2 border-zinc-600 border-t-zinc-300 rounded-full animate-spin" />
+                  Computing allocations…
+                </div>
+              )}
+
+              {sizingError && (
+                <div className="text-red-400 text-sm py-4">
+                  <p className="mb-1">{sizingError}</p>
+                  <button
+                    onClick={() => {
+                      setSizingError(null);
+                      setSizing(null);
+                    }}
+                    className="text-zinc-500 hover:text-zinc-300 text-xs underline"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+
+              {sizing && !sizingLoading && !sizingError && (
+                <>
+                  <AllocationTable
+                    sizing={sizing}
+                    factorData={factorData}
+                    method={method}
+                    capital={capital}
+                  />
+                  <p className="text-zinc-600 text-[10px] mt-2">
+                    {method === "kelly"
+                      ? "Kelly: half-Kelly fraction capped at 25%. Unfavourable signals (score ≤ 50) get 0%."
+                      : "Vol-targeted: weights are inversely proportional to 21-day realised volatility, normalised to sum to 1."}
+                    {" "}Correlation penalty applies when ρ &gt; 0.7 with a higher-scored ticker.
+                  </p>
+                </>
+              )}
+            </section>
+
+            {/* Backtest section */}
+            <section className="border-t border-zinc-800 pt-6">
+              <h2 className="text-sm font-semibold text-zinc-300 mb-4">Portfolio Backtest</h2>
+              {selected.length === 0 ? (
+                <p className="text-zinc-600 text-sm">Select tickers to run a backtest.</p>
+              ) : (
+                <PortfolioBacktestPanel tickers={selected} capital={capital} />
+              )}
+            </section>
+          </main>
+        </div>
+      </div>
+    </div>
+  );
+}
