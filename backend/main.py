@@ -772,12 +772,12 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     insider_score = _get_insider_score(ticker)
 
     factors: dict[str, Any] = {
-        "hmm":       {"score": round(hmm_score, 2), "weight": 0.35, "null": False},
-        "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.30, "null": mom_score is None},
-        "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": 0.15, "null": vt_score  is None},
-        "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": 0.05, "null": earn_score is None},
-        "sentiment": {"score": round(sent_score, 2) if sent_score is not None else None, "weight": 0.10, "null": sent_score is None},
-        "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": 0.05, "null": insider_score is None},
+        "hmm":       {"score": round(hmm_score, 2), "weight": 0.10, "null": False},
+        "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.35, "null": mom_score is None},
+        "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": 0.25, "null": vt_score  is None},
+        "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": 0.20, "null": earn_score is None},
+        "sentiment": {"score": round(sent_score, 2) if sent_score is not None else None, "weight": 0.00, "null": sent_score is None},
+        "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": 0.10, "null": insider_score is None},
     }
 
     available = {k: v for k, v in factors.items() if not v["null"]}

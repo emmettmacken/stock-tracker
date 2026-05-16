@@ -37,12 +37,12 @@ const FACTOR_META: Record<string, { label: string; explanation: string }> = {
 };
 
 const DEFAULT_WEIGHTS: Record<string, number> = {
-  hmm: 35,
-  momentum: 30,
-  vol_trend: 15,
-  earnings: 5,
-  sentiment: 10,
-  insider: 5,
+  hmm: 10,
+  momentum: 35,
+  vol_trend: 25,
+  earnings: 20,
+  sentiment: 0,
+  insider: 10,
 };
 
 function loadWeights(ticker: string): Record<string, number> {
