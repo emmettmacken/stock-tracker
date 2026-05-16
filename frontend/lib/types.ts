@@ -77,6 +77,7 @@ export type SentimentDirection = "bullish" | "neutral" | "bearish";
 
 export interface SentimentData {
   available: boolean;
+  reason?: string;
   ticker?: string;
   sentiment_score?: number;
   direction?: SentimentDirection;

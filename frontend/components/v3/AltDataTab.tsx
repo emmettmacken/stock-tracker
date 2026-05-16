@@ -56,8 +56,10 @@ function SentimentSection({ ticker }: { ticker: string }) {
   );
   if (!data?.available) return (
     <Unavailable reason={
-      data?.available === false
-        ? "Not available — add FINNHUB_API_KEY to backend .env"
+      data?.reason === "no_key"
+        ? "Not available — add ALPHA_VANTAGE_KEY to backend .env"
+        : data?.reason === "rate_limited"
+        ? "Rate limited — retry in a minute"
         : undefined
     } />
   );

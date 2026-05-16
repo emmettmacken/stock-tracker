@@ -30,7 +30,7 @@ export function TickerCard({ data, loading, error, onRemove }: Props) {
       .then(setFactorData)
       .catch(() => {})
       .finally(() => setFactorLoading(false));
-  }, [data.ticker]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [data.ticker, loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const isPositive = data.change_pct >= 0;
 

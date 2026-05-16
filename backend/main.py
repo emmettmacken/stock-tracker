@@ -34,10 +34,12 @@ except Exception:
     SCHEDULER_OK = False
 
 try:
-    import alpaca_trade_api as tradeapi
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
     ALPACA_OK = True
 except Exception:
-    tradeapi = None  # type: ignore[assignment]
+    TradingClient = None  # type: ignore[assignment]
     ALPACA_OK = False
 
 import database as db
@@ -100,6 +102,11 @@ N_ST     = N_RET * N_VOL   # 15
 RET_THRESHOLDS = (-0.015, -0.003, 0.003, 0.015)
 MIN_OBS        = 15
 ROLLING_WINDOW = 252
+_SENTIMENT_CACHE: dict[str, tuple[dict, float]] = {}  # ticker → (result, timestamp)
+_SENTIMENT_TTL = 900  # 15 minutes
+_SENTIMENT_LOCK = threading.Lock()
+_SENTIMENT_LAST_CALL = 0.0
+_SENTIMENT_MIN_INTERVAL = 13.0  # ~4.5 req/min, safely under the 5/min AV free-tier limit
 
 # ── State helpers ─────────────────────────────────────────────────────────────
 
@@ -729,40 +736,78 @@ def get_factors(ticker: str):
 @app.get("/api/sentiment/{ticker}")
 def get_sentiment(ticker: str):
     ticker = ticker.upper()
-    api_key = os.getenv("FINNHUB_API_KEY", "")
+    api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
     if not api_key:
-        return {"available": False}
+        return {"available": False, "reason": "no_key"}
+
+    cached, ts = _SENTIMENT_CACHE.get(ticker, ({}, 0.0))
+    if cached and (time.time() - ts) < _SENTIMENT_TTL:
+        return cached
+
     try:
-        url = f"https://finnhub.io/api/v1/news-sentiment?symbol={ticker}&token={api_key}"
-        with httpx.Client(timeout=10) as client:
+        global _SENTIMENT_LAST_CALL
+        with _SENTIMENT_LOCK:
+            now = time.time()
+            if now - _SENTIMENT_LAST_CALL < _SENTIMENT_MIN_INTERVAL:
+                return {"available": False, "reason": "rate_limited"}
+            _SENTIMENT_LAST_CALL = now
+
+        url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=NEWS_SENTIMENT&tickers={ticker}&apikey={api_key}"
+        )
+        with httpx.Client(timeout=15) as client:
             resp = client.get(url)
         if resp.status_code != 200:
             return {"available": False}
         data = resp.json()
-        if not data or "sentiment" not in data:
+
+        if "Note" in data or "Information" in data:
+            return {"available": False, "reason": "rate_limited"}
+
+        feed = data.get("feed", [])
+        if not feed:
             return {"available": False}
 
-        sent = data.get("sentiment", {})
-        score_raw = sent.get("bullishPercent", 0.5)  # 0–1
-        score = round(score_raw * 100, 1)
-        if score >= 60:
+        scores = [float(a["overall_sentiment_score"]) for a in feed if "overall_sentiment_score" in a]
+        if not scores:
+            return {"available": False}
+
+        avg_score = sum(scores) / len(scores)
+        sentiment_score = round((avg_score + 1) / 2 * 100, 1)
+
+        label_map = {
+            "Bullish": "bullish",
+            "Somewhat-Bullish": "bullish",
+            "Neutral": "neutral",
+            "Somewhat-Bearish": "bearish",
+            "Bearish": "bearish",
+        }
+        if sentiment_score >= 60:
             direction = "bullish"
-        elif score <= 40:
+        elif sentiment_score <= 40:
             direction = "bearish"
         else:
             direction = "neutral"
 
-        buzz = data.get("buzz", {})
-        return {
+        bearish_count = sum(
+            1 for a in feed
+            if label_map.get(a.get("overall_sentiment_label", ""), "neutral") == "bearish"
+        )
+        bearish_pct = round(bearish_count / len(feed) * 100, 1)
+
+        result = {
             "available": True,
             "ticker": ticker,
-            "sentiment_score": score,
+            "sentiment_score": sentiment_score,
             "direction": direction,
-            "article_count": buzz.get("articlesInLastWeek", None),
-            "buzz_score": buzz.get("buzz", None),
-            "sector_vs_avg": data.get("sectorAverageBullishPercent", None),
-            "bearish_pct": round(sent.get("bearishPercent", 0) * 100, 1),
+            "article_count": int(data.get("items", len(feed))),
+            "buzz_score": None,
+            "sector_vs_avg": None,
+            "bearish_pct": bearish_pct,
         }
+        _SENTIMENT_CACHE[ticker] = (result, time.time())
+        return result
     except Exception as e:
         return {"error": str(e), "available": False}
 
@@ -1196,16 +1241,15 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_alpaca():
-    """Return configured Alpaca REST client or (None, reason_str)."""
+    """Return configured Alpaca TradingClient or (None, reason_str)."""
     if not ALPACA_OK:
-        return None, "alpaca-trade-api not installed"
+        return None, "alpaca-py not installed"
     key = os.getenv("ALPACA_API_KEY", "")
     secret = os.getenv("ALPACA_SECRET_KEY", "")
-    base = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
     if not key or not secret:
         return None, "ALPACA_API_KEY / ALPACA_SECRET_KEY not set in .env"
     try:
-        return tradeapi.REST(key, secret, base), None
+        return TradingClient(api_key=key, secret_key=secret, paper=True), None
     except Exception as e:
         return None, str(e)
 
@@ -1330,7 +1374,7 @@ def _run_signal_job() -> None:
     try:
         account  = api.get_account()
         equity   = float(account.equity)
-        positions = {p.symbol: p for p in api.list_positions()}
+        positions = {p.symbol: p for p in api.get_all_positions()}
     except Exception as e:
         logger.error("Signal job: Alpaca account fetch failed: %s", e)
         return
@@ -1379,12 +1423,14 @@ def _run_signal_job() -> None:
                 dollars = _position_dollars(ticker, equity, price)
                 try:
                     try:
-                        api.submit_order(symbol=ticker, notional=round(dollars, 2),
-                                         side="buy", type="market", time_in_force="day")
+                        api.submit_order(MarketOrderRequest(
+                            symbol=ticker, notional=round(dollars, 2),
+                            side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                     except Exception:
                         qty = max(1, int(dollars // price))
-                        api.submit_order(symbol=ticker, qty=qty,
-                                         side="buy", type="market", time_in_force="day")
+                        api.submit_order(MarketOrderRequest(
+                            symbol=ticker, qty=qty,
+                            side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                     db.log_signal(ticker, composite, "BUY", "ordered", None, price, atr)
                     logger.info("%s: BUY $%.0f score=%.1f", ticker, dollars, composite)
                 except Exception as e:
@@ -1406,7 +1452,7 @@ def _run_stoploss_job() -> None:
         return
 
     try:
-        positions = api.list_positions()
+        positions = api.get_all_positions()
     except Exception as e:
         logger.error("Stop-loss job: failed to list positions: %s", e)
         return
@@ -1464,9 +1510,9 @@ def api_remove_ticker(ticker: str):
     api, _ = _get_alpaca()
     if api:
         try:
-            for order in api.list_orders(status="open"):
+            for order in api.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
                 if order.symbol == ticker:
-                    api.cancel_order(order.id)
+                    api.cancel_order_by_id(order.id)
         except Exception as e:
             logger.warning("Could not cancel orders for %s: %s", ticker, e)
     return {"ticker": ticker, "status": "removed"}
@@ -1491,7 +1537,7 @@ def api_paper_account():
         return {"available": False, "error": err}
     try:
         acc = api.get_account()
-        n_pos = len(api.list_positions())
+        n_pos = len(api.get_all_positions())
         return {
             "available":      True,
             "equity":         round(float(acc.equity), 2),
@@ -1509,7 +1555,7 @@ def api_paper_positions():
     if api is None:
         return {"available": False, "error": err}
     try:
-        positions = api.list_positions()
+        positions = api.get_all_positions()
     except Exception as e:
         return {"available": False, "error": str(e)}
 
