@@ -113,7 +113,7 @@ Buy thresholds self-tune weekly based on recent signal performance:
 | Win rate < 40% | Bull threshold raised by 5 pts, bear threshold raised by 5 pts |
 | Otherwise | No change |
 
-Bounds: bull threshold 70–85, bear threshold 80–90. Defaults are 75 (bull) / 85 (bear). Values persist in `system_config` and are applied by the signal job at runtime. The weekly adjustment runs every Sunday at 18:00 ET.
+Bounds: bull threshold 65–80, bear threshold 75–85. Defaults are 70 (bull) / 80 (bear). Values persist in `system_config` and are applied by the signal job at runtime. The weekly adjustment runs every Sunday at 18:00 ET.
 
 ---
 

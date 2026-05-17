@@ -1516,8 +1516,8 @@ def _run_signal_job() -> None:
 
     spy_above, vix = _macro_regime()
     high_vix = vix > 30
-    bull_threshold = float(db.get_config("bull_threshold", "75"))
-    bear_threshold = float(db.get_config("bear_threshold", "85"))
+    bull_threshold = float(db.get_config("bull_threshold", "70"))
+    bear_threshold = float(db.get_config("bear_threshold", "80"))
     buy_threshold  = bear_threshold if not spy_above else bull_threshold
     logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f friday=%s",
                 spy_above, vix, buy_threshold, is_friday)
@@ -1735,14 +1735,14 @@ def _run_adaptive_thresholds_job() -> None:
         return
     wins = sum(1 for t in trades if t["return_pct"] > 0)
     win_rate = wins / len(trades)
-    bull = float(db.get_config("bull_threshold", "75"))
-    bear = float(db.get_config("bear_threshold", "85"))
+    bull = float(db.get_config("bull_threshold", "70"))
+    bear = float(db.get_config("bear_threshold", "80"))
     if win_rate > 0.6:
-        bull = max(70.0, bull - 5.0)
-        bear = max(80.0, bear - 5.0)
+        bull = max(65.0, bull - 5.0)
+        bear = max(75.0, bear - 5.0)
     elif win_rate < 0.4:
-        bull = min(85.0, bull + 5.0)
-        bear = min(90.0, bear + 5.0)
+        bull = min(80.0, bull + 5.0)
+        bear = min(85.0, bear + 5.0)
     now = datetime.utcnow().isoformat()
     db.set_config("bull_threshold", str(bull))
     db.set_config("bear_threshold", str(bear))
@@ -1758,8 +1758,8 @@ def _run_adaptive_thresholds_job() -> None:
 @app.get("/api/analytics")
 def get_analytics():
     stats = db.get_analytics_data()
-    bull_threshold = float(db.get_config("bull_threshold", "75"))
-    bear_threshold = float(db.get_config("bear_threshold", "85"))
+    bull_threshold = float(db.get_config("bull_threshold", "70"))
+    bear_threshold = float(db.get_config("bear_threshold", "80"))
     thresholds_updated = db.get_config("thresholds_last_updated", "") or None
     last_signal_job    = db.get_config("last_signal_job_at", "") or None
     last_stoploss_job  = db.get_config("last_stoploss_job_at", "") or None
