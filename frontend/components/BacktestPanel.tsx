@@ -118,9 +118,9 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
           positive={d.max_drawdown > -10}
         />
         <StatCard
-          label="Win Rate"
-          value={`${d.win_rate.toFixed(1)}%`}
-          sub={`${d.num_trades} in-position days`}
+          label="Trade Win Rate"
+          value={`${d.win_rate_trades.toFixed(1)}%`}
+          sub={`${d.num_trades} trades`}
         />
         <StatCard
           label="Test Windows"

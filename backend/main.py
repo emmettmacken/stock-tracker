@@ -370,12 +370,16 @@ def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: i
     raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
 
 def _atr_from_df(df: pd.DataFrame, period: int = 21) -> float:
-    """Compute ATR from a DataFrame that has High/Low/Close columns."""
+    """Compute ATR using Wilder's EMA (seeded with SMA over first `period` bars)."""
     if len(df) < period + 1:
         return 0.0
     h, l, c = df["High"].values, df["Low"].values, df["Close"].values
     tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-    return float(tr[-period:].mean())
+    atr = float(tr[:period].mean())
+    alpha = 1.0 / period
+    for v in tr[period:]:
+        atr = alpha * float(v) + (1.0 - alpha) * atr
+    return atr
 
 
 # ── /api/quote ────────────────────────────────────────────────────────────────
@@ -498,7 +502,8 @@ def get_backtest(ticker: str):
     hold_left   = 0
     daily_strat: list[float] = []
     equity_curve: list[dict] = []
-    trades: list[float] = []
+    trade_results: list[bool] = []
+    trade_entry_val = 0.0
 
     test_start = TRAIN
     while test_start + TEST <= n:
@@ -547,13 +552,14 @@ def get_backtest(ticker: str):
                 daily_strat.append(r_t)
                 hold_left -= 1
                 if signal == "SELL" or hold_left <= 0:
-                    trades.append(portfolio - 1.0)  # rough trade profit marker
+                    trade_results.append(portfolio > trade_entry_val)
                     in_pos = False
             else:
                 daily_strat.append(0.0)
                 if signal == "BUY":
                     in_pos = True
                     hold_left = HOLD
+                    trade_entry_val = portfolio
 
             bah_val = float(closes[idx + 1]) / bah_base if idx + 1 < len(closes) else float(closes[-1]) / bah_base
             raw_date = dates[idx]
@@ -576,11 +582,7 @@ def get_backtest(ticker: str):
     else:
         max_dd = 0.0
 
-    # Win rate: fraction of completed trades that ended profitably
-    # Each trade in `trades` holds the cumulative portfolio value minus 1 at close.
-    # A simpler proxy: fraction of "in-position" daily returns > 0
-    pos_rets = [r for r in daily_strat if r != 0.0]
-    win_rate = float(sum(r > 0 for r in pos_rets) / len(pos_rets) * 100) if pos_rets else 0.0
+    win_rate_trades = float(sum(trade_results) / len(trade_results) * 100) if trade_results else 0.0
 
     return {
         "ticker":                  ticker,
@@ -589,8 +591,8 @@ def get_backtest(ticker: str):
         "total_bah_return":        round(bah_pct, 2),
         "sharpe_ratio":            round(sharpe, 3),
         "max_drawdown":            round(max_dd, 2),
-        "win_rate":                round(win_rate, 1),
-        "num_trades":              len(trades),
+        "win_rate_trades":         round(win_rate_trades, 1),
+        "num_trades":              len(trade_results),
         "num_windows":             (n - TRAIN) // TEST,
     }
 
@@ -615,54 +617,29 @@ def _hmm_factor_score(signal: str, confidence: float) -> float:
 
 
 def _momentum_score(closes: np.ndarray) -> float | None:
-    """3m+12m momentum, skip last 21 days, z-score vs rolling 252d, clip±3, scale 0–100."""
+    """3m+12m momentum, skip last 21 days, each horizon z-scored against its own distribution."""
     if len(closes) < 252 + 21 + 2:
         return None
-    # Skip most recent 21 days
     c = closes[:-21]
     m3  = (c[-1] / c[-63]  - 1.0) if len(c) >= 63  else None
     m12 = (c[-1] / c[-252] - 1.0) if len(c) >= 252 else None
     if m3 is None and m12 is None:
         return None
-    raw = np.mean([x for x in [m3, m12] if x is not None])
-    # z-score against rolling 252-day distribution of the 63-day return
-    if len(c) >= 252 + 63:
-        window_rets = np.array([(c[i] / c[i - 63] - 1.0) for i in range(63, len(c))])
-        mu, sigma = window_rets[-252:].mean(), window_rets[-252:].std()
-        z = (raw - mu) / (sigma + 1e-10)
-    else:
-        z = raw / 0.1  # crude normalisation
-    z = float(np.clip(z, -3, 3))
-    return (z + 3) / 6 * 100
 
+    z_scores: list[float] = []
+    if m3 is not None:
+        w3 = np.array([closes[i] / closes[i - 63] - 1.0 for i in range(63, len(closes) - 21)])
+        mu3, sig3 = float(w3.mean()), float(w3.std())
+        z_scores.append((m3 - mu3) / sig3 if sig3 > 1e-10 else 0.0)
+    if m12 is not None:
+        w12 = np.array([closes[i] / closes[i - 252] - 1.0 for i in range(252, len(closes) - 21)])
+        mu12, sig12 = float(w12.mean()), float(w12.std())
+        z_scores.append((m12 - mu12) / sig12 if sig12 > 1e-10 else 0.0)
 
-def _rsi14(closes: np.ndarray) -> float:
-    """RSI(14) computed manually."""
-    if len(closes) < 15:
-        return 50.0
-    diffs = np.diff(closes[-15:])
-    gains = np.where(diffs > 0, diffs, 0.0)
-    losses = np.where(diffs < 0, -diffs, 0.0)
-    avg_gain = gains.mean()
-    avg_loss = losses.mean()
-    if avg_loss < 1e-10:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - 100.0 / (1.0 + rs)
-
-
-def _mean_reversion_score(closes: np.ndarray) -> float | None:
-    if len(closes) < 252:
+    if not z_scores:
         return None
-    rsi = _rsi14(closes)
-    mu = closes[-252:].mean()
-    sigma = closes[-252:].std()
-    z_price = (closes[-1] - mu) / (sigma + 1e-10)
-    # High RSI + extended above mean → overbought → LOW score
-    rsi_inv = 100.0 - rsi  # inverted: high RSI becomes low score component
-    z_score_inv = float(np.clip(-z_price, -3, 3))
-    z_component = (z_score_inv + 3) / 6 * 100
-    return 0.5 * rsi_inv + 0.5 * z_component
+    z = float(np.clip(float(np.mean(z_scores)), -3, 3))
+    return (z + 3) / 6 * 100
 
 
 def _vol_trend_score(closes: np.ndarray) -> float | None:
@@ -840,7 +817,6 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     mom_score     = _momentum_score(closes)
     vt_score      = _vol_trend_score(closes)
     earn_score    = _earnings_score(yf.Ticker(ticker))
-    sent_score    = _get_sentiment_score(ticker)
     insider_score = _get_insider_score(ticker)
 
     # Volume and overextension signals used by the signal job
@@ -855,7 +831,6 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.35, "null": mom_score is None},
         "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": 0.25, "null": vt_score  is None},
         "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": 0.20, "null": earn_score is None},
-        "sentiment": {"score": round(sent_score, 2) if sent_score is not None else None, "weight": 0.00, "null": sent_score is None},
         "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": 0.10, "null": insider_score is None},
     }
 
@@ -863,8 +838,9 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     total_w = sum(v["weight"] for v in available.values())
     composite = sum(v["score"] * v["weight"] / total_w for v in available.values()) if total_w > 0 else 0.0
 
-    ret_3m  = float(closes[-1] / closes[-63]  - 1.0) if len(closes) >= 64  else None
-    ret_12m = float(closes[-1] / closes[-252] - 1.0) if len(closes) >= 253 else None
+    c_lag   = closes[:-21] if len(closes) > 21 else closes
+    ret_3m  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 64  else None
+    ret_12m = float(c_lag[-1] / c_lag[-252] - 1.0) if len(c_lag) >= 253 else None
 
     atr = _atr_from_df(df)
     rets_21 = np.diff(closes[-22:]) / closes[-22:-1] if len(closes) >= 22 else np.array([0.0])
@@ -1455,14 +1431,14 @@ def _position_dollars(ticker: str, equity: float, current_price: float, score: f
                        vol_21d: Optional[float] = None) -> float:
     """Vol-targeted position size scaled by conviction score and historical ticker performance."""
     if vol_21d is not None and vol_21d > 0:
-        weight = min(0.01 / vol_21d, 0.10)
+        weight = 0.01 / vol_21d
     else:
         try:
             df = fetch_ohlcv(ticker, days=30, min_bars=22)
             c = df["Close"].values.astype(float)
             rets_21 = np.diff(c[-22:]) / c[-22:-1]
             daily_vol = float(rets_21.std())
-            weight = min(0.01 / daily_vol, 0.10) if daily_vol > 0 else 0.05
+            weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
         except Exception:
             weight = 0.05
     # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5× (capped)
@@ -1475,7 +1451,9 @@ def _position_dollars(ticker: str, equity: float, current_price: float, score: f
             perf_multiplier = 1.2
         elif perf["win_rate"] < 0.4:
             perf_multiplier = 0.7
-    return weight * equity * multiplier * perf_multiplier
+    # 10% hard cap applied after all multipliers
+    raw_dollars = weight * equity * multiplier * perf_multiplier
+    return min(raw_dollars, equity * 0.10)
 
 
 def _trading_days_between(start: datetime, end: datetime) -> int:

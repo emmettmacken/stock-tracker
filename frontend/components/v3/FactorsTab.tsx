@@ -24,11 +24,6 @@ const FACTOR_META: Record<string, { label: string; explanation: string }> = {
     explanation:
       "EPS surprise vs analyst consensus estimate over the last two reported quarters — consecutive positive beats score high; misses score low.",
   },
-  sentiment: {
-    label: "News Sentiment",
-    explanation:
-      "Aggregate sentiment score from recent news articles via Alpha Vantage. Bullish coverage scores high; bearish scores low. Shows N/A without an ALPHA_VANTAGE_KEY.",
-  },
   insider: {
     label: "Insider Activity",
     explanation:
@@ -41,7 +36,6 @@ const DEFAULT_WEIGHTS: Record<string, number> = {
   momentum: 35,
   vol_trend: 25,
   earnings: 20,
-  sentiment: 0,
   insider: 10,
 };
 

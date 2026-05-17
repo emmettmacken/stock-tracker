@@ -46,7 +46,7 @@ export interface BacktestData {
   total_bah_return: number;
   sharpe_ratio: number;
   max_drawdown: number;
-  win_rate: number;
+  win_rate_trades: number;
   num_trades: number;
   num_windows: number;
 }
@@ -66,7 +66,6 @@ export interface FactorScoreData {
     momentum: FactorDetail;
     vol_trend: FactorDetail;
     earnings: FactorDetail;
-    sentiment: FactorDetail;
     insider: FactorDetail;
   };
   composite_score: number;
