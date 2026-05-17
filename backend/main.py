@@ -80,8 +80,13 @@ def _startup() -> None:
             CronTrigger(day_of_week="mon-fri", hour=9, minute=35, timezone=ET),
             id="stoploss_job", replace_existing=True,
         )
+        _scheduler.add_job(
+            _run_adaptive_thresholds_job,
+            CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=ET),
+            id="adaptive_thresholds_job", replace_existing=True,
+        )
         _scheduler.start()
-        logger.info("Scheduler started (signal@15:45 ET, stop-loss@09:35 ET)")
+        logger.info("Scheduler started (signal@15:45 ET, stop-loss@09:35 ET, thresholds@Sun18:00 ET)")
     else:
         logger.warning("APScheduler not available — scheduled jobs disabled")
 
@@ -806,6 +811,9 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     total_w = sum(v["weight"] for v in available.values())
     composite = sum(v["score"] * v["weight"] / total_w for v in available.values()) if total_w > 0 else 0.0
 
+    ret_3m  = float(closes[-1] / closes[-63]  - 1.0) if len(closes) >= 64  else None
+    ret_12m = float(closes[-1] / closes[-252] - 1.0) if len(closes) >= 253 else None
+
     return {
         "ticker":         ticker,
         "factors":        factors,
@@ -815,6 +823,8 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "current_price":  float(closes[-1]),
         "volume_ok":      volume_ok,
         "overextended":   overextended,
+        "ret_3m":         ret_3m,
+        "ret_12m":        ret_12m,
     }
 
 
@@ -1402,7 +1412,7 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
 
 
 def _position_dollars(ticker: str, equity: float, current_price: float, score: float = 75.0) -> float:
-    """Vol-targeted position size scaled by conviction score, capped at 15% of equity."""
+    """Vol-targeted position size scaled by conviction score and historical ticker performance."""
     try:
         df = fetch_ohlcv(ticker, days=30, min_bars=22)
         c = df["Close"].values.astype(float)
@@ -1416,7 +1426,15 @@ def _position_dollars(ticker: str, equity: float, current_price: float, score: f
         weight = 0.05
     # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5× (capped)
     multiplier = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
-    return weight * equity * multiplier
+    # Performance multiplier based on ticker's historical contribution
+    perf = db.get_ticker_performance(ticker)
+    perf_multiplier = 1.0
+    if perf and perf["total_trades"] >= 3:
+        if perf["win_rate"] > 0.6:
+            perf_multiplier = 1.2
+        elif perf["win_rate"] < 0.4:
+            perf_multiplier = 0.7
+    return weight * equity * multiplier * perf_multiplier
 
 
 def _trading_days_between(start: datetime, end: datetime) -> int:
@@ -1447,6 +1465,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
         ret, hold,
         entry_log.get("composite_score") if entry_log else None,
     )
+    db.update_ticker_performance(ticker, ret, exit_reason)
     logger.info("%s: closed (%s) at %.2f (%.1f%%)", ticker, exit_reason, current_price, ret)
 
 
@@ -1454,6 +1473,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
 
 def _run_signal_job() -> None:
     logger.info("▶ Signal job starting")
+    db.set_config("last_signal_job_at", datetime.utcnow().isoformat())
     api, err = _get_alpaca()
     if api is None:
         logger.warning("Signal job aborted: %s", err)
@@ -1476,8 +1496,10 @@ def _run_signal_job() -> None:
         return
 
     spy_above, vix = _macro_regime()
-    high_vix      = vix > 30
-    buy_threshold = 85.0 if not spy_above else 75.0
+    high_vix = vix > 30
+    bull_threshold = float(db.get_config("bull_threshold", "75"))
+    bear_threshold = float(db.get_config("bear_threshold", "85"))
+    buy_threshold  = bear_threshold if not spy_above else bull_threshold
     logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f friday=%s",
                 spy_above, vix, buy_threshold, is_friday)
 
@@ -1549,6 +1571,26 @@ def _run_signal_job() -> None:
                 if result.get("overextended", False):
                     db.log_signal(ticker, composite, "BUY", "skipped", "overextended", price, atr)
                     continue
+                # Momentum quality filter: both 3m and 12m returns must be positive
+                ret_3m  = result.get("ret_3m")
+                ret_12m = result.get("ret_12m")
+                if ret_3m is not None and ret_12m is not None:
+                    if ret_3m <= 0 or ret_12m <= 0:
+                        db.log_signal(ticker, composite, "BUY", "skipped",
+                                      "momentum_disagreement", price, atr)
+                        continue
+                # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
+                perf = db.get_ticker_performance(ticker)
+                if perf and perf.get("last_exit_at"):
+                    try:
+                        last_exit = datetime.fromisoformat(perf["last_exit_at"])
+                        days_since = _trading_days_between(last_exit, datetime.now())
+                        if days_since < 5:
+                            db.log_signal(ticker, composite, "BUY", "skipped",
+                                          "reentry_cooldown", price, atr)
+                            continue
+                    except Exception:
+                        pass
                 sector = _get_sector(ticker)
                 if sector != "Unknown" and open_sector_counts.get(sector, 0) >= 2:
                     db.log_signal(ticker, composite, "BUY", "skipped",
@@ -1585,6 +1627,7 @@ def _run_signal_job() -> None:
 
 def _run_stoploss_job() -> None:
     logger.info("▶ Stop-loss job starting")
+    db.set_config("last_stoploss_job_at", datetime.utcnow().isoformat())
     api, err = _get_alpaca()
     if api is None:
         logger.warning("Stop-loss job aborted: %s", err)
@@ -1595,6 +1638,28 @@ def _run_stoploss_job() -> None:
     except Exception as e:
         logger.error("Stop-loss job: failed to list positions: %s", e)
         return
+
+    # Macro drawdown protection: close all positions if SPY fell >3% over last 5 trading days
+    try:
+        spy_hist = yf.Ticker("SPY").history(period="10d")
+        if len(spy_hist) >= 6:
+            spy_5d_ret = (float(spy_hist["Close"].iloc[-1]) / float(spy_hist["Close"].iloc[-6]) - 1.0) * 100
+            if spy_5d_ret < -3.0:
+                logger.warning("SPY 5-day return %.2f%% — macro_drawdown_protection, closing all", spy_5d_ret)
+                for pos in positions:
+                    try:
+                        _close_and_record(
+                            api, pos.symbol,
+                            float(pos.current_price), float(pos.avg_entry_price),
+                            "macro_drawdown_protection",
+                            db.get_last_buy_signal(pos.symbol),
+                        )
+                    except Exception as exc:
+                        logger.error("macro_drawdown_protection close failed %s: %s", pos.symbol, exc)
+                logger.info("◀ Stop-loss job done (macro_drawdown_protection)")
+                return
+    except Exception as exc:
+        logger.warning("SPY 5-day check failed: %s", exc)
 
     now = datetime.now()
     for pos in positions:
@@ -1636,6 +1701,68 @@ def _run_stoploss_job() -> None:
             logger.error("Stop-loss check error for %s: %s", ticker, e)
 
     logger.info("◀ Stop-loss job done")
+
+
+def _run_adaptive_thresholds_job() -> None:
+    """Weekly job: adjust buy thresholds based on last 20 closed trades."""
+    logger.info("▶ Adaptive thresholds job starting")
+    trades = db.get_last_n_trades(20)
+    if len(trades) < 5:
+        logger.info("Not enough trades to adapt thresholds (have %d, need 5)", len(trades))
+        return
+    wins = sum(1 for t in trades if t["return_pct"] > 0)
+    win_rate = wins / len(trades)
+    bull = float(db.get_config("bull_threshold", "75"))
+    bear = float(db.get_config("bear_threshold", "85"))
+    if win_rate > 0.6:
+        bull = max(70.0, bull - 5.0)
+        bear = max(80.0, bear - 5.0)
+    elif win_rate < 0.4:
+        bull = min(85.0, bull + 5.0)
+        bear = min(90.0, bear + 5.0)
+    now = datetime.utcnow().isoformat()
+    db.set_config("bull_threshold", str(bull))
+    db.set_config("bear_threshold", str(bear))
+    db.set_config("thresholds_last_updated", now)
+    logger.info("Thresholds updated: bull=%.0f bear=%.0f (win_rate=%.2f, n=%d)",
+                bull, bear, win_rate, len(trades))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANALYTICS API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/analytics")
+def get_analytics():
+    stats = db.get_analytics_data()
+    bull_threshold = float(db.get_config("bull_threshold", "75"))
+    bear_threshold = float(db.get_config("bear_threshold", "85"))
+    thresholds_updated = db.get_config("thresholds_last_updated", "") or None
+    last_signal_job    = db.get_config("last_signal_job_at", "") or None
+    last_stoploss_job  = db.get_config("last_stoploss_job_at", "") or None
+    open_positions = 0
+    api, _ = _get_alpaca()
+    if api:
+        try:
+            open_positions = len(api.get_all_positions())
+        except Exception:
+            pass
+    return {
+        "by_exit_reason":  stats["by_exit_reason"],
+        "by_score_bucket": stats["by_score_bucket"],
+        "by_ticker":       stats["by_ticker"],
+        "adaptive_thresholds": {
+            "bull":         bull_threshold,
+            "bear":         bear_threshold,
+            "last_updated": thresholds_updated,
+        },
+        "system_health": {
+            "last_signal_job":    last_signal_job,
+            "last_stoploss_job":  last_stoploss_job,
+            "open_positions":     open_positions,
+            "total_closed_trades": stats["total_closed_trades"],
+        },
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -3,6 +3,7 @@ import {
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
+  AnalyticsData,
 } from "./types";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -148,5 +149,11 @@ export async function fetchSignalLog(limit = 50): Promise<SignalLogEntry[]> {
 export async function triggerSignalJob(): Promise<{ status: string; message: string }> {
   const res = await fetch(`${BASE}/api/paper/run-now`, { method: "POST" });
   if (!res.ok) throw new Error("Failed to trigger signal job");
+  return res.json();
+}
+
+export async function fetchAnalytics(): Promise<AnalyticsData> {
+  const res = await fetch(`${BASE}/api/analytics`);
+  if (!res.ok) throw new Error("Failed to fetch analytics");
   return res.json();
 }

@@ -20,16 +20,19 @@ function ActionPill({ action }: { action: string }) {
 }
 
 const SKIP_LABELS: Record<string, string> = {
-  hold_or_below_threshold: "Hold / below threshold",
-  already_in_position:     "Already in position",
-  earnings_within_2d:      "Earnings within 2 days",
-  data_unavailable:        "Data unavailable",
-  friday_no_entry:         "No entries on Fridays",
-  low_volume:              "Volume < 1.2× 20-day avg",
-  overextended:            "Price >15% above MA20",
-  sector_concentration:    "Sector limit (max 2)",
-  sell_signal:             "Sell signal triggered",
-  score_deterioration:     "Score fell below 40",
+  hold_or_below_threshold:    "Hold / below threshold",
+  already_in_position:        "Already in position",
+  earnings_within_2d:         "Earnings within 2 days",
+  data_unavailable:           "Data unavailable",
+  friday_no_entry:            "No entries on Fridays",
+  low_volume:                 "Volume < 1.2× 20-day avg",
+  overextended:               "Price >15% above MA20",
+  sector_concentration:       "Sector limit (max 2)",
+  sell_signal:                "Sell signal triggered",
+  score_deterioration:        "Score fell below 40",
+  momentum_disagreement:      "3m/12m momentum disagree",
+  reentry_cooldown:           "Re-entry cooldown (5d)",
+  macro_drawdown_protection:  "Macro drawdown protection",
 };
 
 function formatSkipReason(reason: string): string {

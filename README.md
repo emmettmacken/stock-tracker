@@ -103,13 +103,28 @@ To test without waiting for market hours, use the **"Run signals now"** button o
 
 ---
 
+## Adaptive Threshold System
+
+Buy thresholds self-tune weekly based on recent signal performance:
+
+| Condition (last 20 trades) | Effect |
+|---|---|
+| Win rate > 60% | Bull threshold lowered by 5 pts, bear threshold lowered by 5 pts |
+| Win rate < 40% | Bull threshold raised by 5 pts, bear threshold raised by 5 pts |
+| Otherwise | No change |
+
+Bounds: bull threshold 70–85, bear threshold 80–90. Defaults are 75 (bull) / 85 (bear). Values persist in `system_config` and are applied by the signal job at runtime. The weekly adjustment runs every Sunday at 18:00 ET.
+
+---
+
 ## Macro Regime Gate
 
 | Condition | Effect |
 |---|---|
-| SPY below 200-day MA | Buy threshold raised from 65 → 75 (composite score) |
+| SPY below 200-day MA | Buy threshold raised to adaptive bear threshold (default 85) |
 | VIX > 30 | All new buys skipped regardless of score |
 | Earnings within 2 days | Ticker skipped entirely for that session |
+| SPY fell > 3% over last 5 trading days | All open positions closed immediately (macro_drawdown_protection) |
 
 ---
 
@@ -132,6 +147,12 @@ Common `skip_reason` values:
 | `earnings_within_2d` | Earnings announcement imminent |
 | `vix_too_high:XX.X` | VIX exceeded 30 |
 | `data_unavailable` | yfinance failed to return data |
+| `momentum_disagreement` | 3-month or 12-month return is negative (avoid short-term bounces in downtrends) |
+| `reentry_cooldown` | Ticker closed for a non-signal reason within the last 5 trading days |
+| `sector_concentration` | Sector already has 2 open positions |
+| `low_volume` | Volume below 1.2× 20-day average |
+| `overextended` | Price more than 15% above 20-day MA |
+| `friday_no_entry` | No new positions opened on Fridays |
 
 ---
 
@@ -169,6 +190,7 @@ Common `skip_reason` values:
 | `GET /api/paper/history` | Closed trade history with return %, exit reason |
 | `GET /api/signals/log?limit=50` | Recent signal log entries |
 | `POST /api/paper/run-now` | Manually trigger signal job (background thread) |
+| `GET /api/analytics` | Score calibration, exit breakdown, ticker performance, adaptive thresholds, system health |
 
 ---
 

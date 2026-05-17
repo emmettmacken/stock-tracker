@@ -4,7 +4,11 @@ import { AccountSummary } from "@/components/v4/AccountSummary";
 import { PositionsTable } from "@/components/v4/PositionsTable";
 import { SignalLogFeed } from "@/components/v4/SignalLogFeed";
 import { ClosedTradesPanel } from "@/components/v4/ClosedTradesPanel";
+import { AnalyticsTab } from "@/components/v4/AnalyticsTab";
 import { triggerSignalJob } from "@/lib/api";
+
+const TABS = ["Overview", "Signal Log", "Closed Trades", "Analytics"] as const;
+type Tab = (typeof TABS)[number];
 
 function SectionHeader({ title, sub }: { title: string; sub?: string }) {
   return (
@@ -15,7 +19,28 @@ function SectionHeader({ title, sub }: { title: string; sub?: string }) {
   );
 }
 
+function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void }) {
+  return (
+    <div className="flex gap-1 border-b border-zinc-800 mb-6">
+      {TABS.map((t) => (
+        <button
+          key={t}
+          onClick={() => onChange(t)}
+          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
+            active === t
+              ? "border-zinc-300 text-zinc-100"
+              : "border-transparent text-zinc-500 hover:text-zinc-300"
+          }`}
+        >
+          {t}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function AutomationPage() {
+  const [activeTab, setActiveTab] = useState<Tab>("Overview");
   const [running, setRunning] = useState(false);
   const [runMsg, setRunMsg] = useState<string | null>(null);
   const [logRefresh, setLogRefresh] = useState(0);
@@ -26,7 +51,6 @@ export default function AutomationPage() {
     try {
       const res = await triggerSignalJob();
       setRunMsg(res.message);
-      // Give the background job 3 s to log initial entries, then refresh the feed
       setTimeout(() => setLogRefresh((n) => n + 1), 3000);
     } catch (e) {
       setRunMsg(e instanceof Error ? e.message : "Failed to start job");
@@ -37,7 +61,7 @@ export default function AutomationPage() {
 
   return (
     <div className="min-h-screen bg-zinc-950 text-white">
-      <div className="max-w-5xl mx-auto px-4 py-8 space-y-8">
+      <div className="max-w-5xl mx-auto px-4 py-8 space-y-6">
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">Automation</h1>
@@ -64,22 +88,24 @@ export default function AutomationPage() {
           </div>
         </header>
 
-        {/* Account strip */}
-        <section>
-          <AccountSummary />
-        </section>
+        <TabBar active={activeTab} onChange={setActiveTab} />
 
-        {/* Open positions */}
-        <section>
-          <SectionHeader
-            title="Open Positions"
-            sub="ATR stop = entry − 1.5 × 21d ATR at signal. Positions auto-close after 21 trading days."
-          />
-          <PositionsTable />
-        </section>
+        {activeTab === "Overview" && (
+          <div className="space-y-8">
+            <section>
+              <AccountSummary />
+            </section>
+            <section>
+              <SectionHeader
+                title="Open Positions"
+                sub="ATR stop = entry − 1.5 × 21d ATR at signal. Positions auto-close after 21 trading days."
+              />
+              <PositionsTable />
+            </section>
+          </div>
+        )}
 
-        {/* Signal log + Closed trades side-by-side on wider screens */}
-        <div className="grid gap-8 lg:grid-cols-2">
+        {activeTab === "Signal Log" && (
           <section>
             <SectionHeader
               title="Signal Log"
@@ -87,7 +113,9 @@ export default function AutomationPage() {
             />
             <SignalLogFeed refreshTrigger={logRefresh} />
           </section>
+        )}
 
+        {activeTab === "Closed Trades" && (
           <section>
             <SectionHeader
               title="Closed Trades"
@@ -95,7 +123,13 @@ export default function AutomationPage() {
             />
             <ClosedTradesPanel />
           </section>
-        </div>
+        )}
+
+        {activeTab === "Analytics" && (
+          <section>
+            <AnalyticsTab />
+          </section>
+        )}
       </div>
     </div>
   );

@@ -208,3 +208,42 @@ export interface PortfolioBacktestResult {
   rebalance_events: RebalanceEvent[];
   efficient_frontier: EfficientFrontierPoint[];
 }
+
+// ── Analytics Types ───────────────────────────────────────────────────────────
+
+export interface AnalyticsExitReason {
+  exit_reason: string;
+  avg_return: number;
+  count: number;
+}
+
+export interface AnalyticsScoreBucket {
+  bucket: string;
+  avg_return: number;
+  win_rate: number;
+  count: number;
+}
+
+export interface AnalyticsTickerPerf {
+  ticker: string;
+  total_trades: number;
+  win_rate: number;
+  avg_return: number;
+}
+
+export interface AnalyticsData {
+  by_exit_reason: AnalyticsExitReason[];
+  by_score_bucket: AnalyticsScoreBucket[];
+  by_ticker: AnalyticsTickerPerf[];
+  adaptive_thresholds: {
+    bull: number;
+    bear: number;
+    last_updated: string | null;
+  };
+  system_health: {
+    last_signal_job: string | null;
+    last_stoploss_job: string | null;
+    open_positions: number;
+    total_closed_trades: number;
+  };
+}

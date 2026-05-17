@@ -51,6 +51,21 @@ def init_db() -> None:
                 composite_score_at_entry REAL,
                 exit_timestamp           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS ticker_performance (
+                ticker        TEXT PRIMARY KEY,
+                total_trades  INTEGER DEFAULT 0,
+                win_rate      REAL DEFAULT 0.5,
+                avg_return    REAL DEFAULT 0.0,
+                last_updated  TIMESTAMP,
+                last_exit_at  TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS system_config (
+                key        TEXT PRIMARY KEY,
+                value      TEXT,
+                updated_at TIMESTAMP
+            );
         """)
     _run_migrations()
 
@@ -197,3 +212,138 @@ def get_trade_history() -> list[dict]:
                ORDER BY t.exit_timestamp DESC"""
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_last_n_trades(n: int = 20) -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC LIMIT ?", (n,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Ticker performance ────────────────────────────────────────────────────────
+
+def update_ticker_performance(ticker: str, return_pct: float, exit_reason: str) -> None:
+    """Upsert ticker win-rate / avg-return stats and optionally set last_exit_at for cooldown."""
+    ticker = ticker.upper()
+    now = datetime.utcnow().isoformat()
+    is_win = 1.0 if return_pct > 0 else 0.0
+    set_exit_at = exit_reason != "sell_signal"
+
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT total_trades, win_rate, avg_return FROM ticker_performance WHERE ticker = ?",
+            (ticker,),
+        ).fetchone()
+
+        if row:
+            old_total = row["total_trades"]
+            new_total = old_total + 1
+            new_win_rate = (row["win_rate"] * old_total + is_win) / new_total
+            new_avg_return = (row["avg_return"] * old_total + return_pct) / new_total
+            if set_exit_at:
+                conn.execute(
+                    """UPDATE ticker_performance
+                       SET total_trades=?, win_rate=?, avg_return=?, last_updated=?, last_exit_at=?
+                       WHERE ticker=?""",
+                    (new_total, new_win_rate, new_avg_return, now, now, ticker),
+                )
+            else:
+                conn.execute(
+                    """UPDATE ticker_performance
+                       SET total_trades=?, win_rate=?, avg_return=?, last_updated=?
+                       WHERE ticker=?""",
+                    (new_total, new_win_rate, new_avg_return, now, ticker),
+                )
+        else:
+            last_exit_at = now if set_exit_at else None
+            conn.execute(
+                """INSERT INTO ticker_performance
+                   (ticker, total_trades, win_rate, avg_return, last_updated, last_exit_at)
+                   VALUES (?, 1, ?, ?, ?, ?)""",
+                (ticker, is_win, return_pct, now, last_exit_at),
+            )
+
+
+def get_ticker_performance(ticker: str) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ticker_performance WHERE ticker = ?", (ticker.upper(),)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# ── System config ─────────────────────────────────────────────────────────────
+
+def get_config(key: str, default: str = "") -> str:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM system_config WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_config(key: str, value: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO system_config (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            (key, value, datetime.utcnow().isoformat()),
+        )
+
+
+# ── Analytics queries ─────────────────────────────────────────────────────────
+
+def get_analytics_data() -> dict:
+    with _conn() as conn:
+        exit_rows = conn.execute(
+            """SELECT exit_reason,
+                      ROUND(AVG(return_pct), 2) as avg_return,
+                      COUNT(*) as count
+               FROM trade_outcomes
+               GROUP BY exit_reason
+               ORDER BY exit_reason"""
+        ).fetchall()
+
+        bucket_rows = conn.execute(
+            """SELECT
+                   CASE
+                       WHEN composite_score_at_entry >= 90 THEN '90+'
+                       WHEN composite_score_at_entry >= 85 THEN '85-90'
+                       WHEN composite_score_at_entry >= 80 THEN '80-85'
+                       WHEN composite_score_at_entry >= 75 THEN '75-80'
+                   END as bucket,
+                   ROUND(AVG(return_pct), 2)                              as avg_return,
+                   ROUND(AVG(CASE WHEN return_pct > 0 THEN 1.0 ELSE 0.0 END), 4) as win_rate,
+                   COUNT(*) as count
+               FROM trade_outcomes
+               WHERE composite_score_at_entry IS NOT NULL
+                 AND composite_score_at_entry >= 75
+               GROUP BY bucket"""
+        ).fetchall()
+
+        ticker_rows = conn.execute(
+            """SELECT ticker, total_trades,
+                      ROUND(win_rate, 4)   as win_rate,
+                      ROUND(avg_return, 2) as avg_return
+               FROM ticker_performance
+               ORDER BY win_rate DESC"""
+        ).fetchall()
+
+        total_closed = conn.execute(
+            "SELECT COUNT(*) as c FROM trade_outcomes"
+        ).fetchone()["c"]
+
+    bucket_order = {"75-80": 0, "80-85": 1, "85-90": 2, "90+": 3}
+    by_score_bucket = sorted(
+        [dict(r) for r in bucket_rows if r["bucket"] is not None],
+        key=lambda x: bucket_order.get(x["bucket"], 99),
+    )
+
+    return {
+        "by_exit_reason":  [dict(r) for r in exit_rows],
+        "by_score_bucket": by_score_bucket,
+        "by_ticker":       [dict(r) for r in ticker_rows],
+        "total_closed_trades": total_closed,
+    }
