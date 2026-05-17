@@ -1,7 +1,5 @@
 "use client";
-import { useState, useEffect } from "react";
 import { TradeOutcome } from "@/lib/types";
-import { fetchTradeHistory } from "@/lib/api";
 import { Skeleton } from "@/components/v3/Skeleton";
 
 const EXIT_LABELS: Record<string, string> = {
@@ -33,27 +31,20 @@ function StatChip({ label, value, positive }: { label: string; value: string; po
   );
 }
 
-export function ClosedTradesPanel() {
-  const [trades, setTrades] = useState<TradeOutcome[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+interface Props {
+  trades: TradeOutcome[] | null;
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
+}
 
-  function load() {
-    setError(null);
-    fetchTradeHistory()
-      .then(setTrades)
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }
-
-  useEffect(() => { load(); }, []);
-
+export function ClosedTradesPanel({ trades, loading, error, onRetry }: Props) {
   if (loading) return <Skeleton className="h-40 w-full" />;
 
   if (error) return (
     <div className="text-red-400 text-xs py-4">
       {error}
-      <button onClick={load} className="ml-2 underline text-zinc-400 hover:text-white">Retry</button>
+      <button onClick={onRetry} className="ml-2 underline text-zinc-400 hover:text-white">Retry</button>
     </div>
   );
 

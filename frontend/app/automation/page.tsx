@@ -1,11 +1,16 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { PaperAccount, PaperPosition, SignalLogEntry, TradeOutcome } from "@/lib/types";
 import { AccountSummary } from "@/components/v4/AccountSummary";
 import { PositionsTable } from "@/components/v4/PositionsTable";
 import { SignalLogFeed } from "@/components/v4/SignalLogFeed";
 import { ClosedTradesPanel } from "@/components/v4/ClosedTradesPanel";
 import { AnalyticsTab } from "@/components/v4/AnalyticsTab";
-import { triggerSignalJob } from "@/lib/api";
+import {
+  triggerSignalJob,
+  fetchPaperAccount, fetchPaperPositions,
+  fetchSignalLog, fetchTradeHistory,
+} from "@/lib/api";
 
 const TABS = ["Overview", "Signal Log", "Closed Trades", "Analytics"] as const;
 type Tab = (typeof TABS)[number];
@@ -43,15 +48,68 @@ export default function AutomationPage() {
   const [activeTab, setActiveTab] = useState<Tab>("Overview");
   const [running, setRunning] = useState(false);
   const [runMsg, setRunMsg] = useState<string | null>(null);
-  const [logRefresh, setLogRefresh] = useState(0);
 
+  // ── Shared data state (single 60s polling interval) ──────────────────────────
+  const [account, setAccount] = useState<PaperAccount | null>(null);
+  const [positionsData, setPositionsData] = useState<{
+    available: boolean; positions?: PaperPosition[]; error?: string;
+  } | null>(null);
+  const [positionsLoading, setPositionsLoading] = useState(true);
+  const [overviewUpdated, setOverviewUpdated] = useState<Date | null>(null);
+
+  const [signalLog, setSignalLog] = useState<SignalLogEntry[] | null>(null);
+  const [signalLogLoading, setSignalLogLoading] = useState(true);
+  const [signalLogError, setSignalLogError] = useState<string | null>(null);
+
+  const [trades, setTrades] = useState<TradeOutcome[] | null>(null);
+  const [tradesLoading, setTradesLoading] = useState(true);
+  const [tradesError, setTradesError] = useState<string | null>(null);
+
+  // ── Fetch helpers ─────────────────────────────────────────────────────────────
+  const loadOverview = useCallback(() => {
+    fetchPaperAccount().then(setAccount).catch(() => {});
+    setPositionsLoading(true);
+    fetchPaperPositions()
+      .then((d) => { setPositionsData(d); setOverviewUpdated(new Date()); })
+      .catch((e) => setPositionsData({ available: false, error: e.message }))
+      .finally(() => setPositionsLoading(false));
+  }, []);
+
+  const loadSignalLog = useCallback(() => {
+    setSignalLogLoading(true);
+    setSignalLogError(null);
+    fetchSignalLog(50)
+      .then(setSignalLog)
+      .catch((e) => setSignalLogError(e.message))
+      .finally(() => setSignalLogLoading(false));
+  }, []);
+
+  const loadTrades = useCallback(() => {
+    setTradesLoading(true);
+    setTradesError(null);
+    fetchTradeHistory()
+      .then(setTrades)
+      .catch((e) => setTradesError(e.message))
+      .finally(() => setTradesLoading(false));
+  }, []);
+
+  // Single 60s interval drives all polling
+  useEffect(() => {
+    loadOverview();
+    loadSignalLog();
+    loadTrades();
+    const id = setInterval(loadOverview, 60_000);
+    return () => clearInterval(id);
+  }, [loadOverview, loadSignalLog, loadTrades]);
+
+  // ── Run signals now ───────────────────────────────────────────────────────────
   async function handleRunNow() {
     setRunning(true);
     setRunMsg(null);
     try {
       const res = await triggerSignalJob();
       setRunMsg(res.message);
-      setTimeout(() => setLogRefresh((n) => n + 1), 3000);
+      setTimeout(loadSignalLog, 3000);
     } catch (e) {
       setRunMsg(e instanceof Error ? e.message : "Failed to start job");
     } finally {
@@ -93,14 +151,18 @@ export default function AutomationPage() {
         {activeTab === "Overview" && (
           <div className="space-y-8">
             <section>
-              <AccountSummary />
+              <AccountSummary data={account} lastUpdated={overviewUpdated} />
             </section>
             <section>
               <SectionHeader
                 title="Open Positions"
                 sub="ATR stop = entry − 1.5 × 21d ATR at signal. Positions auto-close after 21 trading days."
               />
-              <PositionsTable />
+              <PositionsTable
+                data={positionsData}
+                loading={positionsLoading}
+                lastUpdated={overviewUpdated}
+              />
             </section>
           </div>
         )}
@@ -111,7 +173,12 @@ export default function AutomationPage() {
               title="Signal Log"
               sub="Last 50 decisions — what the system did and why it skipped"
             />
-            <SignalLogFeed refreshTrigger={logRefresh} />
+            <SignalLogFeed
+              entries={signalLog}
+              loading={signalLogLoading}
+              error={signalLogError}
+              onRetry={loadSignalLog}
+            />
           </section>
         )}
 
@@ -121,7 +188,12 @@ export default function AutomationPage() {
               title="Closed Trades"
               sub="Completed paper trades with aggregate performance stats"
             />
-            <ClosedTradesPanel />
+            <ClosedTradesPanel
+              trades={trades}
+              loading={tradesLoading}
+              error={tradesError}
+              onRetry={loadTrades}
+            />
           </section>
         )}
 

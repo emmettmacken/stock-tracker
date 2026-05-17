@@ -5,6 +5,7 @@ import time
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -41,6 +42,23 @@ try:
 except Exception:
     TradingClient = None  # type: ignore[assignment]
     ALPACA_OK = False
+
+# Module-level Alpaca singleton — initialized once at import time after load_dotenv()
+_ak, _sk = os.getenv("ALPACA_API_KEY", ""), os.getenv("ALPACA_SECRET_KEY", "")
+if ALPACA_OK and _ak and _sk:
+    try:
+        _alpaca_client: "TradingClient | None" = TradingClient(api_key=_ak, secret_key=_sk, paper=True)
+        _alpaca_err: "str | None" = None
+    except Exception as _e:
+        _alpaca_client = None
+        _alpaca_err = str(_e)
+elif not ALPACA_OK:
+    _alpaca_client = None
+    _alpaca_err = "alpaca-py not installed"
+else:
+    _alpaca_client = None
+    _alpaca_err = "ALPACA_API_KEY / ALPACA_SECRET_KEY not set in .env"
+del _ak, _sk
 
 import database as db
 
@@ -95,6 +113,10 @@ def _startup() -> None:
 def _shutdown() -> None:
     if SCHEDULER_OK and _scheduler is not None and _scheduler.running:
         _scheduler.shutdown(wait=False)
+    try:
+        _http_client.close()
+    except Exception:
+        pass
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +136,21 @@ _SENTIMENT_LAST_CALL = 0.0
 _SENTIMENT_MIN_INTERVAL = 13.0  # ~4.5 req/min, safely under the 5/min AV free-tier limit
 _SECTOR_CACHE: dict[str, tuple[str, float]] = {}  # ticker → (sector, timestamp)
 _SECTOR_TTL = 86400  # 24 hours
+
+# Shared httpx client — connection pooling, avoid per-request TLS handshakes
+_http_client = httpx.Client(timeout=15.0, follow_redirects=True)
+
+# Per-ticker factor cache (60s TTL — avoids triple yfinance call per signal job tick)
+_FACTORS_CACHE: dict[str, tuple[dict, float]] = {}
+_FACTORS_TTL = 60  # seconds
+
+# Earnings calendar cache (24h TTL — earnings dates don't change intraday)
+_EARNINGS_CACHE: dict[str, tuple[bool, float]] = {}
+_EARNINGS_TTL = 86400  # 24 hours
+
+# Macro regime cache (5-min TTL — SPY/VIX checked once per signal job, not per ticker)
+_MACRO_CACHE: Optional[tuple] = None  # ((spy_above, vix), timestamp)
+_MACRO_TTL = 300  # seconds
 
 # ── State helpers ─────────────────────────────────────────────────────────────
 
@@ -172,8 +209,9 @@ def build_matrix(
     Rows < MIN_OBS fall back to `fallback` (uniform if not given).
     """
     counts = np.zeros((N_ST, N_ST), dtype=float)
-    for a, b in zip(states[:-1], states[1:]):
-        counts[a, b] += 1
+    if len(states) > 1:
+        states_arr = np.array(states, dtype=int)
+        np.add.at(counts, (states_arr[:-1], states_arr[1:]), 1)
     row_obs = counts.sum(axis=1)
     fb = fallback if fallback is not None else np.full(N_ST, 1.0 / N_ST)
     mat = np.zeros((N_ST, N_ST), dtype=float)
@@ -187,7 +225,10 @@ def build_matrix(
 def stationary(mat: np.ndarray, iters: int = 1000) -> np.ndarray:
     pi = np.full(mat.shape[0], 1.0 / mat.shape[0])
     for _ in range(iters):
-        pi = pi @ mat
+        new_pi = pi @ mat
+        if np.max(np.abs(new_pi - pi)) < 1e-10:
+            return new_pi
+        pi = new_pi
     return pi
 
 # ── HMM regime detection ──────────────────────────────────────────────────────
@@ -308,7 +349,7 @@ def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: i
             )
             if df.empty or len(df) < min_bars:
                 raise HTTPException(status_code=404, detail=f"Insufficient data for '{ticker}'")
-            return df[["Close", "Volume"]].dropna()
+            return df[["High", "Low", "Close", "Volume"]].dropna()
         except HTTPException:
             raise
         except Exception as exc:
@@ -327,6 +368,15 @@ def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: i
     if isinstance(last_exc, (YFTzMissingError, YFTickerMissingError)):
         raise HTTPException(status_code=404, detail=f"'{ticker}' not found after {max_retries} attempts")
     raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
+
+def _atr_from_df(df: pd.DataFrame, period: int = 21) -> float:
+    """Compute ATR from a DataFrame that has High/Low/Close columns."""
+    if len(df) < period + 1:
+        return 0.0
+    h, l, c = df["High"].values, df["Low"].values, df["Close"].values
+    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+    return float(tr[-period:].mean())
+
 
 # ── /api/quote ────────────────────────────────────────────────────────────────
 
@@ -679,8 +729,7 @@ def _get_sentiment_score(ticker: str) -> float | None:
             f"https://www.alphavantage.co/query"
             f"?function=NEWS_SENTIMENT&tickers={ticker}&apikey={api_key}"
         )
-        with httpx.Client(timeout=10) as client:
-            resp = client.get(url)
+        resp = _http_client.get(url)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -714,8 +763,7 @@ def _get_insider_score(ticker: str) -> float | None:
             f"&dateRange=custom&startdt={start}&enddt={today}&forms=4"
         )
         headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
-            resp = client.get(url, headers=headers)
+        resp = _http_client.get(url, headers=headers)
         if resp.status_code != 200:
             return None
         hits = resp.json().get("hits", {}).get("hits", [])
@@ -753,6 +801,10 @@ def _get_sector(ticker: str) -> str:
 
 def _compute_factors(ticker: str) -> Optional[dict]:
     """Core factor computation shared by the API endpoint and the scheduler."""
+    cached_result, cached_ts = _FACTORS_CACHE.get(ticker, ({}, 0.0))
+    if cached_result and (time.time() - cached_ts) < _FACTORS_TTL:
+        return cached_result
+
     try:
         df = fetch_ohlcv(ticker, days=760, min_bars=260)
     except Exception:
@@ -814,7 +866,11 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     ret_3m  = float(closes[-1] / closes[-63]  - 1.0) if len(closes) >= 64  else None
     ret_12m = float(closes[-1] / closes[-252] - 1.0) if len(closes) >= 253 else None
 
-    return {
+    atr = _atr_from_df(df)
+    rets_21 = np.diff(closes[-22:]) / closes[-22:-1] if len(closes) >= 22 else np.array([0.0])
+    vol_21d = float(rets_21.std())
+
+    result = {
         "ticker":         ticker,
         "factors":        factors,
         "composite_score": round(composite, 2),
@@ -825,21 +881,20 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "overextended":   overextended,
         "ret_3m":         ret_3m,
         "ret_12m":        ret_12m,
+        "atr":            atr,
+        "vol_21d":        vol_21d,
     }
+    _FACTORS_CACHE[ticker] = (result, time.time())
+    return result
 
 
 @app.get("/api/factors/{ticker}")
 def get_factors(ticker: str):
     ticker = ticker.upper()
-    # Surface HTTPException messages the same way as before
-    try:
-        fetch_ohlcv(ticker, days=10, min_bars=2)  # fast check for existence
-    except HTTPException as e:
-        return {"error": e.detail}
     result = _compute_factors(ticker)
     if result is None:
         return {"error": f"Failed to compute factors for '{ticker}'"}
-    return {k: v for k, v in result.items() if k != "current_price"}
+    return {k: v for k, v in result.items() if k not in ("current_price", "atr", "vol_21d")}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -869,8 +924,7 @@ def get_sentiment(ticker: str):
             f"https://www.alphavantage.co/query"
             f"?function=NEWS_SENTIMENT&tickers={ticker}&apikey={api_key}"
         )
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(url)
+        resp = _http_client.get(url)
         if resp.status_code != 200:
             return {"available": False}
         data = resp.json()
@@ -936,8 +990,7 @@ def get_insider(ticker: str):
             f"&dateRange=custom&startdt={start}&enddt={today}&forms=4"
         )
         headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
-        with httpx.Client(timeout=15, follow_redirects=True) as client:
-            resp = client.get(url, headers=headers)
+        resp = _http_client.get(url, headers=headers)
         if resp.status_code != 200:
             return {"available": False}
         data = resp.json()
@@ -990,8 +1043,7 @@ def get_short_interest(ticker: str):
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
-        with httpx.Client(timeout=15, follow_redirects=True) as client:
-            resp = client.get(url, headers=headers)
+        resp = _http_client.get(url, headers=headers)
         if resp.status_code != 200:
             return {"available": False}
 
@@ -1170,15 +1222,20 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         tickers = [t.upper() for t in req.tickers]
         TRAIN, TEST = 252, 21
 
-        # Fetch all tickers + SPY
+        # Fetch all tickers + SPY in parallel
         all_tickers = list(set(tickers + ["SPY"]))
         dfs: dict[str, pd.DataFrame] = {}
-        for t in all_tickers:
+
+        def _fetch_one(t: str):
             try:
-                df = fetch_ohlcv(t, days=760, min_bars=TRAIN + TEST + 5)
-                dfs[t] = df
+                return t, fetch_ohlcv(t, days=760, min_bars=TRAIN + TEST + 5)
             except Exception:
-                pass
+                return t, None
+
+        with ThreadPoolExecutor(max_workers=min(8, len(all_tickers))) as pool:
+            for t, df in pool.map(_fetch_one, all_tickers):
+                if df is not None:
+                    dfs[t] = df
 
         valid = [t for t in tickers if t in dfs]
         if not valid:
@@ -1340,35 +1397,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 # AUTOMATION HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _get_alpaca():
-    """Return configured Alpaca TradingClient or (None, reason_str)."""
-    if not ALPACA_OK:
-        return None, "alpaca-py not installed"
-    key = os.getenv("ALPACA_API_KEY", "")
-    secret = os.getenv("ALPACA_SECRET_KEY", "")
-    if not key or not secret:
-        return None, "ALPACA_API_KEY / ALPACA_SECRET_KEY not set in .env"
-    try:
-        return TradingClient(api_key=key, secret_key=secret, paper=True), None
-    except Exception as e:
-        return None, str(e)
-
-
-def _compute_atr(ticker: str, period: int = 21) -> float:
-    """Average True Range over `period` days."""
-    try:
-        df = yf.Ticker(ticker).history(period="3mo")
-        if len(df) < period + 1:
-            return 0.0
-        h, l, c = df["High"].values, df["Low"].values, df["Close"].values
-        tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-        return float(tr[-period:].mean())
-    except Exception:
-        return 0.0
-
-
 def _macro_regime() -> tuple[bool, float]:
     """Returns (spy_above_200d_ma, vix_level)."""
+    global _MACRO_CACHE
+    if _MACRO_CACHE is not None and (time.time() - _MACRO_CACHE[1]) < _MACRO_TTL:
+        return _MACRO_CACHE[0]
     spy_above = True
     try:
         h = yf.Ticker("SPY").history(period="1y")
@@ -1383,47 +1416,55 @@ def _macro_regime() -> tuple[bool, float]:
             vix = float(h["Close"].iloc[-1])
     except Exception:
         pass
-    return spy_above, vix
+    result = (spy_above, vix)
+    _MACRO_CACHE = (result, time.time())
+    return result
 
 
 def _earnings_within_days(ticker: str, days: int = 2) -> bool:
     """Return True if earnings announcement is within `days` calendar days."""
+    cached = _EARNINGS_CACHE.get(ticker)
+    if cached is not None and (time.time() - cached[1]) < _EARNINGS_TTL:
+        return cached[0]
+    result = False
     try:
         cal = yf.Ticker(ticker).calendar
-        if cal is None:
-            return False
-        dates = []
-        if isinstance(cal, dict):
-            raw = cal.get("Earnings Date", [])
-            dates = raw if isinstance(raw, list) else [raw]
-        elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
-            dates = cal["Earnings Date"].tolist()
-        now = datetime.now()
-        for d in dates:
-            try:
-                dt = d.replace(tzinfo=None) if hasattr(d, "tzinfo") else datetime.fromisoformat(str(d))
-                if abs((dt - now).days) <= days:
-                    return True
-            except Exception:
-                pass
-        return False
+        if cal is not None:
+            dates = []
+            if isinstance(cal, dict):
+                raw = cal.get("Earnings Date", [])
+                dates = raw if isinstance(raw, list) else [raw]
+            elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+                dates = cal["Earnings Date"].tolist()
+            now = datetime.now()
+            for d in dates:
+                try:
+                    dt = d.replace(tzinfo=None) if hasattr(d, "tzinfo") else datetime.fromisoformat(str(d))
+                    if abs((dt - now).days) <= days:
+                        result = True
+                        break
+                except Exception:
+                    pass
     except Exception:
-        return False
+        pass
+    _EARNINGS_CACHE[ticker] = (result, time.time())
+    return result
 
 
-def _position_dollars(ticker: str, equity: float, current_price: float, score: float = 75.0) -> float:
+def _position_dollars(ticker: str, equity: float, current_price: float, score: float = 75.0,
+                       vol_21d: Optional[float] = None) -> float:
     """Vol-targeted position size scaled by conviction score and historical ticker performance."""
-    try:
-        df = fetch_ohlcv(ticker, days=30, min_bars=22)
-        c = df["Close"].values.astype(float)
-        rets_21 = np.diff(c[-22:]) / c[-22:-1]
-        daily_vol = float(rets_21.std())
-        if daily_vol > 0:
-            weight = min(0.01 / daily_vol, 0.10)
-        else:
+    if vol_21d is not None and vol_21d > 0:
+        weight = min(0.01 / vol_21d, 0.10)
+    else:
+        try:
+            df = fetch_ohlcv(ticker, days=30, min_bars=22)
+            c = df["Close"].values.astype(float)
+            rets_21 = np.diff(c[-22:]) / c[-22:-1]
+            daily_vol = float(rets_21.std())
+            weight = min(0.01 / daily_vol, 0.10) if daily_vol > 0 else 0.05
+        except Exception:
             weight = 0.05
-    except Exception:
-        weight = 0.05
     # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5× (capped)
     multiplier = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
     # Performance multiplier based on ticker's historical contribution
@@ -1474,7 +1515,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
 def _run_signal_job() -> None:
     logger.info("▶ Signal job starting")
     db.set_config("last_signal_job_at", datetime.utcnow().isoformat())
-    api, err = _get_alpaca()
+    api, err = _alpaca_client, _alpaca_err
     if api is None:
         logger.warning("Signal job aborted: %s", err)
         return
@@ -1524,7 +1565,7 @@ def _run_signal_job() -> None:
             composite  = result["composite_score"]
             hmm_signal = result["hmm_signal"]
             price      = result["current_price"]
-            atr        = _compute_atr(ticker)
+            atr        = result.get("atr", 0.0)
             in_pos     = ticker in positions
 
             # Score deterioration — close regardless of HMM signal
@@ -1597,7 +1638,7 @@ def _run_signal_job() -> None:
                                   "sector_concentration", price, atr)
                     continue
 
-                dollars = _position_dollars(ticker, equity, price, composite)
+                dollars = _position_dollars(ticker, equity, price, composite, vol_21d=result.get("vol_21d"))
                 try:
                     try:
                         api.submit_order(MarketOrderRequest(
@@ -1628,7 +1669,7 @@ def _run_signal_job() -> None:
 def _run_stoploss_job() -> None:
     logger.info("▶ Stop-loss job starting")
     db.set_config("last_stoploss_job_at", datetime.utcnow().isoformat())
-    api, err = _get_alpaca()
+    api, err = _alpaca_client, _alpaca_err
     if api is None:
         logger.warning("Stop-loss job aborted: %s", err)
         return
@@ -1676,7 +1717,11 @@ def _run_stoploss_job() -> None:
             )
 
             # Trailing stop: raise the floor as price rises
-            current_atr = _compute_atr(ticker)
+            try:
+                df_atr = fetch_ohlcv(ticker, days=90, min_bars=25)
+                current_atr = _atr_from_df(df_atr)
+            except Exception:
+                current_atr = 0.0
             atr_for_stop = current_atr if current_atr > 0 else atr_entry
             stored_stop  = entry_log.get("current_stop")
             if stored_stop is None and atr_entry > 0:
@@ -1741,10 +1786,9 @@ def get_analytics():
     last_signal_job    = db.get_config("last_signal_job_at", "") or None
     last_stoploss_job  = db.get_config("last_stoploss_job_at", "") or None
     open_positions = 0
-    api, _ = _get_alpaca()
-    if api:
+    if _alpaca_client:
         try:
-            open_positions = len(api.get_all_positions())
+            open_positions = len(_alpaca_client.get_all_positions())
         except Exception:
             pass
     return {
@@ -1786,12 +1830,11 @@ def api_remove_ticker(ticker: str):
     ticker = ticker.upper()
     db.remove_ticker(ticker)
     # Cancel any open Alpaca orders for this ticker
-    api, _ = _get_alpaca()
-    if api:
+    if _alpaca_client:
         try:
-            for order in api.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
+            for order in _alpaca_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
                 if order.symbol == ticker:
-                    api.cancel_order_by_id(order.id)
+                    _alpaca_client.cancel_order_by_id(order.id)
         except Exception as e:
             logger.warning("Could not cancel orders for %s: %s", ticker, e)
     return {"ticker": ticker, "status": "removed"}
@@ -1802,21 +1845,19 @@ def api_remove_ticker(ticker: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _alpaca_or_error(label: str):
-    """Return (api, None) or raise HTTPException with a clear message."""
-    api, err = _get_alpaca()
-    if api is None:
-        raise HTTPException(status_code=503, detail=f"{label}: {err}")
-    return api
+    """Return the Alpaca client or raise HTTPException with a clear message."""
+    if _alpaca_client is None:
+        raise HTTPException(status_code=503, detail=f"{label}: {_alpaca_err}")
+    return _alpaca_client
 
 
 @app.get("/api/paper/account")
 def api_paper_account():
-    api, err = _get_alpaca()
-    if api is None:
-        return {"available": False, "error": err}
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err}
     try:
-        acc = api.get_account()
-        n_pos = len(api.get_all_positions())
+        acc = _alpaca_client.get_account()
+        n_pos = len(_alpaca_client.get_all_positions())
         return {
             "available":      True,
             "equity":         round(float(acc.equity), 2),
@@ -1830,11 +1871,10 @@ def api_paper_account():
 
 @app.get("/api/paper/positions")
 def api_paper_positions():
-    api, err = _get_alpaca()
-    if api is None:
-        return {"available": False, "error": err}
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err}
     try:
-        positions = api.get_all_positions()
+        positions = _alpaca_client.get_all_positions()
     except Exception as e:
         return {"available": False, "error": str(e)}
 

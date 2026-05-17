@@ -1,46 +1,30 @@
 "use client";
-import { useState, useEffect } from "react";
 import { PaperPosition } from "@/lib/types";
-import { fetchPaperPositions } from "@/lib/api";
 import { scoreTextColor } from "@/components/v3/FactorScorePill";
 import { Skeleton } from "@/components/v3/Skeleton";
 
 function fmt(n: number, d = 2) { return n.toFixed(d); }
 
-export function PositionsTable() {
-  const [positions, setPositions] = useState<PaperPosition[] | null>(null);
-  const [unavailable, setUnavailable] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+interface Props {
+  data: { available: boolean; positions?: PaperPosition[]; error?: string } | null;
+  loading: boolean;
+  lastUpdated: Date | null;
+}
 
-  function load() {
-    fetchPaperPositions()
-      .then((d) => {
-        if (!d.available) { setUnavailable(d.error ?? "Not connected"); return; }
-        setPositions(d.positions ?? []);
-        setLastUpdated(new Date());
-      })
-      .catch((e) => setUnavailable(e.message))
-      .finally(() => setLoading(false));
-  }
-
-  useEffect(() => {
-    load();
-    const id = setInterval(load, 60_000);
-    return () => clearInterval(id);
-  }, []);
-
+export function PositionsTable({ data, loading, lastUpdated }: Props) {
   if (loading) return <Skeleton className="h-32 w-full" />;
 
-  if (unavailable) {
+  if (!data || !data.available) {
     return (
       <p className="text-zinc-600 text-xs py-4">
-        Positions unavailable — {unavailable}
+        Positions unavailable — {data?.error ?? "Not connected"}
       </p>
     );
   }
 
-  if (!positions?.length) {
+  const positions = data.positions ?? [];
+
+  if (!positions.length) {
     return (
       <div className="text-center py-8 text-zinc-600 text-sm">
         No open positions.

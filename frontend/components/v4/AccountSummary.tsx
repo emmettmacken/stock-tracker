@@ -1,7 +1,5 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
 import { PaperAccount } from "@/lib/types";
-import { fetchPaperAccount } from "@/lib/api";
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
@@ -17,22 +15,12 @@ function fmt(n: number) {
   return n.toLocaleString("en-IE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export function AccountSummary() {
-  const [data, setData] = useState<PaperAccount | null>(null);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+interface Props {
+  data: PaperAccount | null;
+  lastUpdated: Date | null;
+}
 
-  function load() {
-    fetchPaperAccount()
-      .then((d) => { setData(d); setLastUpdated(new Date()); })
-      .catch(() => {});
-  }
-
-  useEffect(() => {
-    load();
-    const id = setInterval(load, 60_000);
-    return () => clearInterval(id);
-  }, []);
-
+export function AccountSummary({ data, lastUpdated }: Props) {
   if (!data) {
     return (
       <div className="animate-pulse h-14 bg-zinc-800/50 rounded-xl" />

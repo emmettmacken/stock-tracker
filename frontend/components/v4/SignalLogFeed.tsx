@@ -1,7 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
 import { SignalLogEntry } from "@/lib/types";
-import { fetchSignalLog } from "@/lib/api";
 import { SignalBadge } from "@/components/SignalBadge";
 import { Skeleton } from "@/components/v3/Skeleton";
 
@@ -55,24 +53,13 @@ function relTime(ts: string) {
 }
 
 interface Props {
-  refreshTrigger?: number;
+  entries: SignalLogEntry[] | null;
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
 }
 
-export function SignalLogFeed({ refreshTrigger }: Props) {
-  const [entries, setEntries] = useState<SignalLogEntry[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    setError(null);
-    fetchSignalLog(50)
-      .then(setEntries)
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => { load(); }, [load, refreshTrigger]);
-
+export function SignalLogFeed({ entries, loading, error, onRetry }: Props) {
   if (loading) return (
     <div className="space-y-2">
       {[1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
@@ -81,7 +68,7 @@ export function SignalLogFeed({ refreshTrigger }: Props) {
 
   if (error) return (
     <div className="text-red-400 text-xs py-4">
-      {error} <button onClick={load} className="ml-2 underline text-zinc-400 hover:text-white">Retry</button>
+      {error} <button onClick={onRetry} className="ml-2 underline text-zinc-400 hover:text-white">Retry</button>
     </div>
   );
 
