@@ -6,7 +6,7 @@ import {
   AnalyticsData,
 } from "./types";
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export async function fetchSignal(ticker: string): Promise<SignalData> {
   const res = await fetch(`${BASE}/api/signal/${ticker}`);
@@ -115,11 +115,13 @@ export async function fetchWatchlistDB(): Promise<WatchlistTicker[]> {
 }
 
 export async function addTickerDB(ticker: string): Promise<void> {
-  await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "POST" });
+  const res = await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "POST" });
+  if (!res.ok) throw new Error(`Failed to add ${ticker} to watchlist`);
 }
 
 export async function removeTickerDB(ticker: string): Promise<void> {
-  await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "DELETE" });
+  const res = await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Failed to remove ${ticker} from watchlist`);
 }
 
 export async function fetchPaperAccount(): Promise<PaperAccount> {

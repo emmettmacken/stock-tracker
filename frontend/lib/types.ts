@@ -71,6 +71,10 @@ export interface FactorScoreData {
   composite_score: number;
   hmm_signal: string;
   hmm_confidence: number;
+  min_factor_score: number | null;
+  volume_ok: boolean;
+  ret_3m: number | null;
+  ret_12m: number | null;
 }
 
 export type SentimentDirection = "bullish" | "neutral" | "bearish";
@@ -165,7 +169,7 @@ export interface TradeOutcome {
   entry_signal_id: number | null;
   entry_price: number;
   exit_price: number;
-  exit_reason: "sell_signal" | "stop_loss" | "max_hold_exit";
+  exit_reason: "sell_signal" | "stop_loss" | "max_hold_exit" | "score_deterioration" | "macro_drawdown_protection";
   return_pct: number;
   holding_days: number;
   composite_score_at_entry: number | null;

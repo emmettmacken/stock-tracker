@@ -1,5 +1,6 @@
 """Stock Signal Tracker v2 — 2D Markov chain, HMM regimes, CI signals, walk-forward backtest."""
 from __future__ import annotations
+import json
 import warnings
 import time
 import logging
@@ -23,7 +24,7 @@ import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -67,6 +68,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*convergence.*")
 warnings.filterwarnings("ignore", message=".*not converging.*")
 warnings.filterwarnings("ignore", message=".*Model is not.*")
+logging.getLogger("hmmlearn").setLevel(logging.ERROR)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -143,6 +145,56 @@ _http_client = httpx.Client(timeout=15.0, follow_redirects=True)
 # Per-ticker factor cache (60s TTL — avoids triple yfinance call per signal job tick)
 _FACTORS_CACHE: dict[str, tuple[dict, float]] = {}
 _FACTORS_TTL = 60  # seconds
+
+# ── Factor weight configuration ───────────────────────────────────────────────
+
+DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
+    "hmm":       0.20,
+    "momentum":  0.25,
+    "vol_trend": 0.20,
+    "earnings":  0.25,
+    "insider":   0.10,
+}
+
+_WEIGHT_OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "factor_weight_overrides.json")
+_WEIGHT_DRIFT_LOG_PATH = os.path.join(os.path.dirname(__file__), "weight_overrides.json")
+_FACTOR_CORR_PATH      = os.path.join(os.path.dirname(__file__), "factor_correlations.json")
+
+
+def _load_ticker_weights(ticker: str) -> dict[str, float]:
+    """Return weights for ticker, merging per-ticker overrides over defaults."""
+    try:
+        with open(_WEIGHT_OVERRIDES_PATH) as f:
+            overrides: dict = json.load(f)
+        per_ticker = overrides.get(ticker.upper(), {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        per_ticker = {}
+    weights = {**DEFAULT_FACTOR_WEIGHTS, **per_ticker}
+    if per_ticker:
+        drifts = {
+            k: {
+                "override": round(v, 4),
+                "default":  round(DEFAULT_FACTOR_WEIGHTS.get(k, 0.0), 4),
+                "delta":    round(v - DEFAULT_FACTOR_WEIGHTS.get(k, 0.0), 4),
+            }
+            for k, v in per_ticker.items()
+            if abs(v - DEFAULT_FACTOR_WEIGHTS.get(k, 0.0)) > 0.05
+        }
+        if drifts:
+            _append_weight_drift(ticker, drifts)
+    return weights
+
+
+def _append_weight_drift(ticker: str, drifts: dict) -> None:
+    try:
+        with open(_WEIGHT_DRIFT_LOG_PATH) as f:
+            log: dict = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        log = {}
+    log[ticker.upper()] = {"logged_at": datetime.utcnow().isoformat(), "drifts": drifts}
+    with open(_WEIGHT_DRIFT_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+
 
 # Earnings calendar cache (24h TTL — earnings dates don't change intraday)
 _EARNINGS_CACHE: dict[str, tuple[bool, float]] = {}
@@ -824,23 +876,29 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     avg_vol_20d  = float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0
     volume_ok    = current_vol > 1.2 * avg_vol_20d if avg_vol_20d > 0 else True
     ma20         = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes[-1])
-    overextended = float(closes[-1]) > ma20 * 1.15
+    price_ma20_ratio = float(closes[-1]) / ma20 if ma20 > 0 else 1.0
+    overextended = price_ma20_ratio > 1.25  # kept for API compat; gate uses OVEREXTENDED_THRESHOLD_PCT
+
+    weights = _load_ticker_weights(ticker)
 
     factors: dict[str, Any] = {
-        "hmm":       {"score": round(hmm_score, 2), "weight": 0.10, "null": False},
-        "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": 0.35, "null": mom_score is None},
-        "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": 0.25, "null": vt_score  is None},
-        "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": 0.20, "null": earn_score is None},
-        "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": 0.10, "null": insider_score is None},
+        "hmm":       {"score": round(hmm_score, 2), "weight": weights["hmm"], "null": False},
+        "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": weights["momentum"], "null": mom_score is None},
+        "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": weights["vol_trend"], "null": vt_score  is None},
+        "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": weights["earnings"], "null": earn_score is None},
+        "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": weights["insider"],  "null": insider_score is None},
     }
 
     available = {k: v for k, v in factors.items() if not v["null"]}
     total_w = sum(v["weight"] for v in available.values())
     composite = sum(v["score"] * v["weight"] / total_w for v in available.values()) if total_w > 0 else 0.0
 
+    non_null_scores = [v["score"] for v in factors.values() if not v["null"] and v["score"] is not None]
+    min_factor_score = min(non_null_scores) if non_null_scores else None
+
     c_lag   = closes[:-21] if len(closes) > 21 else closes
-    ret_3m  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 64  else None
-    ret_12m = float(c_lag[-1] / c_lag[-252] - 1.0) if len(c_lag) >= 253 else None
+    ret_3m  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 63  else None
+    ret_12m = float(c_lag[-1] / c_lag[-252] - 1.0) if len(c_lag) >= 252 else None
 
     atr = _atr_from_df(df)
     rets_21 = np.diff(closes[-22:]) / closes[-22:-1] if len(closes) >= 22 else np.array([0.0])
@@ -849,19 +907,28 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     result = {
         "ticker":         ticker,
         "factors":        factors,
-        "composite_score": round(composite, 2),
-        "hmm_signal":     sig["signal"],
+        "composite_score":  round(composite, 2),
+        "min_factor_score": round(min_factor_score, 2) if min_factor_score is not None else None,
+        "hmm_signal":       sig["signal"],
         "hmm_confidence": sig["confidence"],
         "current_price":  float(closes[-1]),
-        "volume_ok":      volume_ok,
-        "overextended":   overextended,
-        "ret_3m":         ret_3m,
+        "volume_ok":        volume_ok,
+        "overextended":     overextended,
+        "price_ma20_ratio": round(price_ma20_ratio, 4),
+        "mom_score":        round(mom_score, 2) if mom_score is not None else None,
+        "ret_3m":           ret_3m,
         "ret_12m":        ret_12m,
         "atr":            atr,
         "vol_21d":        vol_21d,
     }
     _FACTORS_CACHE[ticker] = (result, time.time())
     return result
+
+
+@app.get("/api/factor-weights")
+def get_factor_weights():
+    """Return the active default factor weights as percentages (0–100)."""
+    return {k: round(v * 100) for k, v in DEFAULT_FACTOR_WEIGHTS.items()}
 
 
 @app.get("/api/factors/{ticker}")
@@ -871,6 +938,40 @@ def get_factors(ticker: str):
     if result is None:
         return {"error": f"Failed to compute factors for '{ticker}'"}
     return {k: v for k, v in result.items() if k not in ("current_price", "atr", "vol_21d")}
+
+
+@app.get("/api/factor-correlations")
+def get_factor_correlations():
+    """Cross-sectional Pearson correlation of factor scores across the current watchlist."""
+    watchlist = [r["ticker"] for r in db.get_watchlist()]
+    if len(watchlist) < 3:
+        return {"error": "Need at least 3 tickers for correlation"}
+    factor_keys = ["hmm", "momentum", "vol_trend", "earnings", "insider"]
+    rows: dict[str, list] = {k: [] for k in factor_keys}
+    tickers_used: list[str] = []
+    for ticker in watchlist:
+        res = _compute_factors(ticker)
+        if res is None:
+            continue
+        fdata = res["factors"]
+        if any(fdata[k]["null"] for k in factor_keys):
+            continue
+        for k in factor_keys:
+            rows[k].append(fdata[k]["score"])
+        tickers_used.append(ticker)
+    if len(tickers_used) < 3:
+        return {"error": "Not enough tickers with complete factor data"}
+    corr = pd.DataFrame(rows).corr().round(4).to_dict()
+    out = {
+        "computed_at":  datetime.utcnow().isoformat(),
+        "tickers_used": tickers_used,
+        "n":            len(tickers_used),
+        "note":         "Cross-sectional correlation across watchlist at computation time",
+        "correlations": corr,
+    }
+    with open(_FACTOR_CORR_PATH, "w") as f:
+        json.dump(out, f, indent=2)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1163,6 +1264,11 @@ def portfolio_sizing(req: SizingRequest):
             kf = _kelly_fraction(score, rvol) * corr_penalties[t]
             kelly_fracs[t] = kf
 
+        # Normalize so total Kelly allocation never exceeds 100%
+        total_kelly = sum(kelly_fracs.values())
+        if total_kelly > 1.0:
+            kelly_fracs = {t: v / total_kelly for t, v in kelly_fracs.items()}
+
         # Vol-targeted allocations: 1/vol weight, normalised
         inv_vol = {t: (1.0 / max(vols_map[t], 0.01)) * corr_penalties[t] for t in tickers}
         total_inv_vol = sum(inv_vol.values())
@@ -1427,7 +1533,7 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
     return result
 
 
-def _position_dollars(ticker: str, equity: float, current_price: float, score: float = 75.0,
+def _position_dollars(ticker: str, equity: float, score: float = 75.0,
                        vol_21d: Optional[float] = None) -> float:
     """Vol-targeted position size scaled by conviction score and historical ticker performance."""
     if vol_21d is not None and vol_21d > 0:
@@ -1464,7 +1570,8 @@ def _trading_days_between(start: datetime, end: datetime) -> int:
 
 
 def _close_and_record(api, ticker: str, current_price: float, entry_price: float,
-                      exit_reason: str, entry_log: Optional[dict]) -> None:
+                      exit_reason: str, entry_log: Optional[dict],
+                      score: Optional[float] = None) -> None:
     """Close an Alpaca position and write trade_outcomes."""
     api.close_position(ticker)
     ret = (current_price - entry_price) / entry_price * 100
@@ -1472,23 +1579,49 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
     if entry_log:
         try:
             hold = _trading_days_between(
-                datetime.fromisoformat(entry_log["timestamp"]), datetime.now()
+                datetime.fromisoformat(entry_log["timestamp"]), datetime.utcnow()
             )
         except Exception:
             pass
-    db.log_signal(ticker, None, "SELL", "closed", exit_reason, current_price, 0.0)
-    db.record_trade(
-        ticker,
-        entry_log["id"] if entry_log else None,
-        entry_price, current_price, exit_reason,
-        ret, hold,
-        entry_log.get("composite_score") if entry_log else None,
-    )
-    db.update_ticker_performance(ticker, ret, exit_reason)
+    try:
+        db.record_close_transaction(
+            ticker, score, exit_reason, current_price, entry_price,
+            ret, hold,
+            entry_log["id"] if entry_log else None,
+            entry_log.get("composite_score") if entry_log else None,
+        )
+    except Exception as db_err:
+        logger.error(
+            "%s: broker close SUCCEEDED (%s) but DB transaction FAILED — "
+            "position not recorded, cooldown not set: %s",
+            ticker, exit_reason, db_err,
+        )
     logger.info("%s: closed (%s) at %.2f (%.1f%%)", ticker, exit_reason, current_price, ret)
 
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
+
+def _write_gate_stats() -> None:
+    cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
+    gate_names = [
+        "earnings_within_2d", "vix_too_high", "already_in_position",
+        "low_volume", "overextended", "momentum_disagreement",
+        "reentry_cooldown", "sector_concentration",
+    ]
+    total = db.count_buy_evaluations(cutoff)
+    stats: dict[str, dict] = {}
+    for gate in gate_names:
+        rejected = db.count_gate_rejections(gate, cutoff)
+        stats[gate] = {
+            "evaluated": total,
+            "rejected": rejected,
+            "rejection_rate": round(rejected / total, 4) if total > 0 else 0.0,
+        }
+    path = os.path.join(os.path.dirname(__file__), "gate_stats.json")
+    with open(path, "w") as f:
+        json.dump(stats, f, indent=2)
+    logger.info("Gate stats written (%d total BUY evaluations, 90d)", total)
+
 
 def _run_signal_job() -> None:
     logger.info("▶ Signal job starting")
@@ -1497,9 +1630,6 @@ def _run_signal_job() -> None:
     if api is None:
         logger.warning("Signal job aborted: %s", err)
         return
-
-    et_now    = datetime.now(ZoneInfo("America/New_York"))
-    is_friday = et_now.weekday() == 4
 
     watchlist = [r["ticker"] for r in db.get_watchlist()]
     if not watchlist:
@@ -1519,8 +1649,11 @@ def _run_signal_job() -> None:
     bull_threshold = float(db.get_config("bull_threshold", "70"))
     bear_threshold = float(db.get_config("bear_threshold", "80"))
     buy_threshold  = bear_threshold if not spy_above else bull_threshold
-    logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f friday=%s",
-                spy_above, vix, buy_threshold, is_friday)
+    oe_thresh        = float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
+    _mff_cfg         = db.get_config("MIN_FACTOR_FLOOR", "")
+    min_factor_floor = float(_mff_cfg) if _mff_cfg else None
+    logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f",
+                spy_above, vix, buy_threshold)
 
     # Sector counts of currently open positions
     open_sector_counts: dict[str, int] = {}
@@ -1546,15 +1679,20 @@ def _run_signal_job() -> None:
             atr        = result.get("atr", 0.0)
             in_pos     = ticker in positions
 
+            # MIN_FACTOR_FLOOR: cap entry score if any factor falls below the floor
+            effective_composite = composite
+            if min_factor_floor is not None:
+                mfs = result.get("min_factor_score")
+                if mfs is not None and mfs < min_factor_floor:
+                    effective_composite = min(composite, buy_threshold - 5.0)
+
             # Score deterioration — close regardless of HMM signal
             if in_pos and composite < 40.0:
                 pos = positions[ticker]
                 entry_log = db.get_last_buy_signal(ticker)
                 try:
                     _close_and_record(api, ticker, price, float(pos.avg_entry_price),
-                                      "score_deterioration", entry_log)
-                    db.log_signal(ticker, composite, hmm_signal, "closed",
-                                  "score_deterioration", price, atr)
+                                      "score_deterioration", entry_log, score=composite)
                 except Exception as e:
                     db.log_signal(ticker, composite, hmm_signal, "skipped",
                                   f"close_failed:{e}", price, atr)
@@ -1565,37 +1703,34 @@ def _run_signal_job() -> None:
                 entry_log = db.get_last_buy_signal(ticker)
                 try:
                     _close_and_record(api, ticker, price, float(pos.avg_entry_price),
-                                      "sell_signal", entry_log)
-                    db.log_signal(ticker, composite, "SELL", "closed", "sell_signal", price, atr)
+                                      "sell_signal", entry_log, score=composite)
                 except Exception as e:
                     db.log_signal(ticker, composite, "SELL", "skipped",
                                   f"close_failed:{e}", price, atr)
 
-            elif hmm_signal == "BUY" and composite >= buy_threshold:
-                if is_friday:
-                    db.log_signal(ticker, composite, "BUY", "skipped",
-                                  "friday_no_entry", price, atr)
-                    continue
+            elif effective_composite >= buy_threshold:
                 if high_vix:
-                    db.log_signal(ticker, composite, "BUY", "skipped",
+                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   f"vix_too_high:{vix:.1f}", price, atr)
                     continue
                 if in_pos:
-                    db.log_signal(ticker, composite, "BUY", "skipped",
+                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   "already_in_position", price, atr)
                     continue
                 if not result.get("volume_ok", True):
-                    db.log_signal(ticker, composite, "BUY", "skipped", "low_volume", price, atr)
+                    db.log_signal(ticker, effective_composite, "BUY", "skipped", "low_volume", price, atr)
                     continue
-                if result.get("overextended", False):
-                    db.log_signal(ticker, composite, "BUY", "skipped", "overextended", price, atr)
+                mom_score_val    = result.get("mom_score")
+                price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
+                top_quartile_mom = mom_score_val is not None and mom_score_val >= 75.0
+                if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
+                    db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr)
                     continue
-                # Momentum quality filter: both 3m and 12m returns must be positive
                 ret_3m  = result.get("ret_3m")
                 ret_12m = result.get("ret_12m")
                 if ret_3m is not None and ret_12m is not None:
-                    if ret_3m <= 0 or ret_12m <= 0:
-                        db.log_signal(ticker, composite, "BUY", "skipped",
+                    if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
+                        db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                       "momentum_disagreement", price, atr)
                         continue
                 # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
@@ -1603,20 +1738,20 @@ def _run_signal_job() -> None:
                 if perf and perf.get("last_exit_at"):
                     try:
                         last_exit = datetime.fromisoformat(perf["last_exit_at"])
-                        days_since = _trading_days_between(last_exit, datetime.now())
+                        days_since = _trading_days_between(last_exit, datetime.utcnow())
                         if days_since < 5:
-                            db.log_signal(ticker, composite, "BUY", "skipped",
+                            db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                           "reentry_cooldown", price, atr)
                             continue
                     except Exception:
                         pass
                 sector = _get_sector(ticker)
                 if sector != "Unknown" and open_sector_counts.get(sector, 0) >= 2:
-                    db.log_signal(ticker, composite, "BUY", "skipped",
+                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   "sector_concentration", price, atr)
                     continue
 
-                dollars = _position_dollars(ticker, equity, price, composite, vol_21d=result.get("vol_21d"))
+                dollars = _position_dollars(ticker, equity, effective_composite, vol_21d=result.get("vol_21d"))
                 try:
                     try:
                         api.submit_order(MarketOrderRequest(
@@ -1627,21 +1762,29 @@ def _run_signal_job() -> None:
                         api.submit_order(MarketOrderRequest(
                             symbol=ticker, qty=qty,
                             side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                    signal_id = db.log_signal(ticker, composite, "BUY", "ordered", None, price, atr)
+                    signal_id = db.log_signal(ticker, effective_composite, "BUY", "ordered", None, price, atr)
                     if atr > 0:
                         db.update_trailing_stop(signal_id, price - 1.5 * atr)
                     open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
-                    logger.info("%s: BUY $%.0f score=%.1f sector=%s", ticker, dollars, composite, sector)
+                    logger.info("%s: BUY $%.0f score=%.1f sector=%s", ticker, dollars, effective_composite, sector)
                 except Exception as e:
                     db.log_signal(ticker, composite, "BUY", "skipped",
                                   f"order_failed:{e}", price, atr)
             else:
-                db.log_signal(ticker, composite, hmm_signal, "skipped",
-                              "hold_or_below_threshold", price, atr)
+                if effective_composite != composite:
+                    db.log_signal(ticker, effective_composite, hmm_signal, "skipped",
+                                  "min_factor_floor", price, atr)
+                else:
+                    db.log_signal(ticker, composite, hmm_signal, "skipped",
+                                  "hold_or_below_threshold", price, atr)
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
 
     logger.info("◀ Signal job done")
+    try:
+        _write_gate_stats()
+    except Exception as e:
+        logger.warning("Failed to write gate stats: %s", e)
 
 
 def _run_stoploss_job() -> None:
@@ -1680,7 +1823,7 @@ def _run_stoploss_job() -> None:
     except Exception as exc:
         logger.warning("SPY 5-day check failed: %s", exc)
 
-    now = datetime.now()
+    now = datetime.utcnow()
     for pos in positions:
         ticker = pos.symbol
         try:
@@ -1857,7 +2000,7 @@ def api_paper_positions():
         return {"available": False, "error": str(e)}
 
     result = []
-    now = datetime.now()
+    now = datetime.utcnow()
     for pos in positions:
         ticker      = pos.symbol
         entry_price = float(pos.avg_entry_price)

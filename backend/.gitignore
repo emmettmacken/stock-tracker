@@ -6,3 +6,4 @@ __pycache__/
 stock_tracker.db
 stock_tracker.db-shm
 stock_tracker.db-wal
+gate_stats.json

@@ -75,7 +75,6 @@ def _run_migrations() -> None:
     new_columns = [
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN current_stop REAL"),
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN stop_updated_at TIMESTAMP"),
-        ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN entry_score REAL"),
     ]
     with _conn() as conn:
         for _, sql in new_columns:
@@ -266,6 +265,71 @@ def update_ticker_performance(ticker: str, return_pct: float, exit_reason: str) 
             )
 
 
+def record_close_transaction(
+    ticker: str,
+    score: Optional[float],
+    exit_reason: str,
+    current_price: float,
+    entry_price: float,
+    return_pct: float,
+    holding_days: int,
+    entry_signal_id: Optional[int],
+    composite_score_at_entry: Optional[float],
+) -> None:
+    """Atomically write signal_log SELL + trade_outcomes + ticker_performance in one transaction."""
+    now = datetime.utcnow().isoformat()
+    is_win = 1.0 if return_pct > 0 else 0.0
+    set_exit_at = exit_reason != "sell_signal"
+    ticker = ticker.upper()
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO signal_log
+               (ticker, timestamp, composite_score, signal, action,
+                skip_reason, price_at_signal, atr_at_signal)
+               VALUES (?, ?, ?, 'SELL', 'closed', ?, ?, 0.0)""",
+            (ticker, now, score, exit_reason, current_price),
+        )
+        conn.execute(
+            """INSERT INTO trade_outcomes
+               (ticker, entry_signal_id, entry_price, exit_price, exit_reason,
+                return_pct, holding_days, composite_score_at_entry, exit_timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ticker, entry_signal_id, entry_price, current_price, exit_reason,
+             return_pct, holding_days, composite_score_at_entry, now),
+        )
+        row = conn.execute(
+            "SELECT total_trades, win_rate, avg_return FROM ticker_performance WHERE ticker = ?",
+            (ticker,),
+        ).fetchone()
+        if row:
+            old_total = row["total_trades"]
+            new_total = old_total + 1
+            new_win_rate = (row["win_rate"] * old_total + is_win) / new_total
+            new_avg_return = (row["avg_return"] * old_total + return_pct) / new_total
+            if set_exit_at:
+                conn.execute(
+                    """UPDATE ticker_performance
+                       SET total_trades=?, win_rate=?, avg_return=?, last_updated=?, last_exit_at=?
+                       WHERE ticker=?""",
+                    (new_total, new_win_rate, new_avg_return, now, now, ticker),
+                )
+            else:
+                conn.execute(
+                    """UPDATE ticker_performance
+                       SET total_trades=?, win_rate=?, avg_return=?, last_updated=?
+                       WHERE ticker=?""",
+                    (new_total, new_win_rate, new_avg_return, now, ticker),
+                )
+        else:
+            last_exit_at = now if set_exit_at else None
+            conn.execute(
+                """INSERT INTO ticker_performance
+                   (ticker, total_trades, win_rate, avg_return, last_updated, last_exit_at)
+                   VALUES (?, 1, ?, ?, ?, ?)""",
+                (ticker, is_win, return_pct, now, last_exit_at),
+            )
+
+
 def get_ticker_performance(ticker: str) -> Optional[dict]:
     with _conn() as conn:
         row = conn.execute(
@@ -291,6 +355,28 @@ def set_config(key: str, value: str) -> None:
                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
             (key, value, datetime.utcnow().isoformat()),
         )
+
+
+# ── Gate stats queries ───────────────────────────────────────────────────────
+
+def count_buy_evaluations(cutoff: str) -> int:
+    with _conn() as conn:
+        return conn.execute(
+            """SELECT COUNT(*) FROM signal_log
+               WHERE signal = 'BUY' AND timestamp >= ?
+                 AND NOT (action = 'skipped' AND skip_reason = 'hold_or_below_threshold')""",
+            (cutoff,),
+        ).fetchone()[0]
+
+
+def count_gate_rejections(gate: str, cutoff: str) -> int:
+    with _conn() as conn:
+        return conn.execute(
+            """SELECT COUNT(*) FROM signal_log
+               WHERE action = 'skipped'
+               AND skip_reason LIKE ? AND timestamp >= ?""",
+            (f"{gate}%", cutoff),
+        ).fetchone()[0]
 
 
 # ── Analytics queries ─────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { FactorScoreData } from "@/lib/types";
 import { scoreTextColor, scoreBarColor } from "./FactorScorePill";
+import { BASE } from "@/lib/api";
 
 const FACTOR_META: Record<string, { label: string; explanation: string }> = {
   hmm: {
@@ -31,22 +32,23 @@ const FACTOR_META: Record<string, { label: string; explanation: string }> = {
   },
 };
 
-const DEFAULT_WEIGHTS: Record<string, number> = {
-  hmm: 10,
-  momentum: 35,
-  vol_trend: 25,
-  earnings: 20,
+// Fallback used only when the backend is unreachable
+const FALLBACK_WEIGHTS: Record<string, number> = {
+  hmm: 20,
+  momentum: 25,
+  vol_trend: 20,
+  earnings: 25,
   insider: 10,
 };
 
-function loadWeights(ticker: string): Record<string, number> {
-  if (typeof window === "undefined") return { ...DEFAULT_WEIGHTS };
+function loadWeights(ticker: string, defaults: Record<string, number>): Record<string, number> {
+  if (typeof window === "undefined") return { ...defaults };
   try {
     const raw = localStorage.getItem(`v3-factor-weights-${ticker}`);
-    if (!raw) return { ...DEFAULT_WEIGHTS };
-    return { ...DEFAULT_WEIGHTS, ...JSON.parse(raw) };
+    if (!raw) return { ...defaults };
+    return { ...defaults, ...JSON.parse(raw) };
   } catch {
-    return { ...DEFAULT_WEIGHTS };
+    return { ...defaults };
   }
 }
 
@@ -76,11 +78,18 @@ export function FactorsTab({
   data: FactorScoreData;
   ticker: string;
 }) {
-  const [weights, setWeights] = useState<Record<string, number>>(DEFAULT_WEIGHTS);
+  const [weights, setWeights] = useState<Record<string, number>>(FALLBACK_WEIGHTS);
   const [openTip, setOpenTip] = useState<string | null>(null);
 
   useEffect(() => {
-    setWeights(loadWeights(ticker));
+    fetch(`${BASE}/api/factor-weights`)
+      .then((r) => r.json())
+      .then((backendDefaults: Record<string, number>) => {
+        setWeights(loadWeights(ticker, backendDefaults));
+      })
+      .catch(() => {
+        setWeights(loadWeights(ticker, FALLBACK_WEIGHTS));
+      });
   }, [ticker]);
 
   const composite = computeComposite(data.factors, weights);
