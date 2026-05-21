@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import yfinance as yf
 from yfinance.exceptions import YFTzMissingError, YFRateLimitError, YFTickerMissingError
@@ -873,8 +874,10 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     insider_score = _get_insider_score(ticker)
 
     # Volume and overextension signals used by the signal job
-    current_vol  = float(vol[-1]) if len(vol) > 0 else 0.0
-    avg_vol_20d  = float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0
+    # Use [-2] (last *complete* trading day) — today's bar is partial at signal time (15:45 ET)
+    current_vol  = float(vol[-2])     if len(vol)     >= 2 else (float(vol[-1])     if len(vol)     > 0 else 0.0)
+    avg_vol_20d  = float(vol_20d[-2]) if len(vol_20d) >= 2 else (float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0)
+    volume_ratio = round(current_vol / avg_vol_20d, 3) if avg_vol_20d > 0 else None
     volume_ok    = current_vol > 1.2 * avg_vol_20d if avg_vol_20d > 0 else True
     ma20         = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes[-1])
     price_ma20_ratio = float(closes[-1]) / ma20 if ma20 > 0 else 1.0
@@ -914,6 +917,7 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "hmm_confidence": sig["confidence"],
         "current_price":  float(closes[-1]),
         "volume_ok":        volume_ok,
+        "volume_ratio":     volume_ratio,
         "overextended":     overextended,
         "price_ma20_ratio": round(price_ma20_ratio, 4),
         "mom_score":        round(mom_score, 2) if mom_score is not None else None,
@@ -990,13 +994,20 @@ def get_factor_correlations():
         tickers_used.append(ticker)
     if len(tickers_used) < 3:
         return {"error": "Not enough tickers with complete factor data"}
-    corr = pd.DataFrame(rows).corr().round(4).to_dict()
+    try:
+        zero_variance = [k for k, v in rows.items() if len(set(v)) <= 1]
+        corr = pd.DataFrame(rows).corr()
+        corr_clean = corr.where(pd.notna(corr), other=None)
+        corr_dict = corr_clean.round(4).to_dict()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Correlation computation failed: {e}"})
     out = {
         "computed_at":  datetime.utcnow().isoformat(),
         "tickers_used": tickers_used,
         "n":            len(tickers_used),
         "note":         "Cross-sectional correlation across watchlist at computation time",
-        "correlations": corr,
+        "correlations": corr_dict,
+        "zero_variance_factors": zero_variance,
     }
     with open(_FACTOR_CORR_PATH, "w") as f:
         json.dump(out, f, indent=2)
@@ -1693,12 +1704,14 @@ def _write_gate_stats() -> None:
         stats[gate] = {
             "evaluated": total,
             "rejected": rejected,
-            "rejection_rate": round(rejected / total, 4) if total > 0 else 0.0,
+            # rejection_rate = pct_of_threshold_passers (legacy key); pct_of_evaluated uses true denominator
+            "rejection_rate":   round(rejected / total, 4) if total > 0 else 0.0,
+            "pct_of_evaluated": round(rejected / total, 4) if total > 0 else 0.0,
         }
     with open(_GATE_STATS_PATH, "w") as f:
         json.dump(stats, f, indent=2)
     db.save_diagnostic("gate_stats", stats)
-    logger.info("Gate stats written (%d total BUY evaluations, 90d)", total)
+    logger.info("Gate stats written (%d total ticker-days evaluated, 90d)", total)
 
 
 def _run_signal_job() -> None:

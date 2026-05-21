@@ -369,9 +369,9 @@ def set_config(key: str, value: str) -> None:
 def count_buy_evaluations(cutoff: str) -> int:
     with _conn() as conn:
         return conn.execute(
-            """SELECT COUNT(*) FROM signal_log
-               WHERE signal = 'BUY' AND timestamp >= ?
-                 AND NOT (action = 'skipped' AND skip_reason = 'hold_or_below_threshold')""",
+            """SELECT COUNT(DISTINCT ticker || date(timestamp))
+               FROM signal_log
+               WHERE timestamp >= ?""",
             (cutoff,),
         ).fetchone()[0]
 
