@@ -67,6 +67,17 @@ import database as db
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN floats with None for JSON serialization."""
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    return obj
 warnings.filterwarnings("ignore", message=".*convergence.*")
 warnings.filterwarnings("ignore", message=".*not converging.*")
 warnings.filterwarnings("ignore", message=".*Model is not.*")
@@ -305,6 +316,29 @@ def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int, hmm.GaussianHMM]:
     bull_id = int(np.argmax([model.means_[0][0], model.means_[1][0]]))
     return seq.astype(int), bull_id, model
 
+
+def _normalize_returns_for_hmm(returns: np.ndarray, window: int = 63) -> np.ndarray:
+    """
+    Normalize returns against rolling mean and std so the HMM sees directional
+    deviation from trend rather than absolute level.  Prevents the volatility-split
+    failure mode on steadily trending stocks where both HMM states end up positive.
+    Only used as input to fit_regimes / tr_model.predict — never for other factors.
+    """
+    if len(returns) < window + 1:
+        return returns
+    normed = np.empty_like(returns)
+    for i in range(len(returns)):
+        start = max(0, i - window)
+        window_rets = returns[start:i] if i > 0 else returns[0:1]
+        if len(window_rets) < 5:
+            normed[i] = returns[i]
+            continue
+        mu = np.mean(window_rets)
+        sigma = np.std(window_rets)
+        normed[i] = (returns[i] - mu) / sigma if sigma > 1e-8 else 0.0
+    return normed
+
+
 # ── Signal with CI ────────────────────────────────────────────────────────────
 
 def compute_signal(
@@ -318,14 +352,20 @@ def compute_signal(
     s_bull  = float(stat[BULL_STATES].sum())
     s_bear  = float(stat[BEAR_STATES].sum())
 
-    if n_total >= MIN_OBS:
-        b_lo, b_hi = proportion_confint(n_bull, n_total, alpha=0.05, method="wilson")
-        r_lo, r_hi = proportion_confint(n_bear, n_total, alpha=0.05, method="wilson")
-    else:
-        p = n_bull / max(n_total, 1)
-        q = n_bear / max(n_total, 1)
-        b_lo = b_hi = p
-        r_lo = r_hi = q
+    if n_total < MIN_OBS:
+        return {
+            "signal":            "HOLD",
+            "confidence":        0.3,
+            "bullish_edge":      0.0,
+            "bearish_edge":      0.0,
+            "bull_edge_ci_low":  0.0,
+            "bull_edge_ci_high": 0.0,
+            "bear_edge_ci_low":  0.0,
+            "bear_edge_ci_high": 0.0,
+            "n_obs_current_state": n_total,
+        }
+    b_lo, b_hi = proportion_confint(n_bull, n_total, alpha=0.05, method="wilson")
+    r_lo, r_hi = proportion_confint(n_bear, n_total, alpha=0.05, method="wilson")
 
     bull_edge = float(trans_row[BULL_STATES].sum()) - s_bull
     bear_edge = float(trans_row[BEAR_STATES].sum()) - s_bear
@@ -459,10 +499,11 @@ def get_signal(ticker: str):
     # 2 years of OHLCV
     df = fetch_ohlcv(ticker, days=760, min_bars=260)
     closes, returns, vol, vol_20d = extract_features(df)
+    hmm_returns = _normalize_returns_for_hmm(returns)
 
     # Fit HMM on full 2-year return series
     try:
-        regime_seq, bull_id, _ = fit_regimes(returns)
+        regime_seq, bull_id, _ = fit_regimes(hmm_returns)
     except Exception as e:
         logger.warning("HMM failed for %s: %s — using single regime", ticker, e)
         regime_seq = np.zeros(len(returns), dtype=int)
@@ -542,6 +583,7 @@ def get_backtest(ticker: str):
 
     df = fetch_ohlcv(ticker, days=760, min_bars=260)
     closes, returns, vol, vol_20d = extract_features(df)
+    hmm_returns = _normalize_returns_for_hmm(returns)
     dates = df.index.tolist()[1:]
     n = len(returns)  # = len(closes) - 1
 
@@ -572,9 +614,9 @@ def get_backtest(ticker: str):
 
         # Fit HMM on training window only — no future data in model parameters
         try:
-            tr_regime_seq, tr_bull_id, tr_model = fit_regimes(tr_rets)
+            tr_regime_seq, tr_bull_id, tr_model = fit_regimes(hmm_returns[ts:te])
             test_len = min(TEST, n - te)
-            test_regime_seq = tr_model.predict(returns[te:te + test_len].reshape(-1, 1))
+            test_regime_seq = tr_model.predict(hmm_returns[te:te + test_len].reshape(-1, 1))
         except Exception:
             tr_regime_seq = np.zeros(len(tr_rets), dtype=int)
             test_regime_seq = np.zeros(min(TEST, n - te), dtype=int)
@@ -668,7 +710,7 @@ def _hmm_factor_score(signal: str, confidence: float) -> float:
         return 75.0 + confidence * 25.0
     if signal == "SELL":
         return 25.0 - confidence * 25.0
-    return 40.0 + (confidence - 0.5) * 40.0  # HOLD: 40–60 range
+    return 50.0 + (confidence - 0.65) * 20.0  # HOLD: uncertainty→43, mid→50, high-conf→57
 
 
 def _momentum_score(closes: np.ndarray) -> float | None:
@@ -843,9 +885,10 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         return None
 
     closes, returns, vol, vol_20d = extract_features(df)
+    hmm_returns = _normalize_returns_for_hmm(returns)
 
     try:
-        regime_seq, bull_id, _ = fit_regimes(returns)
+        regime_seq, bull_id, _ = fit_regimes(hmm_returns)
     except Exception:
         regime_seq = np.zeros(len(returns), dtype=int)
         bull_id = 0
@@ -1019,19 +1062,19 @@ def get_factor_correlations():
     with open(_FACTOR_CORR_PATH, "w") as f:
         json.dump(out, f, indent=2)
     db.save_diagnostic("factor_correlations", out)
-    return out
+    return _sanitize_json(out)
 
 
 @app.get("/api/gate-stats")
 def get_gate_stats():
     try:
         with open(_GATE_STATS_PATH) as f:
-            return json.load(f)
+            return _sanitize_json(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     db_data = db.load_diagnostic("gate_stats")
     if db_data:
-        return db_data
+        return _sanitize_json(db_data)
     return {"error": "No gate stats found. Run signals job first."}
 
 
@@ -1054,14 +1097,14 @@ def get_debug():
     ]:
         try:
             with open(path) as f:
-                out[key] = json.load(f)
+                out[key] = _sanitize_json(json.load(f))
         except (FileNotFoundError, json.JSONDecodeError) as e:
             out[key] = {"error": str(e)}
     for key in ("gate_stats", "factor_correlations"):
         if "error" in out.get(key, {}):
             db_data = db.load_diagnostic(key)
             if db_data:
-                out[key] = db_data
+                out[key] = _sanitize_json(db_data)
     out["active_config"] = {
         "MIN_FACTOR_FLOOR":           db.get_config("MIN_FACTOR_FLOOR", "disabled"),
         "OVEREXTENDED_THRESHOLD_PCT": db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"),
