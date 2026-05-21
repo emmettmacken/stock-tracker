@@ -1,5 +1,6 @@
 """SQLite persistence layer for watchlist, signal log, and trade outcomes."""
 from __future__ import annotations
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -65,6 +66,12 @@ def init_db() -> None:
                 key        TEXT PRIMARY KEY,
                 value      TEXT,
                 updated_at TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS diagnostic_snapshots (
+                key        TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL
             );
         """)
     _run_migrations()
@@ -433,3 +440,28 @@ def get_analytics_data() -> dict:
         "by_ticker":       [dict(r) for r in ticker_rows],
         "total_closed_trades": total_closed,
     }
+
+
+# ── Diagnostic snapshots ──────────────────────────────────────────────────────
+
+def save_diagnostic(key: str, data: dict) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO diagnostic_snapshots (key, data, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at""",
+            (key, json.dumps(data), datetime.utcnow().isoformat()),
+        )
+
+
+def load_diagnostic(key: str) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT data FROM diagnostic_snapshots WHERE key = ?", (key,)
+        ).fetchone()
+        if row:
+            try:
+                return json.loads(row["data"])
+            except json.JSONDecodeError:
+                return None
+        return None

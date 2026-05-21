@@ -159,6 +159,7 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 _WEIGHT_OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "factor_weight_overrides.json")
 _WEIGHT_DRIFT_LOG_PATH = os.path.join(os.path.dirname(__file__), "weight_overrides.json")
 _FACTOR_CORR_PATH      = os.path.join(os.path.dirname(__file__), "factor_correlations.json")
+_GATE_STATS_PATH       = os.path.join(os.path.dirname(__file__), "gate_stats.json")
 
 
 def _load_ticker_weights(ticker: str) -> dict[str, float]:
@@ -931,6 +932,34 @@ def get_factor_weights():
     return {k: round(v * 100) for k, v in DEFAULT_FACTOR_WEIGHTS.items()}
 
 
+@app.get("/api/factors/cluster")
+def get_factors_cluster(tickers: str = ""):
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not ticker_list:
+        return {"error": "Pass ?tickers=AAPL,MSFT,GOOG"}
+    results = []
+    for ticker in ticker_list:
+        try:
+            res = _compute_factors(ticker)
+            if res is None:
+                results.append({"ticker": ticker, "error": "compute returned None"})
+                continue
+            results.append({
+                "ticker":           ticker,
+                "composite_score":  res["composite_score"],
+                "hmm_signal":       res["hmm_signal"],
+                "min_factor_score": res.get("min_factor_score"),
+                "factors_summary":  {
+                    k: (v["score"] if not v["null"] else None)
+                    for k, v in res["factors"].items()
+                },
+            })
+        except Exception as e:
+            results.append({"ticker": ticker, "error": str(e)})
+    results.sort(key=lambda x: x.get("composite_score") or 0, reverse=True)
+    return {"tickers": results, "count": len(results)}
+
+
 @app.get("/api/factors/{ticker}")
 def get_factors(ticker: str):
     ticker = ticker.upper()
@@ -971,6 +1000,55 @@ def get_factor_correlations():
     }
     with open(_FACTOR_CORR_PATH, "w") as f:
         json.dump(out, f, indent=2)
+    db.save_diagnostic("factor_correlations", out)
+    return out
+
+
+@app.get("/api/gate-stats")
+def get_gate_stats():
+    try:
+        with open(_GATE_STATS_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    db_data = db.load_diagnostic("gate_stats")
+    if db_data:
+        return db_data
+    return {"error": "No gate stats found. Run signals job first."}
+
+
+@app.get("/api/weight-overrides")
+def get_weight_overrides():
+    try:
+        with open(_WEIGHT_DRIFT_LOG_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/debug")
+def get_debug():
+    out: dict = {}
+    for path, key in [
+        (_GATE_STATS_PATH,       "gate_stats"),
+        (_FACTOR_CORR_PATH,      "factor_correlations"),
+        (_WEIGHT_DRIFT_LOG_PATH, "weight_overrides"),
+    ]:
+        try:
+            with open(path) as f:
+                out[key] = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            out[key] = {"error": str(e)}
+    for key in ("gate_stats", "factor_correlations"):
+        if "error" in out.get(key, {}):
+            db_data = db.load_diagnostic(key)
+            if db_data:
+                out[key] = db_data
+    out["active_config"] = {
+        "MIN_FACTOR_FLOOR":           db.get_config("MIN_FACTOR_FLOOR", "disabled"),
+        "OVEREXTENDED_THRESHOLD_PCT": db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"),
+        "DEFAULT_FACTOR_WEIGHTS":     DEFAULT_FACTOR_WEIGHTS,
+    }
     return out
 
 
@@ -1617,9 +1695,9 @@ def _write_gate_stats() -> None:
             "rejected": rejected,
             "rejection_rate": round(rejected / total, 4) if total > 0 else 0.0,
         }
-    path = os.path.join(os.path.dirname(__file__), "gate_stats.json")
-    with open(path, "w") as f:
+    with open(_GATE_STATS_PATH, "w") as f:
         json.dump(stats, f, indent=2)
+    db.save_diagnostic("gate_stats", stats)
     logger.info("Gate stats written (%d total BUY evaluations, 90d)", total)
 
 
