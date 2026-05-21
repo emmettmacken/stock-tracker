@@ -922,7 +922,8 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     current_vol  = float(vol[-2])     if len(vol)     >= 2 else (float(vol[-1])     if len(vol)     > 0 else 0.0)
     avg_vol_20d  = float(vol_20d[-2]) if len(vol_20d) >= 2 else (float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0)
     volume_ratio = round(current_vol / avg_vol_20d, 3) if avg_vol_20d > 0 else None
-    volume_ok    = current_vol > 1.2 * avg_vol_20d if avg_vol_20d > 0 else True
+    vol_thresh   = float(db.get_config("VOLUME_THRESHOLD", "1.05"))
+    volume_ok    = current_vol > vol_thresh * avg_vol_20d if avg_vol_20d > 0 else True
     ma20         = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes[-1])
     price_ma20_ratio = float(closes[-1]) / ma20 if ma20 > 0 else 1.0
     overextended = price_ma20_ratio > 1.25  # kept for API compat; gate uses OVEREXTENDED_THRESHOLD_PCT
@@ -997,6 +998,8 @@ def get_factors_cluster(tickers: str = ""):
                 "composite_score":  res["composite_score"],
                 "hmm_signal":       res["hmm_signal"],
                 "min_factor_score": res.get("min_factor_score"),
+                "volume_ratio":     res.get("volume_ratio"),
+                "volume_ok":        res.get("volume_ok"),
                 "factors_summary":  {
                     k: (v["score"] if not v["null"] else None)
                     for k, v in res["factors"].items()
