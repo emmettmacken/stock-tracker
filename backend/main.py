@@ -1,6 +1,7 @@
 """Stock Signal Tracker v2 — 2D Markov chain, HMM regimes, CI signals, walk-forward backtest."""
 from __future__ import annotations
 import json
+import math
 import warnings
 import time
 import logging
@@ -996,9 +997,15 @@ def get_factor_correlations():
         return {"error": "Not enough tickers with complete factor data"}
     try:
         zero_variance = [k for k, v in rows.items() if len(set(v)) <= 1]
-        corr = pd.DataFrame(rows).corr()
-        corr_clean = corr.where(pd.notna(corr), other=None)
-        corr_dict = corr_clean.round(4).to_dict()
+        corr_df = pd.DataFrame(rows).corr()
+        raw_dict = corr_df.to_dict()
+        corr_dict = {
+            outer_k: {
+                inner_k: (round(v, 4) if isinstance(v, float) and not math.isnan(v) else None)
+                for inner_k, v in inner_v.items()
+            }
+            for outer_k, inner_v in raw_dict.items()
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Correlation computation failed: {e}"})
     out = {
