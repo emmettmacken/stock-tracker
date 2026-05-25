@@ -587,16 +587,40 @@ def get_backtest(ticker: str):
     dates = df.index.tolist()[1:]
     n = len(returns)  # = len(closes) - 1
 
-    TRAIN, TEST, HOLD = 252, 21, 5
+    TRAIN = int(db.get_config("BACKTEST_TRAIN", "252"))
+    TEST  = int(db.get_config("BACKTEST_TEST", "21"))
+    HOLD  = int(db.get_config("BACKTEST_HOLD", "15"))
+    atr_mult     = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
+    use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "false").lower() == "true"
+    macro_filter = db.get_config("BACKTEST_MACRO_FILTER", "true").lower() == "true"
 
     if n < TRAIN + TEST:
         raise HTTPException(status_code=400, detail="Need at least 2 years of history for backtest")
+
+    # Precompute 14-day ATR series aligned with returns (length n)
+    h_bt  = df["High"].values.astype(float)[1:]
+    l_bt  = df["Low"].values.astype(float)[1:]
+    pc_bt = closes[:-1]
+    tr_bt = np.maximum(h_bt - l_bt, np.maximum(np.abs(h_bt - pc_bt), np.abs(l_bt - pc_bt)))
+    atr_series = pd.Series(tr_bt).rolling(14, min_periods=1).mean().values
+
+    # Precompute SPY 200-day MA for macro filter (one SPY fetch, no in-loop calls)
+    spy_above_ma: Optional[np.ndarray] = None
+    if macro_filter:
+        try:
+            spy_df = fetch_ohlcv("SPY", days=760, min_bars=260)
+            spy_arr = spy_df["Close"].reindex(df.index).ffill().bfill().values.astype(float)
+            spy_ma200 = pd.Series(spy_arr).rolling(200, min_periods=1).mean().values
+            spy_above_ma = (spy_arr > spy_ma200)
+        except Exception:
+            spy_above_ma = None  # fail open: don't block trades on SPY fetch failure
 
     # Walk-forward simulation
     portfolio   = 1.0
     bah_base    = float(closes[TRAIN])
     in_pos      = False
     hold_left   = 0
+    trail_stop  = 0.0
     daily_strat: list[float] = []
     equity_curve: list[dict] = []
     trade_results: list[bool] = []
@@ -645,18 +669,36 @@ def get_backtest(ticker: str):
 
             # Portfolio update: earn r_t if already in position BEFORE this signal
             if in_pos:
-                portfolio *= (1 + r_t)
-                daily_strat.append(r_t)
-                hold_left -= 1
-                if signal == "SELL" or hold_left <= 0:
-                    trade_results.append(portfolio > trade_entry_val)
-                    in_pos = False
+                atr_exit = False
+                if use_atr_stop:
+                    cur_price = closes[idx]
+                    atr_now = atr_series[idx] if atr_series[idx] > 0 else cur_price * 0.02
+                    candidate = cur_price - atr_mult * atr_now
+                    trail_stop = max(trail_stop, candidate)
+                    if cur_price < trail_stop:
+                        trade_results.append(portfolio > trade_entry_val)
+                        in_pos = False
+                        atr_exit = True
+                if atr_exit:
+                    daily_strat.append(0.0)
+                else:
+                    portfolio *= (1 + r_t)
+                    daily_strat.append(r_t)
+                    hold_left -= 1
+                    if signal == "SELL" or hold_left <= 0:
+                        trade_results.append(portfolio > trade_entry_val)
+                        in_pos = False
             else:
                 daily_strat.append(0.0)
                 if signal == "BUY":
-                    in_pos = True
-                    hold_left = HOLD
-                    trade_entry_val = portfolio
+                    spy_ok = (spy_above_ma is None) or bool(spy_above_ma[idx])
+                    if not macro_filter or spy_ok:
+                        in_pos = True
+                        hold_left = HOLD
+                        trade_entry_val = portfolio
+                        if use_atr_stop:
+                            atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * 0.02
+                            trail_stop = closes[idx] - atr_mult * atr_entry
 
             bah_val = float(closes[idx + 1]) / bah_base if idx + 1 < len(closes) else float(closes[-1]) / bah_base
             raw_date = dates[idx]
@@ -1890,7 +1932,8 @@ def _run_signal_job() -> None:
                     except Exception:
                         pass
                 sector = _get_sector(ticker)
-                if sector != "Unknown" and open_sector_counts.get(sector, 0) >= 2:
+                max_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+                if sector != "Unknown" and open_sector_counts.get(sector, 0) >= max_sector:
                     db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   "sector_concentration", price, atr)
                     continue
