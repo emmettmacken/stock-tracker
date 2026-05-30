@@ -1894,77 +1894,77 @@ def _run_signal_job() -> None:
                 except Exception as e:
                     db.log_signal(ticker, composite, "SELL", "skipped",
                                   f"close_failed:{e}", price, atr)
+                continue
 
-            elif effective_composite >= buy_threshold:
-                if high_vix:
-                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                  f"vix_too_high:{vix:.1f}", price, atr)
-                    continue
-                if in_pos:
-                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                  "already_in_position", price, atr)
-                    continue
-                mom_score_val    = result.get("mom_score")
-                price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
-                top_quartile_mom = mom_score_val is not None and mom_score_val >= 75.0
-                if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
-                    db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr)
-                    continue
-                ret_3m  = result.get("ret_3m")
-                ret_12m = result.get("ret_12m")
-                if ret_3m is not None and ret_12m is not None:
-                    if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
-                        db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                      "momentum_disagreement", price, atr)
-                        continue
-                # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
-                perf = db.get_ticker_performance(ticker)
-                if perf and perf.get("last_exit_at"):
-                    try:
-                        last_exit = datetime.fromisoformat(perf["last_exit_at"])
-                        days_since = _trading_days_between(last_exit, datetime.utcnow())
-                        if days_since < 5:
-                            db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                          "reentry_cooldown", price, atr)
-                            continue
-                    except Exception:
-                        pass
-                sector = _get_sector(ticker)
-                max_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
-                if sector != "Unknown" and open_sector_counts.get(sector, 0) >= max_sector:
-                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                  "sector_concentration", price, atr)
-                    continue
+            if hmm_signal != "BUY":
+                db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy", price, atr)
+                continue
 
-                dollars = _position_dollars(ticker, equity, effective_composite, vol_21d=result.get("vol_21d"))
+            if effective_composite < buy_threshold:
+                db.log_signal(ticker, composite, hmm_signal, "skipped",
+                              f"score_below_threshold:{effective_composite:.1f}<{buy_threshold:.0f}",
+                              price, atr)
+                continue
+
+            if high_vix:
+                db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                              f"vix_too_high:{vix:.1f}", price, atr)
+                continue
+            if in_pos:
+                db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                              "already_in_position", price, atr)
+                continue
+            mom_score_val    = result.get("mom_score")
+            price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
+            top_quartile_mom = mom_score_val is not None and mom_score_val >= 75.0
+            if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
+                db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr)
+                continue
+            ret_3m  = result.get("ret_3m")
+            ret_12m = result.get("ret_12m")
+            if ret_3m is not None and ret_12m is not None:
+                if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
+                    db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                                  "momentum_disagreement", price, atr)
+                    continue
+            # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
+            perf = db.get_ticker_performance(ticker)
+            if perf and perf.get("last_exit_at"):
                 try:
-                    try:
-                        api.submit_order(MarketOrderRequest(
-                            symbol=ticker, notional=round(dollars, 2),
-                            side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                    except Exception:
-                        qty = max(1, int(dollars // price))
-                        api.submit_order(MarketOrderRequest(
-                            symbol=ticker, qty=qty,
-                            side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                    signal_id = db.log_signal(ticker, effective_composite, "BUY", "ordered", None, price, atr)
-                    if atr > 0:
-                        db.update_trailing_stop(signal_id, price - 1.5 * atr)
-                    open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
-                    logger.info("%s: BUY $%.0f score=%.1f sector=%s", ticker, dollars, effective_composite, sector)
-                except Exception as e:
-                    db.log_signal(ticker, composite, "BUY", "skipped",
-                                  f"order_failed:{e}", price, atr)
-            else:
-                if effective_composite != composite:
-                    db.log_signal(ticker, effective_composite, hmm_signal, "skipped",
-                                  "min_factor_floor", price, atr)
-                elif hmm_signal != "BUY":
-                    db.log_signal(ticker, composite, hmm_signal, "skipped",
-                                  "hmm_not_buy", price, atr)
-                else:
-                    db.log_signal(ticker, composite, hmm_signal, "skipped",
-                                  "score_below_threshold", price, atr)
+                    last_exit = datetime.fromisoformat(perf["last_exit_at"])
+                    days_since = _trading_days_between(last_exit, datetime.utcnow())
+                    if days_since < 5:
+                        db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                                      "reentry_cooldown", price, atr)
+                        continue
+                except Exception:
+                    pass
+            sector = _get_sector(ticker)
+            max_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+            if sector != "Unknown" and open_sector_counts.get(sector, 0) >= max_sector:
+                db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                              "sector_concentration", price, atr)
+                continue
+
+            dollars = _position_dollars(ticker, equity, effective_composite, vol_21d=result.get("vol_21d"))
+            try:
+                try:
+                    api.submit_order(MarketOrderRequest(
+                        symbol=ticker, notional=round(dollars, 2),
+                        side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                except Exception:
+                    qty = max(1, int(dollars // price))
+                    api.submit_order(MarketOrderRequest(
+                        symbol=ticker, qty=qty,
+                        side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                signal_id = db.log_signal(ticker, effective_composite, "BUY", "ordered", None, price, atr)
+                if atr > 0:
+                    db.update_trailing_stop(signal_id, price - 1.5 * atr)
+                open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
+                logger.info("%s: BUY $%.0f score=%.1f sector=%s", ticker, dollars, effective_composite, sector)
+            except Exception as e:
+                db.log_signal(ticker, composite, "BUY", "skipped",
+                              f"order_failed:{e}", price, atr)
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
 
