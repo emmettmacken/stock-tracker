@@ -1789,7 +1789,7 @@ def _write_gate_stats() -> None:
     cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
     gate_names = [
         "earnings_within_2d", "vix_too_high", "already_in_position",
-        "low_volume", "overextended", "momentum_disagreement",
+        "overextended", "momentum_disagreement",
         "reentry_cooldown", "sector_concentration",
     ]
     total = db.count_buy_evaluations(cutoff)
@@ -1902,9 +1902,6 @@ def _run_signal_job() -> None:
                 if in_pos:
                     db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   "already_in_position", price, atr)
-                    continue
-                if not result.get("volume_ok", True):
-                    db.log_signal(ticker, effective_composite, "BUY", "skipped", "low_volume", price, atr)
                     continue
                 mom_score_val    = result.get("mom_score")
                 price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
