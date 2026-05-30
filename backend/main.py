@@ -1788,6 +1788,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
 def _write_gate_stats() -> None:
     cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
     gate_names = [
+        "hmm_not_buy", "score_below_threshold",
         "earnings_within_2d", "vix_too_high", "already_in_position",
         "overextended", "momentum_disagreement",
         "reentry_cooldown", "sector_concentration",
@@ -1958,9 +1959,12 @@ def _run_signal_job() -> None:
                 if effective_composite != composite:
                     db.log_signal(ticker, effective_composite, hmm_signal, "skipped",
                                   "min_factor_floor", price, atr)
+                elif hmm_signal != "BUY":
+                    db.log_signal(ticker, composite, hmm_signal, "skipped",
+                                  "hmm_not_buy", price, atr)
                 else:
                     db.log_signal(ticker, composite, hmm_signal, "skipped",
-                                  "hold_or_below_threshold", price, atr)
+                                  "score_below_threshold", price, atr)
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
 
