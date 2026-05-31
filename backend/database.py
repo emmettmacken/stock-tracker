@@ -88,6 +88,11 @@ def _run_migrations() -> None:
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN hmm_regime TEXT"),
         # Change 4: regime at entry, lets threshold job separate bull/bear trades
         ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN regime_at_entry TEXT"),
+        # Kalman-smoothed HMM bull probability at signal time
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN smoothed_bull_prob REAL"),
+        # Kelly position sizing audit fields
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN kelly_fraction REAL"),
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN sizing_method TEXT"),
     ]
     with _conn() as conn:
         for _, sql in new_columns:
@@ -132,14 +137,18 @@ def log_signal(
     atr_at_signal: Optional[float],
     hmm_regime: Optional[str] = None,
     sentiment_score: Optional[float] = None,
+    smoothed_bull_prob: Optional[float] = None,
+    kelly_fraction: Optional[float] = None,
+    sizing_method: Optional[str] = None,
 ) -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO signal_log
                (ticker, timestamp, composite_score, signal, action,
                 skip_reason, price_at_signal, atr_at_signal,
-                hmm_regime, sentiment_score)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                hmm_regime, sentiment_score, smoothed_bull_prob,
+                kelly_fraction, sizing_method)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 datetime.utcnow().isoformat(),
@@ -151,6 +160,9 @@ def log_signal(
                 atr_at_signal,
                 hmm_regime,
                 sentiment_score,
+                smoothed_bull_prob,
+                kelly_fraction,
+                sizing_method,
             ),
         )
         return cur.lastrowid  # type: ignore[return-value]
@@ -509,3 +521,24 @@ def load_diagnostic(key: str) -> Optional[dict]:
             except json.JSONDecodeError:
                 return None
         return None
+
+
+# ── Kelly sizing queries ──────────────────────────────────────────────────────
+
+def get_trades_for_kelly(ticker: str) -> list[dict]:
+    """Return all closed trades for a ticker (return_pct only) for Kelly computation."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT return_pct FROM trade_outcomes WHERE ticker = ? ORDER BY exit_timestamp DESC",
+            (ticker.upper(),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_trades_for_kelly() -> list[dict]:
+    """Return all closed trades portfolio-wide (return_pct only) for Kelly prior."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT return_pct FROM trade_outcomes ORDER BY exit_timestamp DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]

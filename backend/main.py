@@ -107,7 +107,7 @@ def _startup() -> None:
         ET = ZoneInfo("America/New_York")
         _scheduler.add_job(
             _run_signal_job,
-            CronTrigger(day_of_week="mon-fri", hour=15, minute=45, timezone=ET),
+            CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone=ET),
             id="signal_job", replace_existing=True,
         )
         _scheduler.add_job(
@@ -121,7 +121,7 @@ def _startup() -> None:
             id="adaptive_thresholds_job", replace_existing=True,
         )
         _scheduler.start()
-        logger.info("Scheduler started (signal@15:45 ET, stop-loss@09:35 ET, thresholds@Sun18:00 ET)")
+        logger.info("Scheduler started (signal@15:30 ET, stop-loss@09:35 ET, thresholds@Sun18:00 ET)")
     else:
         logger.warning("APScheduler not available — scheduled jobs disabled")
 
@@ -311,6 +311,23 @@ def stationary(mat: np.ndarray, iters: int = 1000) -> np.ndarray:
     return pi
 
 # ── HMM regime detection ──────────────────────────────────────────────────────
+
+def _kalman_smooth(raw: np.ndarray, Q: float = 0.01, R: float = 0.1) -> np.ndarray:
+    """1-D scalar Kalman filter for smoothing a 0-1 probability series."""
+    n = len(raw)
+    if n == 0:
+        return raw.copy()
+    x = 0.5       # initial state estimate
+    P = 1.0       # initial error covariance
+    out = np.empty(n)
+    for i in range(n):
+        P_pred = P + Q
+        K = P_pred / (P_pred + R)
+        x = x + K * (float(raw[i]) - x)
+        P = (1.0 - K) * P_pred
+        out[i] = x
+    return out
+
 
 def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int, hmm.GaussianHMM]:
     """
@@ -938,14 +955,20 @@ def _earnings_score(ticker_obj: yf.Ticker) -> float | None:
 
 def _get_sentiment_score(ticker: str) -> float | None:
     """Return 0–100 sentiment score from cache or Alpha Vantage.
-    No local rate-limiter here — the per-request guard lives in get_sentiment().
-    Alpha Vantage returns a Note/Information key when over-limit; we handle it gracefully."""
+    Shares the module-level rate limiter (_SENTIMENT_LAST_CALL) with the API endpoint
+    so parallel calls from the signal job are serialized to ≤1 req/13s."""
     api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
     if not api_key:
         return None
-    cached, ts = _SENTIMENT_CACHE.get(ticker, ({}, 0.0))
-    if cached and cached.get("available") and (time.time() - ts) < _SENTIMENT_TTL:
-        return cached.get("sentiment_score")
+    global _SENTIMENT_LAST_CALL
+    with _SENTIMENT_LOCK:
+        cached, ts = _SENTIMENT_CACHE.get(ticker, ({}, 0.0))
+        if cached and cached.get("available") and (time.time() - ts) < _SENTIMENT_TTL:
+            return cached.get("sentiment_score")
+        now = time.time()
+        if now - _SENTIMENT_LAST_CALL < _SENTIMENT_MIN_INTERVAL:
+            return None  # rate-limited; caller should retry after the interval
+        _SENTIMENT_LAST_CALL = now
     try:
         url = (
             f"https://www.alphavantage.co/query"
@@ -964,12 +987,13 @@ def _get_sentiment_score(ticker: str) -> float | None:
         avg = sum(scores) / len(scores)
         score = round((avg + 1) / 2 * 100, 1)
         direction = "bullish" if score >= 60 else ("bearish" if score <= 40 else "neutral")
-        _SENTIMENT_CACHE[ticker] = (
-            {"available": True, "ticker": ticker, "sentiment_score": score, "direction": direction,
-             "article_count": int(data.get("items", len(feed))), "buzz_score": None,
-             "sector_vs_avg": None, "bearish_pct": None},
-            time.time(),
-        )
+        result_entry = {
+            "available": True, "ticker": ticker, "sentiment_score": score, "direction": direction,
+            "article_count": int(data.get("items", len(feed))), "buzz_score": None,
+            "sector_vs_avg": None, "bearish_pct": None,
+        }
+        with _SENTIMENT_LOCK:
+            _SENTIMENT_CACHE[ticker] = (result_entry, time.time())
         return score
     except Exception:
         return None
@@ -1133,11 +1157,26 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     closes, returns, vol, vol_20d = extract_features(df)
     hmm_returns = _normalize_returns_for_hmm(returns)
 
+    smoothed_bull_prob_last = 0.5
+    raw_bull_prob_last = 0.5
     try:
-        regime_seq, bull_id, _ = fit_regimes(hmm_returns)
+        regime_seq, bull_id, hmm_model = fit_regimes(hmm_returns)
+        proba = hmm_model.predict_proba(hmm_returns.reshape(-1, 1))
+        raw_bull_prob_series = proba[:, bull_id]
+        smoothed_bull_prob_series = _kalman_smooth(raw_bull_prob_series)
+        raw_bull_prob_last = float(raw_bull_prob_series[-1])
+        smoothed_bull_prob_last = float(smoothed_bull_prob_series[-1])
     except Exception:
         regime_seq = np.zeros(len(returns), dtype=int)
         bull_id = 0
+
+    # Regime label based on Kalman-smoothed probability (keeps raw hard label for matrix math)
+    if smoothed_bull_prob_last > 0.65:
+        regime_label = "bull"
+    elif smoothed_bull_prob_last < 0.35:
+        regime_label = "bear"
+    else:
+        regime_label = "transition"
 
     w = min(ROLLING_WINDOW, len(returns))
     rets_w, vol_w, vol_20d_w, reg_w = returns[-w:], vol[-w:], vol_20d[-w:], regime_seq[-w:]
@@ -1146,7 +1185,6 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     stat_all = stationary(mat_all)
 
     active_id = int(regime_seq[-1])
-    regime_label = "bull" if active_id == bull_id else "bear"
     active_st = [s for s, r in zip(states_all, reg_w) if r == active_id]
     if len(active_st) >= 20:
         mat_act, _, cnt_act = build_matrix(active_st, fallback=stat_all)
@@ -1205,25 +1243,26 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     vol_21d = float(rets_21.std())
 
     result = {
-        "ticker":           ticker,
-        "factors":          factors,
-        "composite_score":  round(composite, 2),
-        "min_factor_score": round(min_factor_score, 2) if min_factor_score is not None else None,
-        "hmm_signal":       sig["signal"],
-        "hmm_confidence":   sig["confidence"],
-        "hmm_regime":       regime_label,  # Change 4: needed by adaptive threshold job
-        "current_price":    float(closes[-1]),
-        "volume_ok":        volume_ok,
-        "volume_ratio":     volume_ratio,
-        "overextended":     overextended,
-        "price_ma20_ratio": round(price_ma20_ratio, 4),
-        "mom_score":        round(mom_score, 2) if mom_score is not None else None,
-        "ret_3m":           ret_3m,
-        "ret_12m":          ret_12m,
-        "atr":              atr,
-        "vol_21d":          vol_21d,
-        # Change 2: raw sentiment score stored in result for signal_log passthrough
-        "sentiment_score":  round(sentiment_score, 2) if sentiment_score is not None else None,
+        "ticker":              ticker,
+        "factors":             factors,
+        "composite_score":     round(composite, 2),
+        "min_factor_score":    round(min_factor_score, 2) if min_factor_score is not None else None,
+        "hmm_signal":          sig["signal"],
+        "hmm_confidence":      sig["confidence"],
+        "hmm_regime":          regime_label,
+        "smoothed_bull_prob":  round(smoothed_bull_prob_last, 4),
+        "raw_bull_prob":       round(raw_bull_prob_last, 4),
+        "current_price":       float(closes[-1]),
+        "volume_ok":           volume_ok,
+        "volume_ratio":        volume_ratio,
+        "overextended":        overextended,
+        "price_ma20_ratio":    round(price_ma20_ratio, 4),
+        "mom_score":           round(mom_score, 2) if mom_score is not None else None,
+        "ret_3m":              ret_3m,
+        "ret_12m":             ret_12m,
+        "atr":                 atr,
+        "vol_21d":             vol_21d,
+        "sentiment_score":     round(sentiment_score, 2) if sentiment_score is not None else None,
     }
     with _FACTORS_LOCK:
         _FACTORS_CACHE[ticker] = (result, time.time())
@@ -1374,6 +1413,86 @@ def get_debug():
 # ═══════════════════════════════════════════════════════════════════════════════
 # ALTERNATIVE DATA
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/debug/sentiment")
+def debug_sentiment():
+    """Call _get_sentiment_score() for every watchlist ticker sequentially.
+    Returns raw scores, null count, and null rate for sentiment health checking.
+    Note: sequential calls with 13s gap; response may take several minutes for large watchlists."""
+    watchlist = [r["ticker"] for r in db.get_watchlist()]
+    results = []
+    null_count = 0
+    for ticker in watchlist:
+        with _SENTIMENT_LOCK:
+            cached, ts = _SENTIMENT_CACHE.get(ticker, ({}, 0.0))
+            cache_fresh = cached and cached.get("available") and (time.time() - ts) < _SENTIMENT_TTL
+        score = _get_sentiment_score(ticker)
+        results.append({"ticker": ticker, "score": score, "null": score is None, "from_cache": cache_fresh})
+        if score is None:
+            null_count += 1
+        if not cache_fresh:
+            time.sleep(_SENTIMENT_MIN_INTERVAL)
+    total = len(results)
+    null_rate = round(null_count / total, 4) if total > 0 else 0.0
+    return {
+        "scores": results,
+        "null_count": null_count,
+        "null_rate": null_rate,
+        "total": total,
+        "api_key_present": bool(os.getenv("ALPHA_VANTAGE_KEY", "")),
+        "rate_limit_interval_s": _SENTIMENT_MIN_INTERVAL,
+    }
+
+
+@app.get("/api/debug/kelly")
+def debug_kelly():
+    """Return current Kelly parameters for every watchlist ticker plus the portfolio-wide prior."""
+    watchlist = [r["ticker"] for r in db.get_watchlist()]
+    all_trades = db.get_all_trades_for_kelly()
+
+    def _params(trades: list[dict]) -> Optional[dict]:
+        result = _compute_kelly_params(trades)
+        if result is None:
+            return None
+        p, b, f_star = result
+        return {
+            "p":          round(p, 4),
+            "q":          round(1 - p, 4),
+            "b":          round(b, 4),
+            "f_star":     round(f_star, 4),
+            "half_kelly": round(f_star * 0.5, 4),
+            "n_trades":   len(trades),
+        }
+
+    portfolio_params = _params(all_trades)
+
+    tickers_data = []
+    for ticker in watchlist:
+        ticker_trades = db.get_trades_for_kelly(ticker)
+        if len(ticker_trades) >= 10:
+            params = _params(ticker_trades)
+            method = "kelly"
+        elif len(all_trades) >= 20:
+            params = portfolio_params
+            method = "kelly_portfolio_prior"
+        else:
+            params = None
+            method = "vol_target_fallback"
+        tickers_data.append({
+            "ticker":          ticker,
+            "sizing_method":   method,
+            "n_ticker_trades": len(ticker_trades),
+            "kelly_params":    params,
+        })
+
+    return {
+        "portfolio_prior":          portfolio_params,
+        "total_portfolio_trades":   len(all_trades),
+        "min_ticker_trades_for_kelly": 10,
+        "min_portfolio_trades_for_prior": 20,
+        "tickers":                  tickers_data,
+    }
+
 
 @app.get("/api/sentiment/{ticker}")
 def get_sentiment(ticker: str):
@@ -1998,23 +2117,45 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
     return result
 
 
-def _position_dollars(ticker: str, equity: float, score: float = 75.0,
-                       vol_21d: Optional[float] = None) -> float:
-    """Vol-targeted position size scaled by conviction score and historical ticker performance."""
+def _compute_kelly_params(trades: list[dict]) -> Optional[tuple[float, float, float]]:
+    """Return (p, b, f_star) from a list of {return_pct} dicts, or None if insufficient data."""
+    wins   = [t["return_pct"] for t in trades if t["return_pct"] > 0]
+    losses = [abs(t["return_pct"]) for t in trades if t["return_pct"] <= 0]
+    if not wins or not losses:
+        return None
+    p = len(wins) / len(trades)
+    q = 1.0 - p
+    b = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+    f_star = max(0.0, (p * b - q) / b)
+    return p, b, f_star
+
+
+def _position_dollars(
+    ticker: str, equity: float, score: float = 75.0, vol_21d: Optional[float] = None
+) -> tuple[float, float, str]:
+    """Returns (position_dollars, kelly_fraction, sizing_method).
+
+    Uses fractional Kelly when ≥10 ticker trades exist, portfolio-wide prior when
+    the portfolio has ≥20 trades but the ticker has <10, otherwise vol-targeting.
+    Conviction and performance multipliers apply on top in all cases.
+    """
+    # ── Vol-target baseline (always computed; serves as fallback and 3× cap reference) ──
     if vol_21d is not None and vol_21d > 0:
-        weight = 0.01 / vol_21d
+        daily_vol = vol_21d
     else:
         try:
             df = fetch_ohlcv(ticker, days=30, min_bars=22)
             c = df["Close"].values.astype(float)
             rets_21 = np.diff(c[-22:]) / c[-22:-1]
             daily_vol = float(rets_21.std())
-            weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
         except Exception:
-            weight = 0.05
-    # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5× (capped)
+            daily_vol = 0.0
+    vol_weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
+
+    # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5×
     multiplier = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
-    # Performance multiplier based on ticker's historical contribution
+
+    # Performance multiplier
     perf = db.get_ticker_performance(ticker)
     perf_multiplier = 1.0
     if perf and perf["total_trades"] >= 3:
@@ -2022,9 +2163,46 @@ def _position_dollars(ticker: str, equity: float, score: float = 75.0,
             perf_multiplier = 1.2
         elif perf["win_rate"] < 0.4:
             perf_multiplier = 0.7
-    # 10% hard cap applied after all multipliers
-    raw_dollars = weight * equity * multiplier * perf_multiplier
-    return min(raw_dollars, equity * 0.10)
+
+    vol_base = vol_weight * equity * multiplier * perf_multiplier
+
+    # ── Kelly sizing ──────────────────────────────────────────────────────────
+    ticker_trades = db.get_trades_for_kelly(ticker)
+    all_trades    = db.get_all_trades_for_kelly()
+
+    kelly_frac: float = 0.0
+    sizing_method = "vol_target_fallback"
+
+    if len(ticker_trades) >= 10:
+        params = _compute_kelly_params(ticker_trades)
+        if params is not None:
+            _, _, f_star = params
+            kelly_frac = f_star * 0.5  # half-Kelly
+            sizing_method = "kelly"
+    elif len(all_trades) >= 20:
+        params = _compute_kelly_params(all_trades)
+        if params is not None:
+            _, _, f_star = params
+            kelly_frac = f_star * 0.5
+            sizing_method = "kelly_portfolio_prior"
+
+    if sizing_method != "vol_target_fallback":
+        kelly_dollars = kelly_frac * equity * multiplier * perf_multiplier
+        # If Kelly is more than 3× vol-target, warn and cap
+        cap_3x = vol_base * 3.0
+        if kelly_dollars > cap_3x:
+            logger.warning(
+                "%s: Kelly $%.0f exceeds 3× vol-target $%.0f — capping",
+                ticker, kelly_dollars, cap_3x,
+            )
+            kelly_dollars = cap_3x
+        # Hard cap 10%, floor 0.5%
+        kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * 0.005)
+        return kelly_dollars, round(kelly_frac, 6), sizing_method
+
+    # Vol-targeting fallback
+    raw_dollars = max(min(vol_base, equity * 0.10), equity * 0.005)
+    return raw_dollars, 0.0, "vol_target_fallback"
 
 
 def _trading_days_between(start: datetime, end: datetime) -> int:
@@ -2069,8 +2247,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
 def _write_gate_stats() -> None:
     cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
     gate_names = [
-        "hmm_not_buy", "score_below_threshold",
-        # Change 2: gate 6.5 — sentiment hard filter tracked separately
+        "hmm_not_buy", "hmm_regime_uncertain", "score_below_threshold",
         "sentiment_too_low",
         "earnings_within_2d", "vix_too_high", "already_in_position",
         "overextended", "momentum_disagreement",
@@ -2132,7 +2309,19 @@ def _run_signal_job() -> None:
         sec = _get_sector(sym)
         open_sector_counts[sec] = open_sector_counts.get(sec, 0) + 1
 
-    # Change 5: compute factors for all watchlist tickers in parallel, then evaluate gates sequentially
+    # Pre-fetch sentiment sequentially with rate limiting before parallel factor computation.
+    # The AV free tier allows ~5 req/min; 8 parallel workers would all fail simultaneously.
+    # By pre-populating the cache here, the parallel workers get cache hits for sentiment.
+    logger.info("Pre-fetching sentiment for %d tickers (13s gap each)...", len(watchlist))
+    for _st in watchlist:
+        with _SENTIMENT_LOCK:
+            _cached, _ts = _SENTIMENT_CACHE.get(_st, ({}, 0.0))
+            _cache_fresh = _cached and _cached.get("available") and (time.time() - _ts) < _SENTIMENT_TTL
+        if not _cache_fresh:
+            _get_sentiment_score(_st)
+            time.sleep(_SENTIMENT_MIN_INTERVAL)
+
+    # Compute factors for all watchlist tickers in parallel, then evaluate gates sequentially
     def _fetch_factors_safe(ticker: str) -> tuple[str, Optional[dict]]:
         try:
             return ticker, _compute_factors(ticker)
@@ -2142,6 +2331,23 @@ def _run_signal_job() -> None:
 
     with ThreadPoolExecutor(max_workers=min(len(watchlist), 8)) as pool:
         factor_results: dict[str, Optional[dict]] = dict(pool.map(_fetch_factors_safe, watchlist))
+
+    # Sentinel: log warning if >50% of tickers returned None sentiment
+    _with_factors = [r for r in factor_results.values() if r is not None]
+    if _with_factors:
+        _null_sent = sum(1 for r in _with_factors if r.get("sentiment_score") is None)
+        _null_rate = _null_sent / len(_with_factors)
+        if _null_rate > 0.5:
+            logger.warning(
+                "Sentiment degraded: %.0f%% null rate (%d/%d tickers)",
+                _null_rate * 100, _null_sent, len(_with_factors),
+            )
+            db.save_diagnostic("sentiment_degraded", {
+                "null_rate": round(_null_rate, 4),
+                "null_count": _null_sent,
+                "total": len(_with_factors),
+                "timestamp": datetime.utcnow().isoformat(),
+            })
 
     # Sequential gate evaluation and order submission (must not be parallelised)
     for ticker in watchlist:
@@ -2156,13 +2362,14 @@ def _run_signal_job() -> None:
                 db.log_signal(ticker, None, None, "skipped", "data_unavailable", None, None)
                 continue
 
-            composite   = result["composite_score"]
-            hmm_signal  = result["hmm_signal"]
-            hmm_regime  = result.get("hmm_regime")        # Change 4: regime for adaptive threshold
-            sentiment   = result.get("sentiment_score")    # Change 2: for gate 6.5 and signal_log
-            price       = result["current_price"]
-            atr         = result.get("atr", 0.0)
-            in_pos      = ticker in positions
+            composite          = result["composite_score"]
+            hmm_signal         = result["hmm_signal"]
+            hmm_regime         = result.get("hmm_regime")
+            smoothed_bull_prob = result.get("smoothed_bull_prob", 0.5)
+            sentiment          = result.get("sentiment_score")
+            price              = result["current_price"]
+            atr                = result.get("atr", 0.0)
+            in_pos             = ticker in positions
 
             # MIN_FACTOR_FLOOR: cap entry score if any factor falls below the floor
             effective_composite = composite
@@ -2171,8 +2378,8 @@ def _run_signal_job() -> None:
                 if mfs is not None and mfs < min_factor_floor:
                     effective_composite = min(composite, buy_threshold - 5.0)
 
-            # Score deterioration — close regardless of HMM signal
-            if in_pos and composite < 40.0:
+            # Score deterioration exit — skip for transition regime (smoothed_bull_prob in [0.35, 0.65])
+            if in_pos and composite < 40.0 and hmm_regime != "transition":
                 pos = positions[ticker]
                 entry_log = db.get_last_buy_signal(ticker)
                 try:
@@ -2196,38 +2403,52 @@ def _run_signal_job() -> None:
 
             if hmm_signal != "BUY":
                 db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
+                continue
+
+            # Kalman-smoothed regime gate: require bull probability > 0.65
+            if smoothed_bull_prob <= 0.65:
+                db.log_signal(ticker, composite, "BUY", "skipped",
+                              f"hmm_regime_uncertain:{smoothed_bull_prob:.3f}",
+                              price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
 
             if effective_composite < buy_threshold:
                 db.log_signal(ticker, composite, hmm_signal, "skipped",
                               f"score_below_threshold:{effective_composite:.1f}<{buy_threshold:.0f}",
-                              price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
 
-            # Change 2: gate 6.5 — negative sentiment hard filter (between composite and VIX gates)
+            # Negative sentiment hard filter
             if sentiment is not None and sentiment < 35.0:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
                               f"sentiment_too_low:{sentiment:.1f}", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
 
             if high_vix:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
                               f"vix_too_high:{vix:.1f}", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
             if in_pos:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
                               "already_in_position", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
             mom_score_val    = result.get("mom_score")
             price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
             top_quartile_mom = mom_score_val is not None and mom_score_val >= 75.0
             if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
                 db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
             ret_3m  = result.get("ret_3m")
             ret_12m = result.get("ret_12m")
@@ -2235,7 +2456,8 @@ def _run_signal_job() -> None:
                 if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
                     db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   "momentum_disagreement", price, atr,
-                                  hmm_regime=hmm_regime, sentiment_score=sentiment)
+                                  hmm_regime=hmm_regime, sentiment_score=sentiment,
+                                  smoothed_bull_prob=smoothed_bull_prob)
                     continue
             # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
             perf = db.get_ticker_performance(ticker)
@@ -2246,7 +2468,8 @@ def _run_signal_job() -> None:
                     if days_since < 5:
                         db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                       "reentry_cooldown", price, atr,
-                                      hmm_regime=hmm_regime, sentiment_score=sentiment)
+                                      hmm_regime=hmm_regime, sentiment_score=sentiment,
+                                      smoothed_bull_prob=smoothed_bull_prob)
                         continue
                 except Exception:
                     pass
@@ -2255,10 +2478,13 @@ def _run_signal_job() -> None:
             if sector != "Unknown" and open_sector_counts.get(sector, 0) >= max_sector:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
                               "sector_concentration", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment)
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
                 continue
 
-            dollars = _position_dollars(ticker, equity, effective_composite, vol_21d=result.get("vol_21d"))
+            dollars, kelly_frac, sizing_method = _position_dollars(
+                ticker, equity, effective_composite, vol_21d=result.get("vol_21d")
+            )
             try:
                 try:
                     api.submit_order(MarketOrderRequest(
@@ -2269,14 +2495,20 @@ def _run_signal_job() -> None:
                     api.submit_order(MarketOrderRequest(
                         symbol=ticker, qty=qty,
                         side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                # Change 2/4: store regime and sentiment with BUY order for downstream use
-                signal_id = db.log_signal(ticker, effective_composite, "BUY", "ordered", None, price, atr,
-                                          hmm_regime=hmm_regime, sentiment_score=sentiment)
+                signal_id = db.log_signal(
+                    ticker, effective_composite, "BUY", "ordered", None, price, atr,
+                    hmm_regime=hmm_regime, sentiment_score=sentiment,
+                    smoothed_bull_prob=smoothed_bull_prob,
+                    kelly_fraction=kelly_frac, sizing_method=sizing_method,
+                )
                 if atr > 0:
                     db.update_trailing_stop(signal_id, price - 1.5 * atr)
                 open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
-                logger.info("%s: BUY $%.0f score=%.1f regime=%s sector=%s",
-                            ticker, dollars, effective_composite, hmm_regime, sector)
+                logger.info(
+                    "%s: BUY $%.0f score=%.1f regime=%s bull_prob=%.2f sizing=%s kelly=%.3f sector=%s",
+                    ticker, dollars, effective_composite, hmm_regime,
+                    smoothed_bull_prob, sizing_method, kelly_frac, sector,
+                )
             except Exception as e:
                 db.log_signal(ticker, composite, "BUY", "skipped",
                               f"order_failed:{e}", price, atr)
