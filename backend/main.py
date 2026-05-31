@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import math
+import re
 import warnings
 import time
 import logging
@@ -10,6 +11,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Optional
+from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -152,6 +154,12 @@ _SENTIMENT_MIN_INTERVAL = 13.0  # ~4.5 req/min, safely under the 5/min AV free-t
 _SECTOR_CACHE: dict[str, tuple[str, float]] = {}  # ticker → (sector, timestamp)
 _SECTOR_TTL = 86400  # 24 hours
 
+# Change 5: one lock per cache dict to prevent TOCTOU races during parallel factor computation
+_FACTORS_LOCK = threading.Lock()
+_MACRO_LOCK = threading.Lock()
+_EARNINGS_LOCK = threading.Lock()
+_SECTOR_LOCK = threading.Lock()
+
 # Shared httpx client — connection pooling, avoid per-request TLS handshakes
 _http_client = httpx.Client(timeout=15.0, follow_redirects=True)
 
@@ -159,14 +167,19 @@ _http_client = httpx.Client(timeout=15.0, follow_redirects=True)
 _FACTORS_CACHE: dict[str, tuple[dict, float]] = {}
 _FACTORS_TTL = 60  # seconds
 
+# Change 3: CIKs are permanent; cache indefinitely to avoid repeated EDGAR lookups
+_CIK_CACHE: dict[str, str] = {}  # ticker → 10-digit zero-padded CIK string
+
 # ── Factor weight configuration ───────────────────────────────────────────────
 
+# Change 2: sentiment added at 12%; earnings reduced 25→18%, insider 10→5% to keep total=100%
 DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     "hmm":       0.20,
     "momentum":  0.25,
     "vol_trend": 0.20,
-    "earnings":  0.25,
-    "insider":   0.10,
+    "earnings":  0.18,
+    "insider":   0.05,
+    "sentiment": 0.12,
 }
 
 _WEIGHT_OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "factor_weight_overrides.json")
@@ -604,7 +617,17 @@ def get_backtest(ticker: str):
     tr_bt = np.maximum(h_bt - l_bt, np.maximum(np.abs(h_bt - pc_bt), np.abs(l_bt - pc_bt)))
     atr_series = pd.Series(tr_bt).rolling(14, min_periods=1).mean().values
 
-    # Precompute SPY 200-day MA for macro filter (one SPY fetch, no in-loop calls)
+    # Change 1: precompute VIX history aligned to ticker dates for the VIX>30 gate
+    vix_series_bt: Optional[np.ndarray] = None
+    try:
+        vix_df_bt = yf.Ticker("^VIX").history(period="2y")
+        if not vix_df_bt.empty:
+            vix_aligned = vix_df_bt["Close"].reindex(df.index).ffill().bfill()
+            vix_series_bt = vix_aligned.values.astype(float)[1:]  # length n, aligned with returns
+    except Exception:
+        vix_series_bt = None  # fail open: skip VIX gate if data unavailable
+
+    # Change 1: precompute SPY 200-day MA for macro filter (one SPY fetch, no in-loop calls)
     spy_above_ma: Optional[np.ndarray] = None
     if macro_filter:
         try:
@@ -614,6 +637,28 @@ def get_backtest(ticker: str):
             spy_above_ma = (spy_arr > spy_ma200)
         except Exception:
             spy_above_ma = None  # fail open: don't block trades on SPY fetch failure
+
+    # Change 1: rolling MA20 for overextension gate
+    ma20_series = pd.Series(closes).rolling(20, min_periods=1).mean().values
+
+    # Change 1: rolling 63-day returns for top-quartile momentum override on overextension
+    ret_63d_bt = np.full(len(closes), np.nan)
+    for _i in range(63, len(closes)):
+        ret_63d_bt[_i] = closes[_i] / closes[_i - 63] - 1.0
+    mom_q75_bt = pd.Series(ret_63d_bt).rolling(252, min_periods=63).quantile(0.75).values
+
+    # Change 1: pre-compute 3m/12m momentum for momentum-disagreement gate (skip 21 days)
+    ret_3m_bt = np.full(len(closes), np.nan)
+    ret_12m_bt = np.full(len(closes), np.nan)
+    for _i in range(len(closes)):
+        _ci = _i - 21
+        if _ci >= 63:
+            ret_3m_bt[_i] = closes[_ci] / closes[_ci - 63] - 1.0
+        if _ci >= 252:
+            ret_12m_bt[_i] = closes[_ci] / closes[_ci - 252] - 1.0
+
+    # Change 1: 7bps commission + 0.1% slippage per trade side = 0.17% per side
+    TC_PER_SIDE = 0.0017
 
     # Walk-forward simulation
     portfolio   = 1.0
@@ -625,6 +670,16 @@ def get_backtest(ticker: str):
     equity_curve: list[dict] = []
     trade_results: list[bool] = []
     trade_entry_val = 0.0
+    last_exit_idx = -100  # Change 1: tracks re-entry cooldown (5 trading days)
+
+    # Change 1: gate rejection counters for comparison output
+    gate_rejections: dict[str, int] = {
+        "vix_too_high": 0,
+        "overextended": 0,
+        "momentum_disagreement": 0,
+        "reentry_cooldown": 0,
+    }
+    total_buy_signals_raw = 0  # HMM=BUY signals before any gate
 
     test_start = TRAIN
     while test_start + TEST <= n:
@@ -676,8 +731,10 @@ def get_backtest(ticker: str):
                     candidate = cur_price - atr_mult * atr_now
                     trail_stop = max(trail_stop, candidate)
                     if cur_price < trail_stop:
+                        portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: exit transaction cost
                         trade_results.append(portfolio > trade_entry_val)
                         in_pos = False
+                        last_exit_idx = idx
                         atr_exit = True
                 if atr_exit:
                     daily_strat.append(0.0)
@@ -685,16 +742,53 @@ def get_backtest(ticker: str):
                     portfolio *= (1 + r_t)
                     daily_strat.append(r_t)
                     hold_left -= 1
+                    # Change 1: mid-window exit on SELL signal (mirrors live score deterioration gate)
                     if signal == "SELL" or hold_left <= 0:
+                        portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: exit transaction cost
                         trade_results.append(portfolio > trade_entry_val)
                         in_pos = False
+                        last_exit_idx = idx
             else:
                 daily_strat.append(0.0)
                 if signal == "BUY":
                     spy_ok = (spy_above_ma is None) or bool(spy_above_ma[idx])
                     if not macro_filter or spy_ok:
+                        total_buy_signals_raw += 1
+
+                        # Change 1: VIX > 30 gate
+                        if vix_series_bt is not None and idx < len(vix_series_bt):
+                            if vix_series_bt[idx] > 30.0:
+                                gate_rejections["vix_too_high"] += 1
+                                continue
+
+                        # Change 1: overextension gate (price > 1.25×MA20 unless top-quartile momentum)
+                        if idx < len(ma20_series) and ma20_series[idx] > 0:
+                            price_ratio = closes[idx] / ma20_series[idx]
+                            top_q_mom = (
+                                not np.isnan(ret_63d_bt[idx]) and
+                                not np.isnan(mom_q75_bt[idx]) and
+                                ret_63d_bt[idx] >= mom_q75_bt[idx]
+                            )
+                            if price_ratio > 1.25 and not top_q_mom:
+                                gate_rejections["overextended"] += 1
+                                continue
+
+                        # Change 1: momentum disagreement gate
+                        r3  = ret_3m_bt[idx]
+                        r12 = ret_12m_bt[idx]
+                        if not np.isnan(r3) and not np.isnan(r12):
+                            if (r3 + r12) <= 0 or r3 < -0.10 or r12 < -0.10:
+                                gate_rejections["momentum_disagreement"] += 1
+                                continue
+
+                        # Change 1: re-entry cooldown (5 trading days after last exit)
+                        if idx - last_exit_idx < 5:
+                            gate_rejections["reentry_cooldown"] += 1
+                            continue
+
                         in_pos = True
                         hold_left = HOLD
+                        portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: entry transaction cost
                         trade_entry_val = portfolio
                         if use_atr_stop:
                             atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * 0.02
@@ -723,6 +817,7 @@ def get_backtest(ticker: str):
 
     win_rate_trades = float(sum(trade_results) / len(trade_results) * 100) if trade_results else 0.0
 
+    trades_after_gates = total_buy_signals_raw - sum(gate_rejections.values())
     return {
         "ticker":                  ticker,
         "equity_curve":            equity_curve,
@@ -733,6 +828,17 @@ def get_backtest(ticker: str):
         "win_rate_trades":         round(win_rate_trades, 1),
         "num_trades":              len(trade_results),
         "num_windows":             (n - TRAIN) // TEST,
+        # Change 1: gate comparison — how many BUY signals each gate filtered
+        "gate_comparison": {
+            "total_buy_signals_raw":     total_buy_signals_raw,
+            "trades_after_gates":        trades_after_gates,
+            "filters":                   gate_rejections,
+            "transaction_cost_bps_per_side": int(TC_PER_SIDE * 10000),
+            "notes": (
+                "earnings_within_2d and sector_cap gates omitted: require real-time data "
+                "not available in historical simulation."
+            ),
+        },
     }
 
 # ── /health ───────────────────────────────────────────────────────────────────
@@ -869,57 +975,155 @@ def _get_sentiment_score(ticker: str) -> float | None:
         return None
 
 
-def _get_insider_score(ticker: str) -> float | None:
-    """Return 0–100 insider score from SEC Form 4: 70=net buying, 50=neutral, 30=net selling."""
+def _get_cik(ticker: str) -> Optional[str]:
+    """Return 10-digit zero-padded SEC CIK for a ticker, cached indefinitely."""
+    if ticker in _CIK_CACHE:
+        return _CIK_CACHE[ticker]
+    headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         url = (
-            f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
-            f"&dateRange=custom&startdt={start}&enddt={today}&forms=4"
+            f"https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?action=getcompany&ticker={ticker}&type=4&dateb=&owner=include"
+            f"&count=10&search_text=&output=atom"
         )
-        headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
-        resp = _http_client.get(url, headers=headers)
+        resp = _http_client.get(url, headers=headers, timeout=10.0)
         if resp.status_code != 200:
             return None
-        hits = resp.json().get("hits", {}).get("hits", [])
-        if not hits:
-            return 50.0
-        net = 0.0
-        for hit in hits:
-            src = hit.get("_source", {})
-            tx = src.get("transaction_type", "")
+        m = re.search(r"CIK=(\d{1,10})[&\"']", resp.text)
+        if not m:
+            return None
+        cik = m.group(1).zfill(10)
+        _CIK_CACHE[ticker] = cik
+        return cik
+    except Exception:
+        return None
+
+
+def _get_insider_score(ticker: str) -> float | None:
+    """
+    Change 3: 0-100 insider score from EDGAR structured submissions API (not EFTS full-text).
+    Fetches Form 4 filings for the exact company CIK to avoid false positives.
+    P = open-market purchase (bullish), S = open-market sale (bearish) — awards/exercises excluded.
+    Filer weight: Officer=1.0×, Director=0.7×, 10%+ holder=0.5×, other=0.3×.
+    Returns None (not 50) on EDGAR failure so the weight drops and renormalises.
+    """
+    ROLE_WEIGHTS = {"isOfficer": 1.0, "isDirector": 0.7, "isTenPercentOwner": 0.5}
+    headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
+    try:
+        cik = _get_cik(ticker)
+        if not cik:
+            return None
+
+        sub_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        resp = _http_client.get(sub_url, headers=headers, timeout=15.0)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        recent = data.get("filings", {}).get("recent", {})
+        forms        = recent.get("form", [])
+        dates        = recent.get("filingDate", [])
+        accessions   = recent.get("accessionNumber", [])
+        primary_docs = recent.get("primaryDocument", [])
+
+        cutoff = (datetime.now() - timedelta(days=30)).date()
+
+        # Collect Form 4s within the 30-day lookback; filings are sorted newest-first
+        recent_form4s: list[tuple[str, str]] = []
+        for i, form in enumerate(forms):
+            if form != "4":
+                continue
+            fd_str = dates[i] if i < len(dates) else ""
             try:
-                shares = float(src.get("shares", 0) or 0)
-            except (ValueError, TypeError):
-                shares = 0.0
-            if tx == "P":
-                net += shares
-            elif tx == "S":
-                net -= shares
-        return 70.0 if net > 0 else (30.0 if net < 0 else 50.0)
+                fd = datetime.strptime(fd_str, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if fd < cutoff:
+                break  # past window, no need to scan further
+            acc = accessions[i] if i < len(accessions) else ""
+            doc = primary_docs[i] if i < len(primary_docs) else ""
+            if acc and doc:
+                recent_form4s.append((acc, doc))
+
+        if not recent_form4s:
+            return 50.0  # no Form 4s in last 30 days → neutral
+
+        cik_int = int(cik)
+        net_weighted = 0.0
+        filings_processed = 0
+
+        for acc, primary_doc in recent_form4s[:10]:  # cap to avoid excessive HTTP calls
+            acc_clean = acc.replace("-", "")
+            # primaryDocument may have an XSL prefix (e.g. "xslF345X06/form4.xml");
+            # the raw XML lives at the basename path without the XSL subdirectory
+            xml_name = primary_doc.split("/")[-1] if "/" in primary_doc else primary_doc
+            xml_url = (
+                f"https://www.sec.gov/Archives/edgar/data/{cik_int}/"
+                f"{acc_clean}/{xml_name}"
+            )
+            try:
+                xml_resp = _http_client.get(xml_url, headers=headers, timeout=10.0)
+                if xml_resp.status_code != 200:
+                    continue
+                tree = ET.fromstring(xml_resp.text)
+
+                # Highest role weight for this filer (take max if multiple roles held)
+                role_weight = 0.3
+                for role_tag, w in ROLE_WEIGHTS.items():
+                    el = tree.find(f".//reportingOwnerRelationship/{role_tag}")
+                    if el is not None and (el.text or "").strip() in ("1", "true"):
+                        role_weight = max(role_weight, w)
+
+                # Non-derivative transactions only; skip awards (A), exercises (M), gifts (G), etc.
+                for tx in tree.findall(".//nonDerivativeTransaction"):
+                    code_el   = tx.find(".//transactionCoding/transactionCode")
+                    shares_el = tx.find(".//transactionAmounts/transactionShares/value")
+                    if code_el is None or shares_el is None:
+                        continue
+                    code = (code_el.text or "").strip()
+                    if code not in ("P", "S"):
+                        continue
+                    try:
+                        shares = float(shares_el.text or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    net_weighted += shares * role_weight if code == "P" else -shares * role_weight
+
+                filings_processed += 1
+            except Exception:
+                continue
+
+        if filings_processed == 0:
+            return None  # Form 4s exist but all failed to parse → drop weight, don't guess
+
+        return 70.0 if net_weighted > 0 else (30.0 if net_weighted < 0 else 50.0)
     except Exception:
         return None
 
 
 def _get_sector(ticker: str) -> str:
     """Return the sector string for a ticker, cached for 24 h."""
-    cached_sector, ts = _SECTOR_CACHE.get(ticker, ("", 0.0))
-    if cached_sector and (time.time() - ts) < _SECTOR_TTL:
-        return cached_sector
+    # Change 5: lock prevents TOCTOU race during parallel signal job
+    with _SECTOR_LOCK:
+        cached_sector, ts = _SECTOR_CACHE.get(ticker, ("", 0.0))
+        if cached_sector and (time.time() - ts) < _SECTOR_TTL:
+            return cached_sector
     try:
         sector = yf.Ticker(ticker).info.get("sector", "Unknown") or "Unknown"
-        _SECTOR_CACHE[ticker] = (sector, time.time())
-        return sector
     except Exception:
-        return "Unknown"
+        sector = "Unknown"
+    with _SECTOR_LOCK:
+        _SECTOR_CACHE[ticker] = (sector, time.time())
+    return sector
 
 
 def _compute_factors(ticker: str) -> Optional[dict]:
     """Core factor computation shared by the API endpoint and the scheduler."""
-    cached_result, cached_ts = _FACTORS_CACHE.get(ticker, ({}, 0.0))
-    if cached_result and (time.time() - cached_ts) < _FACTORS_TTL:
-        return cached_result
+    # Change 5: lock prevents two concurrent threads from both finding cache stale
+    with _FACTORS_LOCK:
+        cached_result, cached_ts = _FACTORS_CACHE.get(ticker, ({}, 0.0))
+        if cached_result and (time.time() - cached_ts) < _FACTORS_TTL:
+            return cached_result
 
     try:
         df = fetch_ohlcv(ticker, days=760, min_bars=260)
@@ -942,6 +1146,7 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     stat_all = stationary(mat_all)
 
     active_id = int(regime_seq[-1])
+    regime_label = "bull" if active_id == bull_id else "bear"
     active_st = [s for s, r in zip(states_all, reg_w) if r == active_id]
     if len(active_st) >= 20:
         mat_act, _, cnt_act = build_matrix(active_st, fallback=stat_all)
@@ -953,11 +1158,13 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     cur_st = si(ret_bucket(float(rets_w[-1])), vol_bucket(float(ratios_w[-1]), lo_t, hi_t))
     sig = compute_signal(cnt_act[cur_st], mat_act[cur_st], stat_act)
 
-    hmm_score     = _hmm_factor_score(sig["signal"], sig["confidence"])
-    mom_score     = _momentum_score(closes)
-    vt_score      = _vol_trend_score(closes)
-    earn_score    = _earnings_score(yf.Ticker(ticker))
-    insider_score = _get_insider_score(ticker)
+    hmm_score      = _hmm_factor_score(sig["signal"], sig["confidence"])
+    mom_score      = _momentum_score(closes)
+    vt_score       = _vol_trend_score(closes)
+    earn_score     = _earnings_score(yf.Ticker(ticker))
+    insider_score  = _get_insider_score(ticker)
+    # Change 2: sentiment included as a factor; null → weight dropped and renormalised
+    sentiment_score = _get_sentiment_score(ticker)
 
     # Volume and overextension signals used by the signal job
     # Use [-2] (last *complete* trading day) — today's bar is partial at signal time (15:45 ET)
@@ -974,10 +1181,12 @@ def _compute_factors(ticker: str) -> Optional[dict]:
 
     factors: dict[str, Any] = {
         "hmm":       {"score": round(hmm_score, 2), "weight": weights["hmm"], "null": False},
-        "momentum":  {"score": round(mom_score, 2) if mom_score is not None else None, "weight": weights["momentum"], "null": mom_score is None},
-        "vol_trend": {"score": round(vt_score, 2)  if vt_score  is not None else None, "weight": weights["vol_trend"], "null": vt_score  is None},
-        "earnings":  {"score": round(earn_score, 2) if earn_score is not None else None, "weight": weights["earnings"], "null": earn_score is None},
-        "insider":   {"score": round(insider_score, 2) if insider_score is not None else None, "weight": weights["insider"],  "null": insider_score is None},
+        "momentum":  {"score": round(mom_score, 2)      if mom_score      is not None else None, "weight": weights["momentum"],  "null": mom_score      is None},
+        "vol_trend": {"score": round(vt_score, 2)        if vt_score       is not None else None, "weight": weights["vol_trend"], "null": vt_score       is None},
+        "earnings":  {"score": round(earn_score, 2)      if earn_score     is not None else None, "weight": weights["earnings"],  "null": earn_score     is None},
+        "insider":   {"score": round(insider_score, 2)   if insider_score  is not None else None, "weight": weights["insider"],   "null": insider_score  is None},
+        # Change 2: sentiment factor; null when API unavailable — weight renormalises automatically
+        "sentiment": {"score": round(sentiment_score, 2) if sentiment_score is not None else None, "weight": weights.get("sentiment", 0.12), "null": sentiment_score is None},
     }
 
     available = {k: v for k, v in factors.items() if not v["null"]}
@@ -996,24 +1205,28 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     vol_21d = float(rets_21.std())
 
     result = {
-        "ticker":         ticker,
-        "factors":        factors,
+        "ticker":           ticker,
+        "factors":          factors,
         "composite_score":  round(composite, 2),
         "min_factor_score": round(min_factor_score, 2) if min_factor_score is not None else None,
         "hmm_signal":       sig["signal"],
-        "hmm_confidence": sig["confidence"],
-        "current_price":  float(closes[-1]),
+        "hmm_confidence":   sig["confidence"],
+        "hmm_regime":       regime_label,  # Change 4: needed by adaptive threshold job
+        "current_price":    float(closes[-1]),
         "volume_ok":        volume_ok,
         "volume_ratio":     volume_ratio,
         "overextended":     overextended,
         "price_ma20_ratio": round(price_ma20_ratio, 4),
         "mom_score":        round(mom_score, 2) if mom_score is not None else None,
         "ret_3m":           ret_3m,
-        "ret_12m":        ret_12m,
-        "atr":            atr,
-        "vol_21d":        vol_21d,
+        "ret_12m":          ret_12m,
+        "atr":              atr,
+        "vol_21d":          vol_21d,
+        # Change 2: raw sentiment score stored in result for signal_log passthrough
+        "sentiment_score":  round(sentiment_score, 2) if sentiment_score is not None else None,
     }
-    _FACTORS_CACHE[ticker] = (result, time.time())
+    with _FACTORS_LOCK:
+        _FACTORS_CACHE[ticker] = (result, time.time())
     return result
 
 
@@ -1068,7 +1281,7 @@ def get_factor_correlations():
     watchlist = [r["ticker"] for r in db.get_watchlist()]
     if len(watchlist) < 3:
         return {"error": "Need at least 3 tickers for correlation"}
-    factor_keys = ["hmm", "momentum", "vol_trend", "earnings", "insider"]
+    factor_keys = ["hmm", "momentum", "vol_trend", "earnings", "insider", "sentiment"]
     rows: dict[str, list] = {k: [] for k in factor_keys}
     tickers_used: list[str] = []
     for ticker in watchlist:
@@ -1528,11 +1741,15 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             vol_20d_aligned = vol_20d[1:]
             features[t] = (c, ret, vol_aligned, vol_20d_aligned)
 
+        # Change 1: 7bps commission + 0.1% slippage per side
+        TC_PER_SIDE_PB = 0.0017
+
         # Walk-forward
         portfolio_val = req.capital
         equity_curve: list[dict] = []
         rebalance_events: list[dict] = []
         per_ticker_contrib: dict[str, float] = {t: 0.0 for t in valid}
+        mid_window_exits = 0  # Change 1: counter for SELL-signal early exits
 
         # SPY benchmark
         spy_closes = None
@@ -1547,8 +1764,15 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             te = test_start
 
             # Compute vol-targeted weights at this rebalance point
+            # Change 1: also store per-ticker matrices for mid-window exit signal checking
             rvols: dict[str, float] = {}
             signals_window: dict[str, str] = {}
+            ticker_mat_pb: dict[str, np.ndarray] = {}
+            ticker_cnt_pb: dict[str, np.ndarray] = {}
+            ticker_stat_pb: dict[str, np.ndarray] = {}
+            ticker_lo_pb: dict[str, float] = {}
+            ticker_hi_pb: dict[str, float] = {}
+
             for t in valid:
                 c, ret, vol, vol_20d = features[t]
                 tr_rets = ret[ts:te]
@@ -1562,6 +1786,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 tr_states, lo_t, hi_t = make_state_seq(tr_rets, tr_vol, tr_20d)
                 mat_full, _, cnt_full = build_matrix(tr_states)
                 stat_full = stationary(mat_full)
+                ticker_mat_pb[t]  = mat_full
+                ticker_cnt_pb[t]  = cnt_full
+                ticker_stat_pb[t] = stat_full
+                ticker_lo_pb[t]   = lo_t
+                ticker_hi_pb[t]   = hi_t
                 ratios = tr_vol / np.maximum(tr_20d, 1.0)
                 cur_st = si(ret_bucket(float(tr_rets[-1])), vol_bucket(float(ratios[-1]), lo_t, hi_t))
                 sig = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)
@@ -1578,6 +1807,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 if t not in weights:
                     weights[t] = 0.0
 
+            # Change 1: apply entry transaction costs on invested positions
+            invested_weight = sum(weights[t] for t in valid if weights[t] > 0)
+            if invested_weight > 0:
+                portfolio_val *= (1.0 - TC_PER_SIDE_PB * invested_weight)
+
             rebalance_date = str(dates_idx[test_start])[:10]
             rebalance_events.append({
                 "date": rebalance_date,
@@ -1585,14 +1819,43 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 "signals": signals_window,
             })
 
+            # Change 1: live_weights tracks positions that haven't been exited mid-window
+            live_weights = dict(weights)
+
             # Simulate TEST days with these weights
             for idx in range(test_start, min(test_start + TEST, n_days - 1)):
+                # Change 1: check for mid-window SELL exits using training-period matrices
+                for t in valid:
+                    if live_weights.get(t, 0.0) <= 0:
+                        continue
+                    if t not in ticker_mat_pb:
+                        continue
+                    _, ret_t, vol_t, vol_20d_t = features[t]
+                    if idx < 1 or idx - 1 >= len(ret_t):
+                        continue
+                    r_prev  = float(ret_t[idx - 1])
+                    v_prev  = float(vol_t[idx - 1])
+                    v20_prev = float(vol_20d_t[idx - 1])
+                    vr = v_prev / max(v20_prev, 1.0)
+                    lo = ticker_lo_pb[t]
+                    hi = ticker_hi_pb[t]
+                    cur_st = si(ret_bucket(r_prev), vol_bucket(vr, lo, hi))
+                    mat_d  = ticker_mat_pb[t]
+                    cnt_d  = ticker_cnt_pb[t]
+                    stat_d = ticker_stat_pb[t]
+                    sig_d  = compute_signal(cnt_d[cur_st], mat_d[cur_st], stat_d)
+                    if sig_d["signal"] == "SELL":
+                        # Apply exit cost proportional to this position's weight
+                        portfolio_val *= (1.0 - TC_PER_SIDE_PB * live_weights[t])
+                        live_weights[t] = 0.0
+                        mid_window_exits += 1
+
                 contrib_sum = 0.0
                 for i, t in enumerate(valid):
                     c = combined_arr[:, i]
                     if idx + 1 < len(c) and c[idx] > 0:
                         r_t = (c[idx + 1] - c[idx]) / c[idx]
-                        contrib = weights.get(t, 0.0) * r_t
+                        contrib = live_weights.get(t, 0.0) * r_t
                         per_ticker_contrib[t] += contrib
                         contrib_sum += contrib
                 portfolio_val *= (1.0 + contrib_sum)
@@ -1611,6 +1874,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     "value": round(portfolio_val, 2),
                     "spy": spy_val,
                 })
+
+            # Change 1: apply exit transaction costs for positions still open at end of window
+            exit_weight = sum(live_weights.get(t, 0.0) for t in valid)
+            if exit_weight > 0:
+                portfolio_val *= (1.0 - TC_PER_SIDE_PB * exit_weight)
 
             test_start += TEST
 
@@ -1652,6 +1920,13 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             "per_ticker_contrib": {t: round(v * 100, 3) for t, v in per_ticker_contrib.items()},
             "rebalance_events": rebalance_events,
             "efficient_frontier": ef_points,
+            # Change 1: gate comparison showing mid-window exit impact and cost drag
+            "gate_comparison": {
+                "total_rebalances": (n_days - TRAIN) // TEST,
+                "mid_window_exits": mid_window_exits,
+                "transaction_cost_bps_per_side": int(TC_PER_SIDE_PB * 10000),
+                "notes": "mid_window_exits fired when training-period HMM matrix flips to SELL",
+            },
         }
     except HTTPException:
         raise
@@ -1666,8 +1941,10 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 def _macro_regime() -> tuple[bool, float]:
     """Returns (spy_above_200d_ma, vix_level)."""
     global _MACRO_CACHE
-    if _MACRO_CACHE is not None and (time.time() - _MACRO_CACHE[1]) < _MACRO_TTL:
-        return _MACRO_CACHE[0]
+    # Change 5: lock prevents two threads from both finding the cache stale and double-fetching
+    with _MACRO_LOCK:
+        if _MACRO_CACHE is not None and (time.time() - _MACRO_CACHE[1]) < _MACRO_TTL:
+            return _MACRO_CACHE[0]
     spy_above = True
     try:
         h = yf.Ticker("SPY").history(period="1y")
@@ -1683,15 +1960,18 @@ def _macro_regime() -> tuple[bool, float]:
     except Exception:
         pass
     result = (spy_above, vix)
-    _MACRO_CACHE = (result, time.time())
+    with _MACRO_LOCK:
+        _MACRO_CACHE = (result, time.time())
     return result
 
 
 def _earnings_within_days(ticker: str, days: int = 2) -> bool:
     """Return True if earnings announcement is within `days` calendar days."""
-    cached = _EARNINGS_CACHE.get(ticker)
-    if cached is not None and (time.time() - cached[1]) < _EARNINGS_TTL:
-        return cached[0]
+    # Change 5: lock prevents TOCTOU race when multiple threads check the same ticker
+    with _EARNINGS_LOCK:
+        cached = _EARNINGS_CACHE.get(ticker)
+        if cached is not None and (time.time() - cached[1]) < _EARNINGS_TTL:
+            return cached[0]
     result = False
     try:
         cal = yf.Ticker(ticker).calendar
@@ -1713,7 +1993,8 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
                     pass
     except Exception:
         pass
-    _EARNINGS_CACHE[ticker] = (result, time.time())
+    with _EARNINGS_LOCK:
+        _EARNINGS_CACHE[ticker] = (result, time.time())
     return result
 
 
@@ -1789,6 +2070,8 @@ def _write_gate_stats() -> None:
     cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
     gate_names = [
         "hmm_not_buy", "score_below_threshold",
+        # Change 2: gate 6.5 — sentiment hard filter tracked separately
+        "sentiment_too_low",
         "earnings_within_2d", "vix_too_high", "already_in_position",
         "overextended", "momentum_disagreement",
         "reentry_cooldown", "sector_concentration",
@@ -1811,6 +2094,7 @@ def _write_gate_stats() -> None:
 
 
 def _run_signal_job() -> None:
+    job_start = time.time()
     logger.info("▶ Signal job starting")
     db.set_config("last_signal_job_at", datetime.utcnow().isoformat())
     api, err = _alpaca_client, _alpaca_err
@@ -1848,6 +2132,18 @@ def _run_signal_job() -> None:
         sec = _get_sector(sym)
         open_sector_counts[sec] = open_sector_counts.get(sec, 0) + 1
 
+    # Change 5: compute factors for all watchlist tickers in parallel, then evaluate gates sequentially
+    def _fetch_factors_safe(ticker: str) -> tuple[str, Optional[dict]]:
+        try:
+            return ticker, _compute_factors(ticker)
+        except Exception as exc:
+            logger.error("Factor compute failed for %s: %s", ticker, exc)
+            return ticker, None
+
+    with ThreadPoolExecutor(max_workers=min(len(watchlist), 8)) as pool:
+        factor_results: dict[str, Optional[dict]] = dict(pool.map(_fetch_factors_safe, watchlist))
+
+    # Sequential gate evaluation and order submission (must not be parallelised)
     for ticker in watchlist:
         try:
             if _earnings_within_days(ticker):
@@ -1855,16 +2151,18 @@ def _run_signal_job() -> None:
                 logger.info("%s: skipped (earnings soon)", ticker)
                 continue
 
-            result = _compute_factors(ticker)
+            result = factor_results.get(ticker)
             if result is None:
                 db.log_signal(ticker, None, None, "skipped", "data_unavailable", None, None)
                 continue
 
-            composite  = result["composite_score"]
-            hmm_signal = result["hmm_signal"]
-            price      = result["current_price"]
-            atr        = result.get("atr", 0.0)
-            in_pos     = ticker in positions
+            composite   = result["composite_score"]
+            hmm_signal  = result["hmm_signal"]
+            hmm_regime  = result.get("hmm_regime")        # Change 4: regime for adaptive threshold
+            sentiment   = result.get("sentiment_score")    # Change 2: for gate 6.5 and signal_log
+            price       = result["current_price"]
+            atr         = result.get("atr", 0.0)
+            in_pos      = ticker in positions
 
             # MIN_FACTOR_FLOOR: cap entry score if any factor falls below the floor
             effective_composite = composite
@@ -1897,35 +2195,47 @@ def _run_signal_job() -> None:
                 continue
 
             if hmm_signal != "BUY":
-                db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy", price, atr)
+                db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment)
                 continue
 
             if effective_composite < buy_threshold:
                 db.log_signal(ticker, composite, hmm_signal, "skipped",
                               f"score_below_threshold:{effective_composite:.1f}<{buy_threshold:.0f}",
-                              price, atr)
+                              price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment)
+                continue
+
+            # Change 2: gate 6.5 — negative sentiment hard filter (between composite and VIX gates)
+            if sentiment is not None and sentiment < 35.0:
+                db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                              f"sentiment_too_low:{sentiment:.1f}", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment)
                 continue
 
             if high_vix:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                              f"vix_too_high:{vix:.1f}", price, atr)
+                              f"vix_too_high:{vix:.1f}", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment)
                 continue
             if in_pos:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                              "already_in_position", price, atr)
+                              "already_in_position", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment)
                 continue
             mom_score_val    = result.get("mom_score")
             price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
             top_quartile_mom = mom_score_val is not None and mom_score_val >= 75.0
             if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
-                db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr)
+                db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment)
                 continue
             ret_3m  = result.get("ret_3m")
             ret_12m = result.get("ret_12m")
             if ret_3m is not None and ret_12m is not None:
                 if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
                     db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                  "momentum_disagreement", price, atr)
+                                  "momentum_disagreement", price, atr,
+                                  hmm_regime=hmm_regime, sentiment_score=sentiment)
                     continue
             # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
             perf = db.get_ticker_performance(ticker)
@@ -1935,7 +2245,8 @@ def _run_signal_job() -> None:
                     days_since = _trading_days_between(last_exit, datetime.utcnow())
                     if days_since < 5:
                         db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                                      "reentry_cooldown", price, atr)
+                                      "reentry_cooldown", price, atr,
+                                      hmm_regime=hmm_regime, sentiment_score=sentiment)
                         continue
                 except Exception:
                     pass
@@ -1943,7 +2254,8 @@ def _run_signal_job() -> None:
             max_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
             if sector != "Unknown" and open_sector_counts.get(sector, 0) >= max_sector:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
-                              "sector_concentration", price, atr)
+                              "sector_concentration", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment)
                 continue
 
             dollars = _position_dollars(ticker, equity, effective_composite, vol_21d=result.get("vol_21d"))
@@ -1957,22 +2269,32 @@ def _run_signal_job() -> None:
                     api.submit_order(MarketOrderRequest(
                         symbol=ticker, qty=qty,
                         side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                signal_id = db.log_signal(ticker, effective_composite, "BUY", "ordered", None, price, atr)
+                # Change 2/4: store regime and sentiment with BUY order for downstream use
+                signal_id = db.log_signal(ticker, effective_composite, "BUY", "ordered", None, price, atr,
+                                          hmm_regime=hmm_regime, sentiment_score=sentiment)
                 if atr > 0:
                     db.update_trailing_stop(signal_id, price - 1.5 * atr)
                 open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
-                logger.info("%s: BUY $%.0f score=%.1f sector=%s", ticker, dollars, effective_composite, sector)
+                logger.info("%s: BUY $%.0f score=%.1f regime=%s sector=%s",
+                            ticker, dollars, effective_composite, hmm_regime, sector)
             except Exception as e:
                 db.log_signal(ticker, composite, "BUY", "skipped",
                               f"order_failed:{e}", price, atr)
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
 
-    logger.info("◀ Signal job done")
+    # Change 5: log wall-clock time to confirm parallelisation speedup
+    elapsed = round(time.time() - job_start, 2)
+    logger.info("◀ Signal job done in %.1fs (watchlist=%d)", elapsed, len(watchlist))
     try:
+        db.save_diagnostic("signal_job_timing", {
+            "last_run_elapsed_sec": elapsed,
+            "watchlist_size": len(watchlist),
+            "timestamp": datetime.utcnow().isoformat(),
+        })
         _write_gate_stats()
     except Exception as e:
-        logger.warning("Failed to write gate stats: %s", e)
+        logger.warning("Failed to write gate stats / timing: %s", e)
 
 
 def _run_stoploss_job() -> None:
@@ -2058,28 +2380,73 @@ def _run_stoploss_job() -> None:
 
 
 def _run_adaptive_thresholds_job() -> None:
-    """Weekly job: adjust buy thresholds based on last 20 closed trades."""
+    """
+    Change 4: Weekly job — adjust buy thresholds using last 50 trades per regime.
+    Uses continuous EWA update (not discrete ±5 steps) to avoid threshold jumps.
+    Bull and bear thresholds adapt independently using trades from matching regime.
+    Old and new thresholds are logged to diagnostic_snapshots for audit.
+    """
     logger.info("▶ Adaptive thresholds job starting")
-    trades = db.get_last_n_trades(20)
-    if len(trades) < 5:
-        logger.info("Not enough trades to adapt thresholds (have %d, need 5)", len(trades))
-        return
-    wins = sum(1 for t in trades if t["return_pct"] > 0)
-    win_rate = wins / len(trades)
-    bull = float(db.get_config("bull_threshold", "70"))
-    bear = float(db.get_config("bear_threshold", "80"))
-    if win_rate > 0.6:
-        bull = max(65.0, bull - 5.0)
-        bear = max(75.0, bear - 5.0)
-    elif win_rate < 0.4:
-        bull = min(80.0, bull + 5.0)
-        bear = min(85.0, bear + 5.0)
+
+    BULL_MIN, BULL_MAX = 65.0, 80.0
+    BEAR_MIN, BEAR_MAX = 75.0, 85.0
+    EWA_ALPHA = 0.15  # new = old * 0.85 + target * 0.15
+    MIN_TRADES = 5
+
+    bull_old = float(db.get_config("bull_threshold", "70"))
+    bear_old = float(db.get_config("bear_threshold", "80"))
+
+    def _target_threshold(win_rate: float, t_min: float, t_max: float) -> float:
+        """Linear map: 40% win rate → t_max (tighten), 60% win rate → t_min (loosen)."""
+        clipped = max(0.4, min(0.6, win_rate))
+        return t_max - (clipped - 0.4) / 0.2 * (t_max - t_min)
+
+    bull_trades = db.get_last_n_trades_by_regime(50, regime="bull")
+    bear_trades = db.get_last_n_trades_by_regime(50, regime="bear")
+
+    bull_new = bull_old
+    bull_win_rate = None
+    if len(bull_trades) >= MIN_TRADES:
+        bull_win_rate = sum(1 for t in bull_trades if t["return_pct"] > 0) / len(bull_trades)
+        bull_target = _target_threshold(bull_win_rate, BULL_MIN, BULL_MAX)
+        bull_new = round(bull_old * (1.0 - EWA_ALPHA) + bull_target * EWA_ALPHA, 2)
+        bull_new = max(BULL_MIN, min(BULL_MAX, bull_new))
+        logger.info("Bull: win_rate=%.2f target=%.1f old=%.2f new=%.2f (n=%d)",
+                    bull_win_rate, bull_target, bull_old, bull_new, len(bull_trades))
+    else:
+        logger.info("Bull: skipping — only %d trades (need %d)", len(bull_trades), MIN_TRADES)
+
+    bear_new = bear_old
+    bear_win_rate = None
+    if len(bear_trades) >= MIN_TRADES:
+        bear_win_rate = sum(1 for t in bear_trades if t["return_pct"] > 0) / len(bear_trades)
+        bear_target = _target_threshold(bear_win_rate, BEAR_MIN, BEAR_MAX)
+        bear_new = round(bear_old * (1.0 - EWA_ALPHA) + bear_target * EWA_ALPHA, 2)
+        bear_new = max(BEAR_MIN, min(BEAR_MAX, bear_new))
+        logger.info("Bear: win_rate=%.2f target=%.1f old=%.2f new=%.2f (n=%d)",
+                    bear_win_rate, bear_target, bear_old, bear_new, len(bear_trades))
+    else:
+        logger.info("Bear: skipping — only %d trades (need %d)", len(bear_trades), MIN_TRADES)
+
     now = datetime.utcnow().isoformat()
-    db.set_config("bull_threshold", str(bull))
-    db.set_config("bear_threshold", str(bear))
+    db.set_config("bull_threshold", str(bull_new))
+    db.set_config("bear_threshold", str(bear_new))
     db.set_config("thresholds_last_updated", now)
-    logger.info("Thresholds updated: bull=%.0f bear=%.0f (win_rate=%.2f, n=%d)",
-                bull, bear, win_rate, len(trades))
+
+    # Log audit trail so threshold trajectory can be inspected via /api/debug
+    audit = {
+        "timestamp":        now,
+        "bull_old":         bull_old,    "bull_new":         bull_new,
+        "bear_old":         bear_old,    "bear_new":         bear_new,
+        "bull_trade_count": len(bull_trades),
+        "bear_trade_count": len(bear_trades),
+        "bull_win_rate":    round(bull_win_rate, 4) if bull_win_rate is not None else None,
+        "bear_win_rate":    round(bear_win_rate, 4) if bear_win_rate is not None else None,
+        "ewa_alpha":        EWA_ALPHA,
+    }
+    db.save_diagnostic("threshold_audit", audit)
+    logger.info("◀ Adaptive thresholds done: bull %.2f→%.2f bear %.2f→%.2f",
+                bull_old, bull_new, bear_old, bear_new)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

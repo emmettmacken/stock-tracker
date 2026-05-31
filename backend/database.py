@@ -82,6 +82,12 @@ def _run_migrations() -> None:
     new_columns = [
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN current_stop REAL"),
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN stop_updated_at TIMESTAMP"),
+        # Change 2: sentiment score tracked per signal for factor contribution analysis
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN sentiment_score REAL"),
+        # Change 4: HMM regime at signal time, used by adaptive threshold job
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN hmm_regime TEXT"),
+        # Change 4: regime at entry, lets threshold job separate bull/bear trades
+        ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN regime_at_entry TEXT"),
     ]
     with _conn() as conn:
         for _, sql in new_columns:
@@ -124,13 +130,16 @@ def log_signal(
     skip_reason: Optional[str],
     price_at_signal: Optional[float],
     atr_at_signal: Optional[float],
+    hmm_regime: Optional[str] = None,
+    sentiment_score: Optional[float] = None,
 ) -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO signal_log
                (ticker, timestamp, composite_score, signal, action,
-                skip_reason, price_at_signal, atr_at_signal)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                skip_reason, price_at_signal, atr_at_signal,
+                hmm_regime, sentiment_score)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 datetime.utcnow().isoformat(),
@@ -140,6 +149,8 @@ def log_signal(
                 skip_reason,
                 price_at_signal,
                 atr_at_signal,
+                hmm_regime,
+                sentiment_score,
             ),
         )
         return cur.lastrowid  # type: ignore[return-value]
@@ -183,13 +194,15 @@ def record_trade(
     return_pct: float,
     holding_days: int,
     composite_score_at_entry: Optional[float],
+    regime_at_entry: Optional[str] = None,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             """INSERT INTO trade_outcomes
                (ticker, entry_signal_id, entry_price, exit_price, exit_reason,
-                return_pct, holding_days, composite_score_at_entry, exit_timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                return_pct, holding_days, composite_score_at_entry, exit_timestamp,
+                regime_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 entry_signal_id,
@@ -200,6 +213,7 @@ def record_trade(
                 holding_days,
                 composite_score_at_entry,
                 datetime.utcnow().isoformat(),
+                regime_at_entry,
             ),
         )
 
@@ -225,6 +239,23 @@ def get_last_n_trades(n: int = 20) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC LIMIT ?", (n,)
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_last_n_trades_by_regime(n: int = 50, regime: Optional[str] = None) -> list[dict]:
+    """Return last n closed trades, optionally filtered to a specific HMM regime (bull/bear)."""
+    with _conn() as conn:
+        if regime:
+            rows = conn.execute(
+                """SELECT * FROM trade_outcomes
+                   WHERE regime_at_entry = ?
+                   ORDER BY exit_timestamp DESC LIMIT ?""",
+                (regime, n),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC LIMIT ?", (n,)
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -282,6 +313,7 @@ def record_close_transaction(
     holding_days: int,
     entry_signal_id: Optional[int],
     composite_score_at_entry: Optional[float],
+    regime_at_entry: Optional[str] = None,
 ) -> None:
     """Atomically write signal_log SELL + trade_outcomes + ticker_performance in one transaction."""
     now = datetime.utcnow().isoformat()
@@ -289,6 +321,17 @@ def record_close_transaction(
     set_exit_at = exit_reason != "sell_signal"
     ticker = ticker.upper()
     with _conn() as conn:
+        # If regime not passed, look it up from the BUY signal_log entry
+        if regime_at_entry is None and entry_signal_id is not None:
+            try:
+                row = conn.execute(
+                    "SELECT hmm_regime FROM signal_log WHERE id = ?", (entry_signal_id,)
+                ).fetchone()
+                if row:
+                    regime_at_entry = row["hmm_regime"]
+            except Exception:
+                pass
+
         conn.execute(
             """INSERT INTO signal_log
                (ticker, timestamp, composite_score, signal, action,
@@ -299,10 +342,11 @@ def record_close_transaction(
         conn.execute(
             """INSERT INTO trade_outcomes
                (ticker, entry_signal_id, entry_price, exit_price, exit_reason,
-                return_pct, holding_days, composite_score_at_entry, exit_timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                return_pct, holding_days, composite_score_at_entry, exit_timestamp,
+                regime_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker, entry_signal_id, entry_price, current_price, exit_reason,
-             return_pct, holding_days, composite_score_at_entry, now),
+             return_pct, holding_days, composite_score_at_entry, now, regime_at_entry),
         )
         row = conn.execute(
             "SELECT total_trades, win_rate, avg_return FROM ticker_performance WHERE ticker = ?",
