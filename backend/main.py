@@ -2247,7 +2247,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
 def _write_gate_stats() -> None:
     cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
     gate_names = [
-        "hmm_not_buy", "hmm_regime_uncertain", "score_below_threshold",
+        "hmm_not_buy_transition", "hmm_regime_uncertain", "score_below_threshold",
         "sentiment_too_low",
         "earnings_within_2d", "vix_too_high", "already_in_position",
         "overextended", "momentum_disagreement",
@@ -2264,6 +2264,14 @@ def _write_gate_stats() -> None:
             "rejection_rate":   round(rejected / total, 4) if total > 0 else 0.0,
             "pct_of_evaluated": round(rejected / total, 4) if total > 0 else 0.0,
         }
+    # Informational pass-counter (not a rejection): how often the Gaussian HMM probability
+    # carried the HMM gate despite the transition matrix returning HOLD/SELL.
+    gaussian_passes = db.count_signal_reason("hmm_passed_via_gaussian", cutoff)
+    stats["hmm_passed_via_gaussian"] = {
+        "evaluated": total,
+        "passed": gaussian_passes,
+        "pct_of_evaluated": round(gaussian_passes / total, 4) if total > 0 else 0.0,
+    }
     with open(_GATE_STATS_PATH, "w") as f:
         json.dump(stats, f, indent=2)
     db.save_diagnostic("gate_stats", stats)
@@ -2401,14 +2409,26 @@ def _run_signal_job() -> None:
                                   f"close_failed:{e}", price, atr)
                 continue
 
-            if hmm_signal != "BUY":
-                db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy", price, atr,
+            # Combined HMM gate: pass if the transition-matrix signal is BUY OR the
+            # Gaussian HMM is ≥70% confident in a bull regime. Neither model has sole veto.
+            hmm_passes = (hmm_signal == "BUY") or (smoothed_bull_prob >= 0.70)
+            if not hmm_passes:
+                db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy_transition", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob)
                 continue
 
-            # Kalman-smoothed regime gate: require bull probability > 0.65
-            if smoothed_bull_prob <= 0.65:
+            # Informational only (hmm_source: gaussian): the Gaussian probability — not the
+            # transition matrix — carried the gate. Trade still proceeds; tracked in gate-stats.
+            if hmm_signal != "BUY":
+                db.log_signal(ticker, composite, hmm_signal, "evaluated",
+                              "hmm_passed_via_gaussian", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
+
+            # Kalman-smoothed regime gate: lowered to 0.55 since the combined gate above now
+            # already requires ≥0.70 to pass on the Gaussian path alone (avoids 0.65–0.70 ambiguity).
+            if smoothed_bull_prob <= 0.55:
                 db.log_signal(ticker, composite, "BUY", "skipped",
                               f"hmm_regime_uncertain:{smoothed_bull_prob:.3f}",
                               price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment,
