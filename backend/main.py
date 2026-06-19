@@ -1165,13 +1165,18 @@ def _get_sector(ticker: str) -> str:
     return sector
 
 
-def _compute_factors(ticker: str) -> Optional[dict]:
-    """Core factor computation shared by the API endpoint and the scheduler."""
+def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
+    """Core factor computation shared by the API endpoint and the scheduler.
+
+    Pass force=True to bypass the read cache (used by the explicit single-ticker
+    refresh) so the user always gets freshly computed numbers.
+    """
     # Change 5: lock prevents two concurrent threads from both finding cache stale
-    with _FACTORS_LOCK:
-        cached_result, cached_ts = _FACTORS_CACHE.get(ticker, ({}, 0.0))
-        if cached_result and (time.time() - cached_ts) < _FACTORS_TTL:
-            return cached_result
+    if not force:
+        with _FACTORS_LOCK:
+            cached_result, cached_ts = _FACTORS_CACHE.get(ticker, ({}, 0.0))
+            if cached_result and (time.time() - cached_ts) < _FACTORS_TTL:
+                return cached_result
 
     try:
         df = fetch_ohlcv(ticker, days=760, min_bars=260)
@@ -1284,6 +1289,12 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     ret_3m  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 63  else None
     ret_12m = float(c_lag[-1] / c_lag[-252] - 1.0) if len(c_lag) >= 252 else None
 
+    # Display-only: day-over-day price change for the snapshot/homepage cards.
+    prev_close = float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
+    price_change_pct = (
+        round((float(closes[-1]) - prev_close) / prev_close * 100, 4) if prev_close else 0.0
+    )
+
     atr = _atr_from_df(df)
     rets_21 = np.diff(closes[-22:]) / closes[-22:-1] if len(closes) >= 22 else np.array([0.0])
     vol_21d = float(rets_21.std())
@@ -1300,6 +1311,7 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "raw_bull_prob":       round(raw_bull_prob_last, 4),
         "hmm_fit_failed":      hmm_fit_failed,
         "current_price":       float(closes[-1]),
+        "price_change_pct":    price_change_pct,
         "volume_ok":           volume_ok,
         "volume_ratio":        volume_ratio,
         "overextended":        overextended,
@@ -1315,6 +1327,28 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     with _FACTORS_LOCK:
         _FACTORS_CACHE[ticker] = (result, time.time())
     return result
+
+
+def _factors_payload(result: dict) -> dict:
+    """The display payload (FactorScoreData) — full breakdown minus internal-only fields."""
+    return {k: v for k, v in result.items() if k not in ("current_price", "atr", "vol_21d")}
+
+
+def _write_snapshot(ticker: str, result: dict) -> None:
+    """Persist a ticker's freshly computed factors as a cached display snapshot.
+
+    Display-only: never affects trading logic. `signal` mirrors the Markov/HMM signal
+    already shown on the card (BUY/SELL/HOLD).
+    """
+    db.upsert_snapshot(
+        ticker=ticker,
+        composite_score=result.get("composite_score"),
+        signal=result.get("hmm_signal"),
+        hmm_regime=result.get("hmm_regime"),
+        price=result.get("current_price"),
+        price_change_pct=result.get("price_change_pct"),
+        factors=_factors_payload(result),
+    )
 
 
 @app.get("/api/factor-weights")
@@ -1359,7 +1393,12 @@ def get_factors(ticker: str):
     result = _compute_factors(ticker)
     if result is None:
         return {"error": f"Failed to compute factors for '{ticker}'"}
-    return {k: v for k, v in result.items() if k not in ("current_price", "atr", "vol_21d")}
+    # Live-compute path (also used by "Refresh all") — keep the display snapshot in sync.
+    try:
+        _write_snapshot(ticker, result)
+    except Exception as e:
+        logger.warning("snapshot write failed for %s: %s", ticker, e)
+    return _factors_payload(result)
 
 
 @app.get("/api/factor-correlations")
@@ -2421,6 +2460,16 @@ def _run_signal_job() -> None:
                 "timestamp": datetime.utcnow().isoformat(),
             })
 
+    # Display-only: persist a cached snapshot for every ticker we computed, so the
+    # homepage can render instantly without live computation. This is free (the data
+    # is already in hand) and does not touch the trading logic / gates / thresholds below.
+    for _t, _r in factor_results.items():
+        if _r is not None:
+            try:
+                _write_snapshot(_t, _r)
+            except Exception as e:
+                logger.warning("snapshot write failed for %s: %s", _t, e)
+
     # Sequential gate evaluation and order submission (must not be parallelised)
     for ticker in watchlist:
         try:
@@ -2819,11 +2868,51 @@ def api_get_watchlist():
     return db.get_watchlist()
 
 
+@app.get("/api/watchlist/snapshot")
+def api_watchlist_snapshot():
+    """Cached display data for every watchlist ticker in one fast DB read.
+
+    No yfinance calls, no HMM fitting, no live computation — this is what the homepage
+    loads on mount. Tickers without a snapshot yet return null fields (UI shows
+    "Calculating…"). See POST /api/watchlist/{ticker}/refresh and /api/factors/{ticker}
+    for the explicit live-recompute paths.
+    """
+    return {"snapshots": db.get_watchlist_snapshots()}
+
+
+def _compute_and_store_snapshot(ticker: str, force: bool = False) -> Optional[dict]:
+    """Live-compute a single ticker and persist its display snapshot. Returns the snapshot."""
+    result = _compute_factors(ticker, force=force)
+    if result is None:
+        return None
+    _write_snapshot(ticker, result)
+    return db.get_snapshot(ticker)
+
+
 @app.post("/api/watchlist/{ticker}", status_code=201)
 def api_add_ticker(ticker: str):
     ticker = ticker.upper()
     db.add_ticker(ticker)
+    # New-ticker edge case: kick off a one-time live compute in the background so the
+    # card fills in within seconds instead of sitting empty until tomorrow's signal job.
+    # The card shows "Calculating…" until the snapshot lands.
+    def _seed():
+        try:
+            _compute_and_store_snapshot(ticker)
+        except Exception as e:
+            logger.warning("initial snapshot compute failed for %s: %s", ticker, e)
+    threading.Thread(target=_seed, daemon=True).start()
     return {"ticker": ticker, "status": "added"}
+
+
+@app.post("/api/watchlist/{ticker}/refresh")
+def api_refresh_ticker(ticker: str):
+    """Live-recompute a single ticker and update its snapshot (the "refresh" button)."""
+    ticker = ticker.upper()
+    snapshot = _compute_and_store_snapshot(ticker, force=True)
+    if snapshot is None:
+        raise HTTPException(status_code=502, detail=f"Failed to compute factors for '{ticker}'")
+    return snapshot
 
 
 @app.delete("/api/watchlist/{ticker}")

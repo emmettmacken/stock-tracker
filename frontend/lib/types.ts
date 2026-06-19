@@ -77,6 +77,20 @@ export interface FactorScoreData {
   ret_12m: number | null;
 }
 
+// Cached display snapshot served by /api/watchlist/snapshot — no live computation.
+// `factors` is null until the first compute lands (new ticker → "Calculating…").
+export interface SnapshotData {
+  ticker: string;
+  added_at?: string | null;
+  composite_score: number | null;
+  signal: Signal | null;
+  hmm_regime: "bull" | "bear" | "transition" | null;
+  price: number | null;
+  price_change_pct: number | null;
+  computed_at: string | null;
+  factors: FactorScoreData | null;
+}
+
 export type SentimentDirection = "bullish" | "neutral" | "bearish";
 
 export interface SentimentData {

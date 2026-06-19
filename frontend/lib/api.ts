@@ -3,7 +3,7 @@ import {
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
-  AnalyticsData,
+  AnalyticsData, SnapshotData,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -117,6 +117,24 @@ export async function fetchWatchlistDB(): Promise<WatchlistTicker[]> {
 export async function addTickerDB(ticker: string): Promise<void> {
   const res = await fetch(`${BASE}/api/watchlist/${ticker}`, { method: "POST" });
   if (!res.ok) throw new Error(`Failed to add ${ticker} to watchlist`);
+}
+
+// Cached display data for the whole watchlist — one fast read, no live computation.
+export async function fetchWatchlistSnapshot(): Promise<SnapshotData[]> {
+  const res = await fetch(`${BASE}/api/watchlist/snapshot`);
+  if (!res.ok) throw new Error("Failed to fetch watchlist snapshot");
+  const data = await res.json();
+  return data.snapshots ?? [];
+}
+
+// Explicit live recompute of a single ticker; returns its refreshed snapshot.
+export async function refreshTicker(ticker: string): Promise<SnapshotData> {
+  const res = await fetch(`${BASE}/api/watchlist/${ticker}/refresh`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to refresh ${ticker}`);
+  }
+  return res.json();
 }
 
 export async function removeTickerDB(ticker: string): Promise<void> {

@@ -73,6 +73,19 @@ def init_db() -> None:
                 data       TEXT NOT NULL,
                 updated_at TIMESTAMP NOT NULL
             );
+
+            -- Cached per-ticker display data, written by the signal job (and on-demand
+            -- refresh) so the homepage can render without any live computation.
+            CREATE TABLE IF NOT EXISTS latest_snapshot (
+                ticker           TEXT PRIMARY KEY,
+                composite_score  REAL,
+                signal           TEXT,
+                hmm_regime       TEXT,
+                price            REAL,
+                price_change_pct REAL,
+                factors_json     TEXT,
+                computed_at      TIMESTAMP NOT NULL
+            );
         """)
     _run_migrations()
 
@@ -125,6 +138,92 @@ def add_ticker(ticker: str) -> None:
 def remove_ticker(ticker: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker.upper(),))
+        conn.execute("DELETE FROM latest_snapshot WHERE ticker = ?", (ticker.upper(),))
+
+
+# ── Display snapshots ──────────────────────────────────────────────────────────
+
+def upsert_snapshot(
+    ticker: str,
+    composite_score: Optional[float],
+    signal: Optional[str],
+    hmm_regime: Optional[str],
+    price: Optional[float],
+    price_change_pct: Optional[float],
+    factors: Optional[dict],
+) -> None:
+    """Write/replace the cached display snapshot for a ticker.
+
+    `factors` is the full factor breakdown (the /api/factors payload) stored as JSON
+    so the homepage and detail view can render without any live computation.
+    """
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO latest_snapshot
+                   (ticker, composite_score, signal, hmm_regime, price,
+                    price_change_pct, factors_json, computed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                   composite_score=excluded.composite_score,
+                   signal=excluded.signal,
+                   hmm_regime=excluded.hmm_regime,
+                   price=excluded.price,
+                   price_change_pct=excluded.price_change_pct,
+                   factors_json=excluded.factors_json,
+                   computed_at=excluded.computed_at""",
+            (
+                ticker.upper(),
+                composite_score,
+                signal,
+                hmm_regime,
+                price,
+                price_change_pct,
+                json.dumps(factors) if factors is not None else None,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+
+
+def _row_to_snapshot(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    raw = d.pop("factors_json", None)
+    try:
+        d["factors"] = json.loads(raw) if raw else None
+    except (json.JSONDecodeError, TypeError):
+        d["factors"] = None
+    return d
+
+
+def get_snapshot(ticker: str) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM latest_snapshot WHERE ticker = ?", (ticker.upper(),)
+        ).fetchone()
+    return _row_to_snapshot(row) if row else None
+
+
+def get_watchlist_snapshots() -> list[dict]:
+    """Return one row per watchlist ticker, joined to its cached snapshot.
+
+    Single fast read used by the homepage. Tickers with no snapshot yet come back
+    with null fields (so the UI can show a "Calculating…" state).
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT w.ticker            AS ticker,
+                      w.added_at          AS added_at,
+                      s.composite_score   AS composite_score,
+                      s.signal            AS signal,
+                      s.hmm_regime        AS hmm_regime,
+                      s.price             AS price,
+                      s.price_change_pct  AS price_change_pct,
+                      s.factors_json      AS factors_json,
+                      s.computed_at       AS computed_at
+               FROM watchlist w
+               LEFT JOIN latest_snapshot s ON s.ticker = w.ticker
+               ORDER BY w.added_at"""
+        ).fetchall()
+    return [_row_to_snapshot(r) for r in rows]
 
 
 # ── Signal log ────────────────────────────────────────────────────────────────

@@ -1,116 +1,129 @@
 "use client";
-import { useEffect, useState, useCallback } from "react";
-import { SignalData } from "@/lib/types";
-import { fetchSignal, fetchWatchlistDB, addTickerDB, removeTickerDB } from "@/lib/api";
+import { useEffect, useState, useCallback, useRef } from "react";
+import { SnapshotData } from "@/lib/types";
+import {
+  fetchWatchlistSnapshot, fetchFactors, addTickerDB, removeTickerDB,
+} from "@/lib/api";
 import { loadWatchlist, saveWatchlist } from "@/lib/watchlist";
 import { TickerCard } from "./TickerCard";
 import { AddTickerForm } from "./AddTickerForm";
 
-interface TickerState {
-  data: SignalData | null;
-  loading: boolean;
-  error?: string;
+function placeholder(ticker: string): SnapshotData {
+  return {
+    ticker,
+    composite_score: null,
+    signal: null,
+    hmm_regime: null,
+    price: null,
+    price_change_pct: null,
+    computed_at: null,
+    factors: null,
+  };
 }
 
-const EMPTY: SignalData = {
-  ticker: "",
-  price: 0,
-  prev_close: 0,
-  change_pct: 0,
-  signal: "HOLD",
-  confidence: 0,
-  current_state: "Flat-Mid Vol",
-  current_return_bucket: 2,
-  current_vol_bucket: 1,
-  bullish_edge: 0,
-  bearish_edge: 0,
-  bull_edge_ci_low: 0,
-  bull_edge_ci_high: 0,
-  bear_edge_ci_low: 0,
-  bear_edge_ci_high: 0,
-  n_obs_current_state: 0,
-  regime: "bull",
-  high_confidence: false,
-  transition_matrix_5x5: Array(5).fill(Array(5).fill(0.2)),
-  bullish_heatmap: Array(5).fill(Array(3).fill(0.4)),
-  row_observations: Array(5).fill(Array(3).fill(0)),
-  stationary_distribution: Array(5).fill(0.2),
-  return_labels: ["Strong Down", "Down", "Flat", "Up", "Strong Up"],
-  vol_labels: ["Low Vol", "Mid Vol", "High Vol"],
-  num_returns: 0,
-  regime_window_size: 0,
-};
-
 export function Watchlist() {
-  const [tickers, setTickers] = useState<string[]>([]);
-  const [states, setStates] = useState<Record<string, TickerState>>({});
+  const [order, setOrder] = useState<string[]>([]);
+  const [snapshots, setSnapshots] = useState<Record<string, SnapshotData>>({});
   const [refreshing, setRefreshing] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const applySnapshots = useCallback((list: SnapshotData[]) => {
+    setSnapshots((prev) => {
+      const next = { ...prev };
+      list.forEach((s) => { next[s.ticker] = s; });
+      return next;
+    });
+  }, []);
+
+  // Poll the cached snapshot endpoint while any ticker is still "Calculating…"
+  // (e.g. a freshly added ticker whose background compute hasn't landed yet).
+  const ensurePolling = useCallback(() => {
+    if (pollRef.current) return;
+    let ticks = 0;
+    pollRef.current = setInterval(async () => {
+      ticks += 1;
+      try {
+        const list = await fetchWatchlistSnapshot();
+        applySnapshots(list);
+        const stillCalculating = list.some((s) => s.computed_at === null);
+        if (!stillCalculating || ticks >= 10) {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      } catch {
+        /* transient — keep trying until the tick cap */
+        if (ticks >= 10 && pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      }
+    }, 4000);
+  }, [applySnapshots]);
 
   useEffect(() => {
-    // Show localStorage immediately for fast first paint
+    // Fast first paint from localStorage, rendered as "Calculating…" placeholders.
     const local = loadWatchlist();
-    setTickers(local);
-    // Then fetch from backend and reconcile (backend is source of truth)
-    fetchWatchlistDB()
-      .then((items) => {
-        if (items.length > 0) {
-          const dbList = items.map((i) => i.ticker);
-          setTickers(dbList);
-          saveWatchlist(dbList);
+    if (local.length > 0) {
+      setOrder(local);
+      setSnapshots(Object.fromEntries(local.map((t) => [t, placeholder(t)])));
+    }
+    // Source of truth: one fast cached read, no live computation.
+    fetchWatchlistSnapshot()
+      .then((list) => {
+        if (list.length > 0) {
+          const tickers = list.map((s) => s.ticker);
+          setOrder(tickers);
+          setSnapshots(Object.fromEntries(list.map((s) => [s.ticker, s])));
+          saveWatchlist(tickers);
+          if (list.some((s) => s.computed_at === null)) ensurePolling();
         } else if (local.length > 0) {
-          // Seed backend with existing localStorage tickers
+          // Seed backend with existing localStorage tickers (triggers their compute).
           local.forEach((t) => addTickerDB(t).catch(() => {}));
+          ensurePolling();
         }
       })
-      .catch(() => { /* backend unavailable — localStorage already set */ });
-  }, []);
+      .catch(() => { /* backend unavailable — placeholders already shown */ });
 
-  const loadTicker = useCallback(async (ticker: string) => {
-    setStates((prev) => ({
-      ...prev,
-      [ticker]: { data: prev[ticker]?.data ?? null, loading: true },
-    }));
-    try {
-      const data = await fetchSignal(ticker);
-      setStates((prev) => ({ ...prev, [ticker]: { data, loading: false } }));
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      setStates((prev) => ({
-        ...prev,
-        [ticker]: { data: prev[ticker]?.data ?? null, loading: false, error: msg },
-      }));
-    }
-  }, []);
-
-  useEffect(() => {
-    tickers.forEach((t) => {
-      if (!states[t]) loadTicker(t);
-    });
-  }, [tickers, loadTicker]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, [ensurePolling]);
 
   function addTicker(ticker: string) {
-    const updated = [...tickers, ticker];
-    setTickers(updated);
+    const updated = [...order, ticker];
+    setOrder(updated);
+    setSnapshots((prev) => ({ ...prev, [ticker]: placeholder(ticker) }));
     saveWatchlist(updated);
     addTickerDB(ticker).catch(() => {});
+    ensurePolling();
   }
 
   function removeTicker(ticker: string) {
-    const updated = tickers.filter((t) => t !== ticker);
-    setTickers(updated);
+    const updated = order.filter((t) => t !== ticker);
+    setOrder(updated);
     saveWatchlist(updated);
     removeTickerDB(ticker).catch(() => {});
-    setStates((prev) => {
+    setSnapshots((prev) => {
       const next = { ...prev };
       delete next[ticker];
       return next;
     });
   }
 
+  // "Give me fresh numbers right now": explicit live recompute of every ticker via the
+  // /api/factors/{ticker} path (which also updates the backend snapshot), then re-read
+  // the consolidated cached snapshots for display.
   async function refreshAll() {
     setRefreshing(true);
-    await Promise.all(tickers.map(loadTicker));
-    setRefreshing(false);
+    try {
+      await Promise.all(order.map((t) => fetchFactors(t).catch(() => null)));
+      const list = await fetchWatchlistSnapshot();
+      applySnapshots(list);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  function updateSnapshot(snap: SnapshotData) {
+    setSnapshots((prev) => ({ ...prev, [snap.ticker]: snap }));
   }
 
   return (
@@ -121,36 +134,33 @@ export function Watchlist() {
         </h2>
         <button
           onClick={refreshAll}
-          disabled={refreshing || tickers.length === 0}
+          disabled={refreshing || order.length === 0}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg
             bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          title="Recompute every ticker live (slower)"
         >
           <span className={refreshing ? "animate-spin inline-block" : ""}>⟳</span>
           {refreshing ? "Refreshing…" : "Refresh all"}
         </button>
       </div>
 
-      <AddTickerForm onAdd={addTicker} existing={tickers} />
+      <AddTickerForm onAdd={addTicker} existing={order} />
 
-      {tickers.length === 0 && (
+      {order.length === 0 && (
         <p className="text-sm text-zinc-500 text-center py-8">
           Add a ticker above to get started.
         </p>
       )}
 
       <div className="grid gap-3 sm:grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
-        {tickers.map((ticker) => {
-          const s = states[ticker];
-          return (
-            <TickerCard
-              key={ticker}
-              data={s?.data ?? { ...EMPTY, ticker }}
-              loading={!s || s.loading}
-              error={s?.error}
-              onRemove={() => removeTicker(ticker)}
-            />
-          );
-        })}
+        {order.map((ticker) => (
+          <TickerCard
+            key={ticker}
+            snapshot={snapshots[ticker] ?? placeholder(ticker)}
+            onRemove={() => removeTicker(ticker)}
+            onRefreshed={updateSnapshot}
+          />
+        ))}
       </div>
     </div>
   );
