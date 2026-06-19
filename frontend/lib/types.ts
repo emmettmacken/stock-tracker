@@ -59,6 +59,17 @@ export interface FactorDetail {
   null: boolean;
 }
 
+export interface VolTrendDetail {
+  price: number;
+  ma20: number;
+  ma50: number;
+  ma200: number;
+}
+
+export interface EarningsDetail {
+  surprises: number[]; // last two quarters, oldest → newest, as fractions (0.05 = +5%)
+}
+
 export interface FactorScoreData {
   ticker: string;
   factors: {
@@ -67,14 +78,20 @@ export interface FactorScoreData {
     vol_trend: FactorDetail;
     earnings: FactorDetail;
     insider: FactorDetail;
+    sentiment?: FactorDetail;
   };
   composite_score: number;
   hmm_signal: string;
   hmm_confidence: number;
+  hmm_regime?: "bull" | "bear" | "transition";
   min_factor_score: number | null;
   volume_ok: boolean;
   ret_3m: number | null;
   ret_12m: number | null;
+  // Display-only raw breakdowns added by the backend for the stock detail page.
+  // Optional: older cached snapshots won't have them.
+  vol_trend_detail?: VolTrendDetail | null;
+  earnings_detail?: EarningsDetail | null;
 }
 
 // Cached display snapshot served by /api/watchlist/snapshot — no live computation.

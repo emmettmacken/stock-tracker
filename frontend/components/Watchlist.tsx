@@ -122,10 +122,6 @@ export function Watchlist() {
     }
   }
 
-  function updateSnapshot(snap: SnapshotData) {
-    setSnapshots((prev) => ({ ...prev, [snap.ticker]: snap }));
-  }
-
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -158,7 +154,6 @@ export function Watchlist() {
             key={ticker}
             snapshot={snapshots[ticker] ?? placeholder(ticker)}
             onRemove={() => removeTicker(ticker)}
-            onRefreshed={updateSnapshot}
           />
         ))}
       </div>

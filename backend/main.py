@@ -921,9 +921,11 @@ def _momentum_score(closes: np.ndarray) -> float | None:
     return (z + 3) / 6 * 100
 
 
-def _vol_trend_score(closes: np.ndarray) -> float | None:
+def _vol_trend_score(closes: np.ndarray) -> tuple[float | None, dict | None]:
+    """Return (0–100 score, display detail). Detail is the raw price/MA levels so the
+    UI can show which moving averages the price is above/below — display only."""
     if len(closes) < 201:
-        return None
+        return None, None
     ma20  = closes[-20:].mean()
     ma50  = closes[-50:].mean()
     ma200 = closes[-200:].mean()
@@ -937,38 +939,47 @@ def _vol_trend_score(closes: np.ndarray) -> float | None:
     # Rescale: already 0-1, apply vol weight as a squeeze toward 50 for high-vol
     vol_factor = min(inv_vol_weight / 5.0, 1.0)  # normalise so typical ~0.5 maps to 1
     score = 50.0 + (raw - 0.5) * 100.0 * vol_factor
-    return float(np.clip(score, 0, 100))
+    detail = {
+        "price": float(price),
+        "ma20":  float(ma20),
+        "ma50":  float(ma50),
+        "ma200": float(ma200),
+    }
+    return float(np.clip(score, 0, 100)), detail
 
 
-def _earnings_score(ticker_obj: yf.Ticker) -> float | None:
+def _earnings_score(ticker_obj: yf.Ticker) -> tuple[float | None, dict | None]:
+    """Return (0–100 score, display detail). Detail carries the last two quarters'
+    surprise % (act vs estimate, as fractions) so the UI can show the raw beats/misses."""
     try:
         eh = ticker_obj.earnings_history
         if eh is None or len(eh) < 2:
-            return None
+            return None, None
         # Most recent two quarters
         last2 = eh.sort_index().tail(2)
         surprises = []
         for col in ["epsActual", "epsEstimate"]:
             if col not in last2.columns:
-                return None
+                return None, None
         for _, row in last2.iterrows():
             est, act = row.get("epsEstimate"), row.get("epsActual")
             if pd.isna(est) or pd.isna(act) or est == 0:
-                return None
+                return None, None
             surprises.append((act - est) / abs(est))
         if len(surprises) < 2:
-            return None
+            return None, None
+        detail = {"surprises": [float(s) for s in surprises]}  # oldest → newest
         pos = sum(s > 0 for s in surprises)
         if pos == 2:
             avg = np.mean(surprises)
-            return float(np.clip(70.0 + avg * 200.0, 70.0, 100.0))
+            return float(np.clip(70.0 + avg * 200.0, 70.0, 100.0)), detail
         if pos == 0:
             avg = np.mean(surprises)
-            return float(np.clip(30.0 + avg * 200.0, 0.0, 30.0))
-        return 50.0
+            return float(np.clip(30.0 + avg * 200.0, 0.0, 30.0)), detail
+        return 50.0, detail
     except Exception as e:
         logger.warning("Earnings score failed for %s: %s", getattr(ticker_obj, "ticker", "?"), e)
-        return None
+        return None, None
 
 
 def _get_sentiment_score(ticker: str) -> float | None:
@@ -1235,8 +1246,8 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
 
     hmm_score      = _hmm_factor_score(sig["signal"], sig["confidence"])
     mom_score      = _momentum_score(closes)
-    vt_score       = _vol_trend_score(closes)
-    earn_score     = _earnings_score(yf.Ticker(ticker))
+    vt_score, vt_detail     = _vol_trend_score(closes)
+    earn_score, earn_detail = _earnings_score(yf.Ticker(ticker))
     insider_score  = _get_insider_score(ticker)
     # Change 2: sentiment included as a factor; null → weight dropped and renormalised
     sentiment_score = _get_sentiment_score(ticker)
@@ -1320,6 +1331,9 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         "mom_score":           round(mom_score, 2) if mom_score is not None else None,
         "ret_3m":              ret_3m,
         "ret_12m":             ret_12m,
+        # Display-only raw breakdowns for the stock detail page (never used in scoring)
+        "vol_trend_detail":    vt_detail,
+        "earnings_detail":     earn_detail,
         "atr":                 atr,
         "vol_21d":             vol_21d,
         "sentiment_score":     round(sentiment_score, 2) if sentiment_score is not None else None,
