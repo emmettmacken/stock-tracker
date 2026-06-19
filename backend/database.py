@@ -93,6 +93,8 @@ def _run_migrations() -> None:
         # Kelly position sizing audit fields
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN kelly_fraction REAL"),
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN sizing_method TEXT"),
+        # Fix 2-D: flag when the HMM fit/predict failed (bull_prob=0.5 was a fallback, not neutral)
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN hmm_fit_failed INTEGER"),
     ]
     with _conn() as conn:
         for _, sql in new_columns:
@@ -140,6 +142,7 @@ def log_signal(
     smoothed_bull_prob: Optional[float] = None,
     kelly_fraction: Optional[float] = None,
     sizing_method: Optional[str] = None,
+    hmm_fit_failed: Optional[bool] = None,
 ) -> int:
     with _conn() as conn:
         cur = conn.execute(
@@ -147,8 +150,8 @@ def log_signal(
                (ticker, timestamp, composite_score, signal, action,
                 skip_reason, price_at_signal, atr_at_signal,
                 hmm_regime, sentiment_score, smoothed_bull_prob,
-                kelly_fraction, sizing_method)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                kelly_fraction, sizing_method, hmm_fit_failed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 datetime.utcnow().isoformat(),
@@ -163,6 +166,7 @@ def log_signal(
                 smoothed_bull_prob,
                 kelly_fraction,
                 sizing_method,
+                int(hmm_fit_failed) if hmm_fit_failed is not None else None,
             ),
         )
         return cur.lastrowid  # type: ignore[return-value]
@@ -197,39 +201,6 @@ def get_last_buy_signal(ticker: str) -> Optional[dict]:
 
 # ── Trade outcomes ────────────────────────────────────────────────────────────
 
-def record_trade(
-    ticker: str,
-    entry_signal_id: Optional[int],
-    entry_price: float,
-    exit_price: float,
-    exit_reason: str,
-    return_pct: float,
-    holding_days: int,
-    composite_score_at_entry: Optional[float],
-    regime_at_entry: Optional[str] = None,
-) -> None:
-    with _conn() as conn:
-        conn.execute(
-            """INSERT INTO trade_outcomes
-               (ticker, entry_signal_id, entry_price, exit_price, exit_reason,
-                return_pct, holding_days, composite_score_at_entry, exit_timestamp,
-                regime_at_entry)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                ticker.upper(),
-                entry_signal_id,
-                entry_price,
-                exit_price,
-                exit_reason,
-                return_pct,
-                holding_days,
-                composite_score_at_entry,
-                datetime.utcnow().isoformat(),
-                regime_at_entry,
-            ),
-        )
-
-
 def get_trade_history() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
@@ -242,14 +213,6 @@ def get_trade_history() -> list[dict]:
                FROM trade_outcomes t
                LEFT JOIN signal_log sl ON t.entry_signal_id = sl.id
                ORDER BY t.exit_timestamp DESC"""
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_last_n_trades(n: int = 20) -> list[dict]:
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC LIMIT ?", (n,)
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -272,48 +235,6 @@ def get_last_n_trades_by_regime(n: int = 50, regime: Optional[str] = None) -> li
 
 
 # ── Ticker performance ────────────────────────────────────────────────────────
-
-def update_ticker_performance(ticker: str, return_pct: float, exit_reason: str) -> None:
-    """Upsert ticker win-rate / avg-return stats and optionally set last_exit_at for cooldown."""
-    ticker = ticker.upper()
-    now = datetime.utcnow().isoformat()
-    is_win = 1.0 if return_pct > 0 else 0.0
-    set_exit_at = exit_reason != "sell_signal"
-
-    with _conn() as conn:
-        row = conn.execute(
-            "SELECT total_trades, win_rate, avg_return FROM ticker_performance WHERE ticker = ?",
-            (ticker,),
-        ).fetchone()
-
-        if row:
-            old_total = row["total_trades"]
-            new_total = old_total + 1
-            new_win_rate = (row["win_rate"] * old_total + is_win) / new_total
-            new_avg_return = (row["avg_return"] * old_total + return_pct) / new_total
-            if set_exit_at:
-                conn.execute(
-                    """UPDATE ticker_performance
-                       SET total_trades=?, win_rate=?, avg_return=?, last_updated=?, last_exit_at=?
-                       WHERE ticker=?""",
-                    (new_total, new_win_rate, new_avg_return, now, now, ticker),
-                )
-            else:
-                conn.execute(
-                    """UPDATE ticker_performance
-                       SET total_trades=?, win_rate=?, avg_return=?, last_updated=?
-                       WHERE ticker=?""",
-                    (new_total, new_win_rate, new_avg_return, now, ticker),
-                )
-        else:
-            last_exit_at = now if set_exit_at else None
-            conn.execute(
-                """INSERT INTO ticker_performance
-                   (ticker, total_trades, win_rate, avg_return, last_updated, last_exit_at)
-                   VALUES (?, 1, ?, ?, ?, ?)""",
-                (ticker, is_win, return_pct, now, last_exit_at),
-            )
-
 
 def record_close_transaction(
     ticker: str,
@@ -423,11 +344,13 @@ def set_config(key: str, value: str) -> None:
 # ── Gate stats queries ───────────────────────────────────────────────────────
 
 def count_buy_evaluations(cutoff: str) -> int:
+    # Fix 2-G: exclude stop-loss 'closed' rows so ticker-days with only a close don't
+    # inflate the evaluated denominator and understate gate rejection rates.
     with _conn() as conn:
         return conn.execute(
             """SELECT COUNT(DISTINCT ticker || date(timestamp))
                FROM signal_log
-               WHERE timestamp >= ?""",
+               WHERE timestamp >= ? AND action != 'closed'""",
             (cutoff,),
         ).fetchone()[0]
 

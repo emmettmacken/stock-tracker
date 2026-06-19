@@ -494,17 +494,31 @@ def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: i
         raise HTTPException(status_code=404, detail=f"'{ticker}' not found after {max_retries} attempts")
     raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
 
+def _wilder_atr(tr: np.ndarray, period: int = 21) -> np.ndarray:
+    """Wilder's EMA of a true-range series, seeded with the SMA of the first `period`
+    TRs. Returns an array the same length as `tr`; indices before the seed are NaN."""
+    n = len(tr)
+    out = np.full(n, np.nan)
+    if n < period:
+        return out
+    atr = float(tr[:period].mean())
+    out[period - 1] = atr
+    alpha = 1.0 / period
+    for i in range(period, n):
+        atr = alpha * float(tr[i]) + (1.0 - alpha) * atr
+        out[i] = atr
+    return out
+
+
 def _atr_from_df(df: pd.DataFrame, period: int = 21) -> float:
     """Compute ATR using Wilder's EMA (seeded with SMA over first `period` bars)."""
     if len(df) < period + 1:
         return 0.0
     h, l, c = df["High"].values, df["Low"].values, df["Close"].values
     tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-    atr = float(tr[:period].mean())
-    alpha = 1.0 / period
-    for v in tr[period:]:
-        atr = alpha * float(v) + (1.0 - alpha) * atr
-    return atr
+    series = _wilder_atr(tr, period)
+    last = series[-1]
+    return float(last) if not np.isnan(last) else 0.0
 
 
 # ── /api/quote ────────────────────────────────────────────────────────────────
@@ -619,20 +633,23 @@ def get_backtest(ticker: str):
 
     TRAIN = int(db.get_config("BACKTEST_TRAIN", "252"))
     TEST  = int(db.get_config("BACKTEST_TEST", "21"))
-    HOLD  = int(db.get_config("BACKTEST_HOLD", "15"))
+    # Fix 2-E: align with live system — 21-day max hold and ATR trailing stop on by default
+    HOLD  = int(db.get_config("BACKTEST_HOLD", "21"))
     atr_mult     = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
-    use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "false").lower() == "true"
+    use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "true").lower() == "true"
     macro_filter = db.get_config("BACKTEST_MACRO_FILTER", "true").lower() == "true"
 
     if n < TRAIN + TEST:
         raise HTTPException(status_code=400, detail="Need at least 2 years of history for backtest")
 
-    # Precompute 14-day ATR series aligned with returns (length n)
+    # Fix 2-E: Wilder 21-period ATR series (same logic as live _atr_from_df), aligned
+    # with returns (length n). Early indices are NaN but idx starts at TRAIN (252) so
+    # they're never read; the loop falls back to 2% of price when ATR is NaN/<=0.
     h_bt  = df["High"].values.astype(float)[1:]
     l_bt  = df["Low"].values.astype(float)[1:]
     pc_bt = closes[:-1]
     tr_bt = np.maximum(h_bt - l_bt, np.maximum(np.abs(h_bt - pc_bt), np.abs(l_bt - pc_bt)))
-    atr_series = pd.Series(tr_bt).rolling(14, min_periods=1).mean().values
+    atr_series = _wilder_atr(tr_bt, 21)
 
     # Change 1: precompute VIX history aligned to ticker dates for the VIX>30 gate
     vix_series_bt: Optional[np.ndarray] = None
@@ -949,7 +966,8 @@ def _earnings_score(ticker_obj: yf.Ticker) -> float | None:
             avg = np.mean(surprises)
             return float(np.clip(30.0 + avg * 200.0, 0.0, 30.0))
         return 50.0
-    except Exception:
+    except Exception as e:
+        logger.warning("Earnings score failed for %s: %s", getattr(ticker_obj, "ticker", "?"), e)
         return None
 
 
@@ -995,7 +1013,8 @@ def _get_sentiment_score(ticker: str) -> float | None:
         with _SENTIMENT_LOCK:
             _SENTIMENT_CACHE[ticker] = (result_entry, time.time())
         return score
-    except Exception:
+    except Exception as e:
+        logger.warning("Sentiment fetch failed for %s: %s", ticker, e)
         return None
 
 
@@ -1019,7 +1038,8 @@ def _get_cik(ticker: str) -> Optional[str]:
         cik = m.group(1).zfill(10)
         _CIK_CACHE[ticker] = cik
         return cik
-    except Exception:
+    except Exception as e:
+        logger.warning("CIK lookup failed for %s: %s", ticker, e)
         return None
 
 
@@ -1070,7 +1090,9 @@ def _get_insider_score(ticker: str) -> float | None:
                 recent_form4s.append((acc, doc))
 
         if not recent_form4s:
-            return 50.0  # no Form 4s in last 30 days → neutral
+            # Fix 2-H: no Form 4s = no data, not a neutral signal. Return None so the factor
+            # is excluded from the composite and the remaining weights renormalise.
+            return None
 
         cik_int = int(cik)
         net_weighted = 0.0
@@ -1121,7 +1143,8 @@ def _get_insider_score(ticker: str) -> float | None:
             return None  # Form 4s exist but all failed to parse → drop weight, don't guess
 
         return 70.0 if net_weighted > 0 else (30.0 if net_weighted < 0 else 50.0)
-    except Exception:
+    except Exception as e:
+        logger.warning("Insider score failed for %s: %s", ticker, e)
         return None
 
 
@@ -1134,7 +1157,8 @@ def _get_sector(ticker: str) -> str:
             return cached_sector
     try:
         sector = yf.Ticker(ticker).info.get("sector", "Unknown") or "Unknown"
-    except Exception:
+    except Exception as e:
+        logger.warning("Sector lookup failed for %s: %s", ticker, e)
         sector = "Unknown"
     with _SECTOR_LOCK:
         _SECTOR_CACHE[ticker] = (sector, time.time())
@@ -1159,6 +1183,7 @@ def _compute_factors(ticker: str) -> Optional[dict]:
 
     smoothed_bull_prob_last = 0.5
     raw_bull_prob_last = 0.5
+    hmm_fit_failed = False
     try:
         regime_seq, bull_id, hmm_model = fit_regimes(hmm_returns)
         proba = hmm_model.predict_proba(hmm_returns.reshape(-1, 1))
@@ -1166,7 +1191,11 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         smoothed_bull_prob_series = _kalman_smooth(raw_bull_prob_series)
         raw_bull_prob_last = float(raw_bull_prob_series[-1])
         smoothed_bull_prob_last = float(smoothed_bull_prob_series[-1])
-    except Exception:
+    except Exception as e:
+        # Fix 2-D: surface (don't swallow) HMM failure — bull_prob=0.5 here is a
+        # fallback, not a genuine neutral reading; flag it so it's visible downstream.
+        hmm_fit_failed = True
+        logger.warning("HMM fit/predict failed for %s: %s — falling back to single regime, bull_prob=0.5", ticker, e)
         regime_seq = np.zeros(len(returns), dtype=int)
         bull_id = 0
 
@@ -1193,7 +1222,10 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     stat_act = stationary(mat_act)
 
     ratios_w = vol_w / np.maximum(vol_20d_w, 1.0)
-    cur_st = si(ret_bucket(float(rets_w[-1])), vol_bucket(float(ratios_w[-1]), lo_t, hi_t))
+    # Fix 2-C: use the last *complete* bar [-2] for the current Markov state, consistent with
+    # the volume read below — today's bar is partial at signal time. Fall back to [-1] if short.
+    _cb = -2 if len(rets_w) >= 2 else -1
+    cur_st = si(ret_bucket(float(rets_w[_cb])), vol_bucket(float(ratios_w[_cb]), lo_t, hi_t))
     sig = compute_signal(cnt_act[cur_st], mat_act[cur_st], stat_act)
 
     hmm_score      = _hmm_factor_score(sig["signal"], sig["confidence"])
@@ -1205,7 +1237,7 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     sentiment_score = _get_sentiment_score(ticker)
 
     # Volume and overextension signals used by the signal job
-    # Use [-2] (last *complete* trading day) — today's bar is partial at signal time (15:45 ET)
+    # Use [-2] (last *complete* trading day) — today's bar is partial at signal time (15:30 ET)
     current_vol  = float(vol[-2])     if len(vol)     >= 2 else (float(vol[-1])     if len(vol)     > 0 else 0.0)
     avg_vol_20d  = float(vol_20d[-2]) if len(vol_20d) >= 2 else (float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0)
     volume_ratio = round(current_vol / avg_vol_20d, 3) if avg_vol_20d > 0 else None
@@ -1213,7 +1245,21 @@ def _compute_factors(ticker: str) -> Optional[dict]:
     volume_ok    = current_vol > vol_thresh * avg_vol_20d if avg_vol_20d > 0 else True
     ma20         = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes[-1])
     price_ma20_ratio = float(closes[-1]) / ma20 if ma20 > 0 else 1.0
-    overextended = price_ma20_ratio > 1.25  # kept for API compat; gate uses OVEREXTENDED_THRESHOLD_PCT
+    # Fix 2-F: derive overextended from the same config the live gate uses (no hardcoded 1.25)
+    _oe_thresh_pct = float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
+    overextended = price_ma20_ratio > (1.0 + _oe_thresh_pct)
+
+    # Fix 2-B: true rolling 75th-percentile of 63-day returns, matching the backtest's
+    # overextension override (ret_63d >= mom_q75) instead of the z-scored mom_score threshold.
+    if len(closes) > 63:
+        ret_63d_arr = closes[63:] / closes[:-63] - 1.0
+    else:
+        ret_63d_arr = np.array([])
+    if len(ret_63d_arr) >= 63:
+        mom_q75_now = float(np.quantile(ret_63d_arr[-252:], 0.75))
+        top_quartile_mom = bool(float(ret_63d_arr[-1]) >= mom_q75_now)
+    else:
+        top_quartile_mom = False
 
     weights = _load_ticker_weights(ticker)
 
@@ -1252,11 +1298,13 @@ def _compute_factors(ticker: str) -> Optional[dict]:
         "hmm_regime":          regime_label,
         "smoothed_bull_prob":  round(smoothed_bull_prob_last, 4),
         "raw_bull_prob":       round(raw_bull_prob_last, 4),
+        "hmm_fit_failed":      hmm_fit_failed,
         "current_price":       float(closes[-1]),
         "volume_ok":           volume_ok,
         "volume_ratio":        volume_ratio,
         "overextended":        overextended,
         "price_ma20_ratio":    round(price_ma20_ratio, 4),
+        "top_quartile_mom":    top_quartile_mom,
         "mom_score":           round(mom_score, 2) if mom_score is not None else None,
         "ret_3m":              ret_3m,
         "ret_12m":             ret_12m,
@@ -2064,20 +2112,35 @@ def _macro_regime() -> tuple[bool, float]:
     with _MACRO_LOCK:
         if _MACRO_CACHE is not None and (time.time() - _MACRO_CACHE[1]) < _MACRO_TTL:
             return _MACRO_CACHE[0]
+    # Fix 4-A: fail CLOSED. If SPY/VIX data is unavailable we must not assume a
+    # benign regime — treat SPY as below its 200d MA (bear → stricter threshold)
+    # and VIX as elevated (blocks new buys) until the data comes back.
     spy_above = True
+    spy_ok = False
     try:
         h = yf.Ticker("SPY").history(period="1y")
         if len(h) >= 200:
             spy_above = float(h["Close"].iloc[-1]) > float(h["Close"].iloc[-200:].mean())
-    except Exception:
-        pass
+            spy_ok = True
+    except Exception as e:
+        logger.warning("Macro: SPY fetch failed (%s)", e)
+    if not spy_ok:
+        spy_above = False  # fail closed → bear-level threshold
+        logger.warning("Macro: SPY 200d MA unavailable — failing closed to bearish regime")
+
     vix = 20.0
+    vix_ok = False
     try:
         h = yf.Ticker("^VIX").history(period="5d")
         if not h.empty:
             vix = float(h["Close"].iloc[-1])
-    except Exception:
-        pass
+            vix_ok = True
+    except Exception as e:
+        logger.warning("Macro: VIX fetch failed (%s)", e)
+    if not vix_ok:
+        vix = 999.0  # fail closed → high_vix gate blocks new buys
+        logger.warning("Macro: VIX unavailable — failing closed to elevated VIX (new buys blocked)")
+
     result = (spy_above, vix)
     with _MACRO_LOCK:
         _MACRO_CACHE = (result, time.time())
@@ -2250,6 +2313,7 @@ def _write_gate_stats() -> None:
         "hmm_not_buy_transition", "hmm_regime_uncertain", "score_below_threshold",
         "sentiment_too_low",
         "earnings_within_2d", "vix_too_high", "already_in_position",
+        "volume_below_average",
         "overextended", "momentum_disagreement",
         "reentry_cooldown", "sector_concentration",
     ]
@@ -2374,6 +2438,7 @@ def _run_signal_job() -> None:
             hmm_signal         = result["hmm_signal"]
             hmm_regime         = result.get("hmm_regime")
             smoothed_bull_prob = result.get("smoothed_bull_prob", 0.5)
+            hmm_fit_failed     = bool(result.get("hmm_fit_failed", False))
             sentiment          = result.get("sentiment_score")
             price              = result["current_price"]
             atr                = result.get("atr", 0.0)
@@ -2415,7 +2480,7 @@ def _run_signal_job() -> None:
             if not hmm_passes:
                 db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy_transition", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
-                              smoothed_bull_prob=smoothed_bull_prob)
+                              smoothed_bull_prob=smoothed_bull_prob, hmm_fit_failed=hmm_fit_failed)
                 continue
 
             # Informational only (hmm_source: gaussian): the Gaussian probability — not the
@@ -2432,7 +2497,7 @@ def _run_signal_job() -> None:
                 db.log_signal(ticker, composite, "BUY", "skipped",
                               f"hmm_regime_uncertain:{smoothed_bull_prob:.3f}",
                               price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment,
-                              smoothed_bull_prob=smoothed_bull_prob)
+                              smoothed_bull_prob=smoothed_bull_prob, hmm_fit_failed=hmm_fit_failed)
                 continue
 
             if effective_composite < buy_threshold:
@@ -2462,9 +2527,16 @@ def _run_signal_job() -> None:
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob)
                 continue
-            mom_score_val    = result.get("mom_score")
+            # Fix 2-A: volume confirmation gate (previously computed but never applied)
+            if not result.get("volume_ok", True):
+                db.log_signal(ticker, effective_composite, "BUY", "skipped",
+                              "volume_below_average", price, atr,
+                              hmm_regime=hmm_regime, sentiment_score=sentiment,
+                              smoothed_bull_prob=smoothed_bull_prob)
+                continue
             price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
-            top_quartile_mom = mom_score_val is not None and mom_score_val >= 75.0
+            # Fix 2-B: use the true rolling-percentile momentum flag (matches backtest), not mom_score>=75
+            top_quartile_mom = bool(result.get("top_quartile_mom", False))
             if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
                 db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
@@ -2520,6 +2592,7 @@ def _run_signal_job() -> None:
                     hmm_regime=hmm_regime, sentiment_score=sentiment,
                     smoothed_bull_prob=smoothed_bull_prob,
                     kelly_fraction=kelly_frac, sizing_method=sizing_method,
+                    hmm_fit_failed=hmm_fit_failed,
                 )
                 if atr > 0:
                     db.update_trailing_stop(signal_id, price - 1.5 * atr)
