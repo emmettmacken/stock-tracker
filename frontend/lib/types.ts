@@ -110,6 +110,19 @@ export interface SnapshotData {
   factors: FactorScoreData | null;
 }
 
+export interface EquityHistoryPoint {
+  date: string;
+  equity: number;
+}
+
+export interface EquityHistory {
+  available: boolean;
+  source?: "alpaca" | "reconstructed";
+  approximate?: boolean;
+  points?: EquityHistoryPoint[];
+  error?: string;
+}
+
 export interface SectorBucket {
   sector: string;
   count: number;

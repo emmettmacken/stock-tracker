@@ -4,6 +4,7 @@ import {
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
   AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
+  EquityHistory,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -151,6 +152,12 @@ export async function fetchPaperAccount(): Promise<PaperAccount> {
 export async function fetchPaperPositions(): Promise<{ available: boolean; positions?: PaperPosition[]; error?: string }> {
   const res = await fetch(`${BASE}/api/paper/positions`);
   if (!res.ok) throw new Error("Failed to fetch positions");
+  return res.json();
+}
+
+export async function fetchEquityHistory(days = 30): Promise<EquityHistory> {
+  const res = await fetch(`${BASE}/api/paper/equity-history?days=${days}`);
+  if (!res.ok) throw new Error("Failed to fetch equity history");
   return res.json();
 }
 

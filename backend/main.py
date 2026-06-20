@@ -41,7 +41,7 @@ except Exception:
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, GetPortfolioHistoryRequest
     from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
     ALPACA_OK = True
 except Exception:
@@ -3091,6 +3091,81 @@ def api_paper_sector_exposure():
         "total_positions": total,
         "sectors": sectors,
     }
+
+
+def _reconstruct_equity_history(days: int, current_equity: Optional[float]) -> list[dict]:
+    """Approximate daily equity curve from closed-trade timestamps + current equity.
+
+    Fallback used only when Alpaca's own portfolio history is unavailable. Read-only:
+    walks backward from today's equity, undoing each closed trade's realised return
+    (scaled by an assumed average position weight). Clearly approximate — no live calc.
+    """
+    if current_equity is None:
+        return []
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    trades = [t for t in db.get_trade_history()
+              if t.get("exit_timestamp") and t["exit_timestamp"] >= cutoff.isoformat()]
+    # Map each day → summed realised return fraction (return_pct is a percent).
+    AVG_WEIGHT = 0.10  # rough average position weight; magnitude is illustrative only
+    by_day: dict[str, float] = {}
+    for t in trades:
+        day = t["exit_timestamp"][:10]
+        by_day[day] = by_day.get(day, 0.0) + (float(t.get("return_pct") or 0.0) / 100.0) * AVG_WEIGHT
+    # Walk backward from today's equity.
+    points: list[dict] = []
+    equity = float(current_equity)
+    today = datetime.utcnow().date()
+    series: list[tuple[str, float]] = []
+    for i in range(days + 1):
+        d = today - timedelta(days=i)
+        series.append((d.isoformat(), equity))
+        # Undo trades that closed on this day to get the prior day's equity.
+        frac = by_day.get(d.isoformat(), 0.0)
+        if 1 + frac != 0:
+            equity = equity / (1 + frac)
+    for date, eq in reversed(series):
+        points.append({"date": date, "equity": round(eq, 2)})
+    return points
+
+
+@app.get("/api/paper/equity-history")
+def api_paper_equity_history(days: int = 30):
+    """Daily account equity over the last `days`. Read-only.
+
+    Prefers Alpaca's own portfolio history (real equity, computed by Alpaca — we only
+    read it); falls back to an approximate reconstruction from closed-trade timestamps
+    and current equity. No new live calculation of any score or signal.
+    """
+    days = max(5, min(int(days), 365))
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err}
+
+    # Primary: Alpaca portfolio history.
+    try:
+        req = GetPortfolioHistoryRequest(period=f"{days}D", timeframe="1D")
+        hist = _alpaca_client.get_portfolio_history(req)
+        ts = getattr(hist, "timestamp", None) or []
+        eq = getattr(hist, "equity", None) or []
+        points = [
+            {"date": datetime.utcfromtimestamp(int(t)).strftime("%Y-%m-%d"),
+             "equity": round(float(e), 2)}
+            for t, e in zip(ts, eq) if e is not None
+        ]
+        if points:
+            return {"available": True, "source": "alpaca", "approximate": False, "points": points}
+    except Exception as e:
+        logger.info("Portfolio history unavailable, reconstructing: %s", e)
+
+    # Fallback: approximate reconstruction.
+    try:
+        acc = _alpaca_client.get_account()
+        equity = float(acc.equity)
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+    points = _reconstruct_equity_history(days, equity)
+    if not points:
+        return {"available": False, "error": "no equity history"}
+    return {"available": True, "source": "reconstructed", "approximate": True, "points": points}
 
 
 @app.get("/api/paper/history")
