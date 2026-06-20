@@ -108,6 +108,23 @@ export interface SnapshotData {
   factors: FactorScoreData | null;
 }
 
+export interface SectorBucket {
+  sector: string;
+  count: number;
+  tickers: string[];
+  pct: number;
+  at_cap: boolean;
+  near_cap: boolean;
+}
+
+export interface SectorExposure {
+  available: boolean;
+  error?: string;
+  max_per_sector: number;
+  total_positions: number;
+  sectors: SectorBucket[];
+}
+
 export interface BriefingOrder {
   ticker: string;
   price: number | null;

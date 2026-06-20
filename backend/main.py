@@ -3047,6 +3047,49 @@ def api_paper_positions():
     return {"available": True, "positions": result}
 
 
+@app.get("/api/paper/sector-exposure")
+def api_paper_sector_exposure():
+    """Sector breakdown of currently open Alpaca positions.
+
+    Read-only: reuses the cached _get_sector lookup (same data the concentration gate
+    uses) to count open positions per sector. No new sector fetching logic, no scoring.
+    """
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err}
+    try:
+        positions = _alpaca_client.get_all_positions()
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+    max_per_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+    buckets: dict[str, list[str]] = {}
+    for pos in positions:
+        sector = _get_sector(pos.symbol)
+        buckets.setdefault(sector, []).append(pos.symbol)
+
+    total = sum(len(v) for v in buckets.values())
+    sectors = sorted(
+        (
+            {
+                "sector": sec,
+                "count": len(tks),
+                "tickers": sorted(tks),
+                "pct": round(len(tks) / total * 100, 1) if total else 0.0,
+                "at_cap": len(tks) >= max_per_sector,
+                "near_cap": len(tks) == max_per_sector - 1,
+            }
+            for sec, tks in buckets.items()
+        ),
+        key=lambda x: x["count"], reverse=True,
+    )
+    return {
+        "available": True,
+        "max_per_sector": max_per_sector,
+        "total_positions": total,
+        "sectors": sectors,
+    }
+
+
 @app.get("/api/paper/history")
 def api_paper_history():
     return db.get_trade_history()

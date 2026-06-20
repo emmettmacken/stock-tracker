@@ -3,7 +3,7 @@ import {
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
-  AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing,
+  AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -151,6 +151,12 @@ export async function fetchPaperAccount(): Promise<PaperAccount> {
 export async function fetchPaperPositions(): Promise<{ available: boolean; positions?: PaperPosition[]; error?: string }> {
   const res = await fetch(`${BASE}/api/paper/positions`);
   if (!res.ok) throw new Error("Failed to fetch positions");
+  return res.json();
+}
+
+export async function fetchSectorExposure(): Promise<SectorExposure> {
+  const res = await fetch(`${BASE}/api/paper/sector-exposure`);
+  if (!res.ok) throw new Error("Failed to fetch sector exposure");
   return res.json();
 }
 
