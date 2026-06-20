@@ -68,11 +68,27 @@ export function PositionsTable({ data, loading, lastUpdated }: Props) {
                   </td>
                   <td className={`py-2.5 pr-4 tabular-nums ${atRisk ? "text-amber-400" : "text-zinc-500"}`}>
                     {stopPrice != null ? `$${fmt(stopPrice)}` : "—"}
-                    {atRisk && <span className="ml-1 text-amber-500 text-[9px]">⚠ near stop</span>}
+                    {atRisk && (
+                      <span className="ml-1 inline-flex items-center gap-0.5 text-amber-500 text-[9px] align-middle">
+                        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                          <path d="M12 9v4M12 17h.01" />
+                        </svg>
+                        near stop
+                      </span>
+                    )}
                   </td>
                   <td className={`py-2.5 pr-4 tabular-nums ${p.days_held > 18 ? "text-amber-400" : "text-zinc-400"}`}>
                     {p.days_held}d
-                    {p.days_held > 18 && <span className="ml-1 text-amber-500 text-[9px]">⚠ expiring</span>}
+                    {p.days_held > 18 && (
+                      <span className="ml-1 inline-flex items-center gap-0.5 text-amber-500 text-[9px] align-middle">
+                        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                          <path d="M12 9v4M12 17h.01" />
+                        </svg>
+                        expiring
+                      </span>
+                    )}
                   </td>
                   <td className="py-2.5 tabular-nums text-zinc-300">
                     ${p.market_value.toLocaleString("en-IE", { maximumFractionDigits: 0 })}
