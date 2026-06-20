@@ -43,7 +43,7 @@ export function AllocationTable({ sizing, factorData, method, capital }: Props) 
             const dollar = method === "kelly" ? alloc.kelly_dollar : alloc.vol_targeted_dollar;
 
             return (
-              <tr key={ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+              <tr key={ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors duration-150 ease-out-quart">
                 <td className="py-2.5 pr-3 font-semibold text-zinc-200">{ticker}</td>
                 <td className="py-2.5 pr-3">
                   {score !== null ? (
@@ -67,7 +67,7 @@ export function AllocationTable({ sizing, factorData, method, capital }: Props) 
                 </td>
                 <td className="py-2.5">
                   {hasPenalty ? (
-                    <span className="text-amber-400 text-[10px] font-medium bg-amber-950/30 border border-amber-800/40 rounded px-1.5 py-0.5">
+                    <span className="text-amber-400 text-[10px] font-medium tabular-nums bg-amber-950/30 border border-amber-800/40 rounded-md px-1.5 py-0.5">
                       −{fmt((1 - penalty) * 100, 0)}%
                     </span>
                   ) : (

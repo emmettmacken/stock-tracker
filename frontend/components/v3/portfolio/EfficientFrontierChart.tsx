@@ -87,7 +87,7 @@ export function EfficientFrontierChart({ points }: Props) {
           <Scatter
             name="Min Variance"
             data={minVar}
-            fill="#6366f1"
+            fill="#38bdf8"
             opacity={1}
             r={6}
           />
@@ -102,7 +102,7 @@ export function EfficientFrontierChart({ points }: Props) {
       </ResponsiveContainer>
       <div className="flex gap-4 mt-1 text-[10px] text-zinc-500 justify-center">
         <span>
-          <span className="text-indigo-400 font-bold">●</span> Min Variance: {points[minVarIdx].volatility.toFixed(1)}% vol
+          <span className="text-sky-400 font-bold">●</span> Min Variance: {points[minVarIdx].volatility.toFixed(1)}% vol
         </span>
         <span>
           <span className="text-emerald-400 font-bold">●</span> Max Sharpe:{" "}

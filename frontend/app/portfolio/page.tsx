@@ -86,11 +86,11 @@ export default function PortfolioPage() {
   const loadingCount = factorLoadingTickers.size;
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-white">
-      <div className="max-w-5xl mx-auto px-4 py-8">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100">
+      <div className="max-w-5xl mx-auto px-4 py-8 sm:py-10">
         <header className="mb-8">
-          <h1 className="text-2xl font-bold tracking-tight">Portfolio</h1>
-          <p className="mt-1 text-zinc-400 text-sm">
+          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">Portfolio</h1>
+          <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
             Size positions and backtest multi-ticker portfolios using composite factor signals.
           </p>
         </header>
@@ -119,7 +119,7 @@ export default function PortfolioPage() {
                       onChange={() => toggleTicker(ticker)}
                       className="rounded accent-emerald-500 w-3.5 h-3.5 shrink-0"
                     />
-                    <span className="text-sm text-zinc-300 group-hover:text-white transition-colors flex-1 min-w-0 truncate">
+                    <span className="text-sm text-zinc-300 group-hover:text-white transition-colors duration-150 ease-out-quart flex-1 min-w-0 truncate">
                       {ticker}
                     </span>
                     {isLoading ? (
@@ -140,12 +140,13 @@ export default function PortfolioPage() {
                 Capital
               </label>
               <div className="relative">
-                <span className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-500 text-sm">€</span>
+                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 text-sm">€</span>
                 <input
                   type="number"
                   value={capital}
                   onChange={(e) => setCapital(Math.max(100, parseInt(e.target.value) || 10000))}
-                  className="w-full bg-zinc-800 border border-zinc-700 rounded-lg pl-6 pr-2 py-1.5 text-sm text-zinc-200 focus:outline-none focus:border-zinc-500"
+                  className="w-full bg-zinc-900 border border-zinc-800 rounded-lg pl-6 pr-2 py-1.5 text-sm text-zinc-200 tabular-nums
+                    focus:outline-none focus:border-zinc-600 transition-colors duration-150 ease-out-quart"
                   min={100}
                   step={1000}
                 />
@@ -157,19 +158,19 @@ export default function PortfolioPage() {
               <label className="block text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-2">
                 Sizing Method
               </label>
-              <div className="flex rounded-lg overflow-hidden border border-zinc-700 text-xs">
+              <div className="flex gap-0.5 rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
                 <button
                   onClick={() => setMethod("vol")}
-                  className={`flex-1 py-1.5 transition-colors ${
-                    method === "vol" ? "bg-zinc-700 text-white font-medium" : "text-zinc-500 hover:text-zinc-300"
+                  className={`flex-1 rounded-md py-1.5 transition-colors duration-150 ease-out-quart ${
+                    method === "vol" ? "bg-zinc-700 text-zinc-100 font-medium" : "text-zinc-500 hover:text-zinc-300"
                   }`}
                 >
                   Vol-target
                 </button>
                 <button
                   onClick={() => setMethod("kelly")}
-                  className={`flex-1 py-1.5 transition-colors ${
-                    method === "kelly" ? "bg-zinc-700 text-white font-medium" : "text-zinc-500 hover:text-zinc-300"
+                  className={`flex-1 rounded-md py-1.5 transition-colors duration-150 ease-out-quart ${
+                    method === "kelly" ? "bg-zinc-700 text-zinc-100 font-medium" : "text-zinc-500 hover:text-zinc-300"
                   }`}
                 >
                   Kelly
@@ -183,7 +184,7 @@ export default function PortfolioPage() {
             {/* Allocation section */}
             <section>
               <div className="flex items-center justify-between mb-3">
-                <h2 className="text-sm font-semibold text-zinc-300">
+                <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">
                   Position Sizing
                 </h2>
                 {loadingCount > 0 && (
@@ -250,7 +251,7 @@ export default function PortfolioPage() {
 
             {/* Backtest section */}
             <section className="border-t border-zinc-800 pt-6">
-              <h2 className="text-sm font-semibold text-zinc-300 mb-4">Portfolio Backtest</h2>
+              <h2 className="text-sm font-semibold text-zinc-100 tracking-tight mb-4">Portfolio Backtest</h2>
               {selected.length === 0 ? (
                 <p className="text-zinc-600 text-sm">Select tickers to run a backtest.</p>
               ) : (

@@ -23,10 +23,10 @@ function StatCard({
   const color =
     positive === undefined ? "text-zinc-100" : positive ? "text-emerald-400" : "text-red-400";
   return (
-    <div className="bg-zinc-800 rounded-lg p-3">
+    <div className="bg-zinc-800/50 rounded-lg p-3">
       <div className="text-zinc-500 text-[10px] mb-1">{label}</div>
       <div className={`text-base font-bold tabular-nums ${color}`}>{value}</div>
-      {sub && <div className="text-zinc-600 text-[10px] mt-0.5">{sub}</div>}
+      {sub && <div className="text-zinc-600 text-[10px] mt-0.5 tabular-nums">{sub}</div>}
     </div>
   );
 }
@@ -82,7 +82,8 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
         <button
           onClick={run}
           disabled={tickers.length === 0}
-          className="px-5 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors"
+          className="px-5 py-2 bg-zinc-100 hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed text-zinc-900 text-sm font-medium rounded-lg
+            transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
         >
           Run Portfolio Backtest
         </button>
@@ -192,7 +193,7 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
             <Legend wrapperStyle={{ fontSize: 10, paddingTop: 4 }} iconType="line" />
             <ReferenceLine y={100} stroke="#3f3f46" strokeDasharray="3 3" />
             <Line type="monotone" dataKey="Portfolio" stroke="#10b981" strokeWidth={1.5} dot={false} />
-            <Line type="monotone" dataKey="SPY" stroke="#6366f1" strokeWidth={1.5} dot={false} strokeDasharray="4 2" />
+            <Line type="monotone" dataKey="SPY" stroke="#a1a1aa" strokeWidth={1.5} dot={false} strokeDasharray="4 2" />
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -235,7 +236,7 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
       {/* Per-ticker contribution */}
       {contribData.length > 0 && (
         <div>
-          <h4 className="font-semibold text-zinc-400 uppercase tracking-wide mb-3 text-[10px]">
+          <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-3">
             Ticker Contribution to Return
           </h4>
           <ResponsiveContainer width="100%" height={Math.max(60, contribData.length * 32)}>
@@ -281,7 +282,7 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
       {/* Efficient frontier */}
       {d.efficient_frontier.length > 0 && (
         <div>
-          <h4 className="font-semibold text-zinc-400 uppercase tracking-wide mb-3 text-[10px]">
+          <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-3">
             Efficient Frontier (500 Monte Carlo Portfolios)
           </h4>
           <EfficientFrontierChart points={d.efficient_frontier} />
