@@ -29,8 +29,11 @@ export function TickerCard({ snapshot, onRemove }: Props) {
 
   return (
     <div
-      className={`bg-zinc-900 border rounded-xl p-4 transition-all duration-200
-        ${!ready ? "opacity-70 border-zinc-800" : "border-zinc-800 hover:border-zinc-600 cursor-pointer"}`}
+      className={`group bg-zinc-900 border rounded-xl p-4
+        transition-[border-color,transform,background-color] duration-200 ease-out-quart
+        ${!ready
+          ? "opacity-70 border-zinc-800"
+          : "border-zinc-800 hover:border-zinc-700 hover:bg-zinc-900/60 hover:-translate-y-px cursor-pointer"}`}
       onClick={handleCardClick}
     >
       {/* Header row */}
@@ -56,10 +59,10 @@ export function TickerCard({ snapshot, onRemove }: Props) {
 
           {ready ? (
             <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-semibold text-white">
+              <span className="text-2xl font-semibold text-white tabular-nums tracking-tight">
                 ${(snapshot.price ?? 0).toFixed(2)}
               </span>
-              <span className={`text-sm font-medium ${isPositive ? "text-emerald-400" : "text-red-400"}`}>
+              <span className={`text-sm font-medium tabular-nums ${isPositive ? "text-emerald-400" : "text-red-400"}`}>
                 {isPositive ? "+" : ""}{change.toFixed(2)}%
               </span>
             </div>
@@ -69,9 +72,11 @@ export function TickerCard({ snapshot, onRemove }: Props) {
         </div>
 
         <button
-          className="ml-2 text-zinc-600 hover:text-red-400 transition-colors text-lg leading-none"
+          className="-mr-1 -mt-1 ml-2 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-lg leading-none
+            text-zinc-600 hover:text-red-400 hover:bg-zinc-800/70 transition-colors duration-150 ease-out-quart active:scale-95"
           onClick={(e) => { e.stopPropagation(); onRemove(); }}
           title="Remove"
+          aria-label={`Remove ${ticker}`}
         >
           ×
         </button>
@@ -86,11 +91,18 @@ export function TickerCard({ snapshot, onRemove }: Props) {
           )}
 
           {/* Staleness indicator — the displayed score can be up to a day old. */}
-          <div className="mt-2 flex items-center justify-between text-xs text-zinc-600">
-            <span className="inline-flex items-center gap-1" title={`Computed at ${snapshot.computed_at}`}>
-              🕒 Updated {relativeTime(snapshot.computed_at)}
+          <div className="mt-2.5 flex items-center justify-between text-xs text-zinc-600">
+            <span className="inline-flex items-center gap-1.5" title={`Computed at ${snapshot.computed_at}`}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+              Updated {relativeTime(snapshot.computed_at)}
             </span>
-            <span className="text-zinc-500">View detail →</span>
+            <span className="inline-flex items-center gap-1 text-zinc-500 transition-colors duration-150 ease-out-quart group-hover:text-zinc-300">
+              View detail
+              <span className="transition-transform duration-150 ease-out-quart group-hover:translate-x-0.5">→</span>
+            </span>
           </div>
         </>
       )}

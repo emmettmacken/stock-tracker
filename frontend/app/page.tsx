@@ -2,13 +2,13 @@ import { Watchlist } from "@/components/Watchlist";
 
 export default function Home() {
   return (
-    <main className="min-h-screen bg-zinc-950 text-white">
-      <div className="max-w-5xl mx-auto px-4 py-10">
-        <header className="mb-10">
-          <h1 className="text-3xl font-bold tracking-tight text-white">
+    <main className="min-h-screen bg-zinc-950 text-zinc-100">
+      <div className="max-w-5xl mx-auto px-4 py-10 sm:py-12">
+        <header className="mb-9">
+          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">
             Stock Signal Tracker
           </h1>
-          <p className="mt-1 text-zinc-400 text-sm">
+          <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
             Markov chain buy/sell/hold signals from 90 days of price history
           </p>
         </header>

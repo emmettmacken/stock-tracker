@@ -31,17 +31,19 @@ export function AddTickerForm({ onAdd, existing }: Props) {
           value={value}
           onChange={(e) => { setValue(e.target.value); setErr(""); }}
           placeholder="Add ticker (e.g. NVDA)"
-          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white
-            placeholder-zinc-500 focus:outline-none focus:border-zinc-500 uppercase"
+          className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white
+            placeholder-zinc-600 focus:outline-none focus:border-zinc-600 uppercase
+            transition-colors duration-150 ease-out-quart"
           maxLength={10}
         />
-        {err && <p className="text-xs text-red-400 mt-1">{err}</p>}
+        {err && <p className="text-xs text-red-400 mt-1.5">{err}</p>}
       </div>
       <button
         type="submit"
-        className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap"
+        className="px-4 py-2 bg-zinc-100 hover:bg-white text-zinc-900 text-sm font-medium rounded-lg whitespace-nowrap
+          transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
       >
-        + Add
+        Add
       </button>
     </form>
   );

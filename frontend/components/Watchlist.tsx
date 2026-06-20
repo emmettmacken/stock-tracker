@@ -123,19 +123,33 @@ export function Watchlist() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest">
+        <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-[0.14em]">
           Watchlist
+          {order.length > 0 && (
+            <span className="ml-2 font-normal normal-case tracking-normal text-zinc-600">
+              {order.length}
+            </span>
+          )}
         </h2>
         <button
           onClick={refreshAll}
           disabled={refreshing || order.length === 0}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg
-            bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed
+            transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
           title="Recompute every ticker live (slower)"
         >
-          <span className={refreshing ? "animate-spin inline-block" : ""}>⟳</span>
+          <svg
+            width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+            className={refreshing ? "animate-spin" : ""}
+            aria-hidden
+          >
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <path d="M21 3v6h-6" />
+          </svg>
           {refreshing ? "Refreshing…" : "Refresh all"}
         </button>
       </div>
@@ -143,9 +157,10 @@ export function Watchlist() {
       <AddTickerForm onAdd={addTicker} existing={order} />
 
       {order.length === 0 && (
-        <p className="text-sm text-zinc-500 text-center py-8">
-          Add a ticker above to get started.
-        </p>
+        <div className="rounded-xl border border-dashed border-zinc-800 py-12 text-center">
+          <p className="text-sm text-zinc-400">Your watchlist is empty</p>
+          <p className="mt-1 text-xs text-zinc-600">Add a ticker above to get started.</p>
+        </div>
       )}
 
       <div className="grid gap-3 sm:grid-cols-1 md:grid-cols-2 xl:grid-cols-3">

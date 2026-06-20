@@ -13,29 +13,38 @@ export function Nav() {
   }
 
   return (
-    <nav className="border-b border-zinc-800 bg-zinc-950">
-      <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-6">
-        <span className="text-sm font-semibold text-zinc-300">Stock Tracker</span>
-        <div className="flex gap-5 flex-1">
+    <nav className="sticky top-0 z-40 border-b border-zinc-800/80 bg-zinc-950/80 backdrop-blur-md supports-[backdrop-filter]:bg-zinc-950/60">
+      <div className="max-w-5xl mx-auto px-4 h-14 flex items-center gap-7">
+        <span className="flex items-center gap-2 text-sm font-semibold text-zinc-100 tracking-tight">
+          <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" aria-hidden />
+          Stock Tracker
+        </span>
+        <div className="flex gap-1 flex-1">
           {([
             ["/", "Watchlist"],
             ["/portfolio", "Portfolio"],
             ["/automation", "Automation"],
-          ] as const).map(([href, label]) => (
-            <Link
-              key={href}
-              href={href}
-              className={`text-sm transition-colors ${
-                path === href ? "text-white font-medium" : "text-zinc-500 hover:text-zinc-300"
-              }`}
-            >
-              {label}
-            </Link>
-          ))}
+          ] as const).map(([href, label]) => {
+            const active = path === href;
+            return (
+              <Link
+                key={href}
+                href={href}
+                aria-current={active ? "page" : undefined}
+                className={`rounded-md px-2.5 py-1.5 text-sm transition-colors duration-150 ease-out-quart ${
+                  active
+                    ? "bg-zinc-800 text-zinc-100 font-medium"
+                    : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                }`}
+              >
+                {label}
+              </Link>
+            );
+          })}
         </div>
         <button
           onClick={handleLogout}
-          className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+          className="rounded-md px-2 py-1 text-xs text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors duration-150 ease-out-quart active:scale-[0.98]"
         >
           Sign out
         </button>
