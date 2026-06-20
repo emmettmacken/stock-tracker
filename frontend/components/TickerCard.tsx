@@ -6,19 +6,28 @@ import { ConfidenceBar } from "./ConfidenceBar";
 import { FactorScorePill } from "./v3/FactorScorePill";
 import { RegimePill } from "./v3/RegimePill";
 import { relativeTime } from "@/lib/relativeTime";
+import { whyChip } from "@/lib/whyChip";
 
 interface Props {
   snapshot: SnapshotData;
   onRemove: () => void;
+  held?: boolean;
 }
 
-export function TickerCard({ snapshot, onRemove }: Props) {
+const CHIP_TONE = {
+  pos: "bg-emerald-500/10 text-emerald-300 border-emerald-800/40",
+  neg: "bg-red-500/10 text-red-300 border-red-800/40",
+  neutral: "bg-zinc-800/60 text-zinc-400 border-zinc-700/50",
+} as const;
+
+export function TickerCard({ snapshot, onRemove, held = false }: Props) {
   const router = useRouter();
 
   const ticker = snapshot.ticker;
   const ready = snapshot.computed_at !== null;
   const factors = snapshot.factors;
   const signal: Signal = snapshot.signal ?? "HOLD";
+  const chip = ready ? whyChip(snapshot) : null;
 
   const change = snapshot.price_change_pct ?? 0;
   const isPositive = change >= 0;
@@ -31,8 +40,10 @@ export function TickerCard({ snapshot, onRemove }: Props) {
     <div
       className={`group bg-zinc-900 border rounded-xl p-4
         transition-[border-color,transform,background-color] duration-200 ease-out-quart
-        ${!ready
+        ${held ? "ring-1 ring-sky-500/30 " : ""}${!ready
           ? "opacity-70 border-zinc-800"
+          : held
+          ? "border-sky-800/50 hover:border-sky-700 hover:bg-zinc-900/60 hover:-translate-y-px cursor-pointer"
           : "border-zinc-800 hover:border-zinc-700 hover:bg-zinc-900/60 hover:-translate-y-px cursor-pointer"}`}
       onClick={handleCardClick}
     >
@@ -41,6 +52,12 @@ export function TickerCard({ snapshot, onRemove }: Props) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="text-lg font-bold text-white tracking-tight">{ticker}</span>
+            {held && (
+              <span className="inline-flex items-center gap-1 rounded-md border border-sky-700/50 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-sky-400" aria-hidden />
+                Held
+              </span>
+            )}
             {ready ? (
               <>
                 <SignalBadge signal={signal} />
@@ -58,14 +75,21 @@ export function TickerCard({ snapshot, onRemove }: Props) {
           </div>
 
           {ready ? (
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-semibold text-white tabular-nums tracking-tight">
-                ${(snapshot.price ?? 0).toFixed(2)}
-              </span>
-              <span className={`text-sm font-medium tabular-nums ${isPositive ? "text-emerald-400" : "text-red-400"}`}>
-                {isPositive ? "+" : ""}{change.toFixed(2)}%
-              </span>
-            </div>
+            <>
+              <div className="flex items-baseline gap-2">
+                <span className="text-2xl font-semibold text-white tabular-nums tracking-tight">
+                  ${(snapshot.price ?? 0).toFixed(2)}
+                </span>
+                <span className={`text-sm font-medium tabular-nums ${isPositive ? "text-emerald-400" : "text-red-400"}`}>
+                  {isPositive ? "+" : ""}{change.toFixed(2)}%
+                </span>
+              </div>
+              {chip && (
+                <span className={`mt-2 inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium ${CHIP_TONE[chip.tone]}`}>
+                  {chip.label}
+                </span>
+              )}
+            </>
           ) : (
             <p className="text-xs text-zinc-500">Computing factor scores…</p>
           )}

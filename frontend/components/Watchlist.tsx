@@ -1,12 +1,17 @@
 "use client";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { SnapshotData } from "@/lib/types";
 import {
   fetchWatchlistSnapshot, fetchFactors, addTickerDB, removeTickerDB,
+  fetchPaperPositions,
 } from "@/lib/api";
 import { loadWatchlist, saveWatchlist } from "@/lib/watchlist";
+import { BUY_ZONE_THRESHOLD } from "@/lib/whyChip";
 import { TickerCard } from "./TickerCard";
 import { AddTickerForm } from "./AddTickerForm";
+
+type FilterMode = "all" | "buy" | "held";
+type SortMode = "score" | "az";
 
 function placeholder(ticker: string): SnapshotData {
   return {
@@ -25,6 +30,10 @@ export function Watchlist() {
   const [order, setOrder] = useState<string[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, SnapshotData>>({});
   const [refreshing, setRefreshing] = useState(false);
+  const [held, setHeld] = useState<Set<string>>(new Set());
+  const [filter, setFilter] = useState<FilterMode>("all");
+  const [sectorFilter, setSectorFilter] = useState<string>("all");
+  const [sort, setSort] = useState<SortMode>("score");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const applySnapshots = useCallback((list: SnapshotData[]) => {
@@ -86,6 +95,45 @@ export function Watchlist() {
 
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [ensurePolling]);
+
+  // Cross-reference live Alpaca positions to mark held vs watch-only cards.
+  useEffect(() => {
+    let cancelled = false;
+    fetchPaperPositions()
+      .then((d) => {
+        if (cancelled) return;
+        const set = d.available && d.positions
+          ? new Set(d.positions.map((p) => p.ticker))
+          : new Set<string>();
+        setHeld(set);
+      })
+      .catch(() => { /* held state is optional */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Sectors present across the (already-fetched) snapshots — powers the sector filter.
+  const sectors = useMemo(() => {
+    const set = new Set<string>();
+    order.forEach((t) => {
+      const sec = snapshots[t]?.factors?.sector;
+      if (sec && sec !== "Unknown") set.add(sec);
+    });
+    return [...set].sort();
+  }, [order, snapshots]);
+
+  // Client-side filtered + sorted view over the already-fetched snapshot data.
+  const view = useMemo(() => {
+    let list = order.map((t) => snapshots[t] ?? placeholder(t));
+    if (filter === "buy") list = list.filter((s) => (s.composite_score ?? -1) >= BUY_ZONE_THRESHOLD);
+    else if (filter === "held") list = list.filter((s) => held.has(s.ticker));
+    if (sectorFilter !== "all") list = list.filter((s) => s.factors?.sector === sectorFilter);
+    list = [...list].sort((a, b) =>
+      sort === "score"
+        ? (b.composite_score ?? -1) - (a.composite_score ?? -1)
+        : a.ticker.localeCompare(b.ticker)
+    );
+    return list;
+  }, [order, snapshots, filter, sectorFilter, sort, held]);
 
   function addTicker(ticker: string) {
     const updated = [...order, ticker];
@@ -163,12 +211,69 @@ export function Watchlist() {
         </div>
       )}
 
+      {order.length > 0 && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="inline-flex rounded-lg bg-zinc-800/50 p-0.5 text-xs">
+            {([
+              ["all", "All"],
+              ["buy", "Buy zone"],
+              ["held", "Held"],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setFilter(key)}
+                className={`rounded-md px-2.5 py-1 font-medium transition-colors duration-150 ease-out-quart ${
+                  filter === key ? "bg-zinc-100 text-zinc-900" : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                {label}
+                {key === "held" && held.size > 0 && (
+                  <span className="ml-1 text-[10px] opacity-70">{held.size}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {sectors.length > 0 && (
+              <select
+                value={sectorFilter}
+                onChange={(e) => setSectorFilter(e.target.value)}
+                className="rounded-lg bg-zinc-900 border border-zinc-800 px-2 py-1.5 text-xs text-zinc-300
+                  focus:outline-none focus:border-zinc-600 transition-colors duration-150 ease-out-quart"
+                aria-label="Filter by sector"
+              >
+                <option value="all">All sectors</option>
+                {sectors.map((sec) => (
+                  <option key={sec} value={sec}>{sec}</option>
+                ))}
+              </select>
+            )}
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as SortMode)}
+              className="rounded-lg bg-zinc-900 border border-zinc-800 px-2 py-1.5 text-xs text-zinc-300
+                focus:outline-none focus:border-zinc-600 transition-colors duration-150 ease-out-quart"
+              aria-label="Sort"
+            >
+              <option value="score">Sort: Score</option>
+              <option value="az">Sort: A–Z</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      {order.length > 0 && view.length === 0 && (
+        <p className="text-sm text-zinc-500 py-8 text-center">No tickers match this filter.</p>
+      )}
+
       <div className="grid gap-3 sm:grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
-        {order.map((ticker) => (
+        {view.map((snap) => (
           <TickerCard
-            key={ticker}
-            snapshot={snapshots[ticker] ?? placeholder(ticker)}
-            onRemove={() => removeTicker(ticker)}
+            key={snap.ticker}
+            snapshot={snap}
+            held={held.has(snap.ticker)}
+            onRemove={() => removeTicker(snap.ticker)}
           />
         ))}
       </div>

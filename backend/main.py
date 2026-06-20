@@ -1363,6 +1363,9 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         "atr":                 atr,
         "vol_21d":             vol_21d,
         "sentiment_score":     round(sentiment_score, 2) if sentiment_score is not None else None,
+        # Display-only: cached sector tag (same _get_sector lookup the concentration gate
+        # uses) so the watchlist can offer a sector filter. Never used in scoring.
+        "sector":              _get_sector(ticker),
     }
     with _FACTORS_LOCK:
         _FACTORS_CACHE[ticker] = (result, time.time())

@@ -92,6 +92,8 @@ export interface FactorScoreData {
   // Optional: older cached snapshots won't have them.
   vol_trend_detail?: VolTrendDetail | null;
   earnings_detail?: EarningsDetail | null;
+  // Display-only cached sector tag (for the watchlist sector filter). Not used in scoring.
+  sector?: string | null;
 }
 
 // Cached display snapshot served by /api/watchlist/snapshot — no live computation.
