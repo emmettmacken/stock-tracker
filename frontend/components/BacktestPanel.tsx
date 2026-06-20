@@ -84,6 +84,14 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
   const stratPositive = d.total_strategy_return >= 0;
   const vsBAH = d.total_strategy_return - d.total_bah_return;
 
+  // Plain-English recap built purely from numbers the backtest already returned.
+  const months = (() => {
+    const c = d.equity_curve;
+    if (c.length < 2) return null;
+    const ms = new Date(c[c.length - 1].date).getTime() - new Date(c[0].date).getTime();
+    return Math.max(1, Math.round(ms / (1000 * 60 * 60 * 24 * 30.44)));
+  })();
+
   // Normalise equity curve to 100 for display
   const chartData = d.equity_curve.map((pt, i) => ({
     i,
@@ -94,6 +102,20 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
 
   return (
     <div className="space-y-4 text-xs">
+      {/* Plain-English summary */}
+      <p className="text-sm text-zinc-300 leading-relaxed">
+        Over the past {months ?? "—"} months, this strategy would have returned{" "}
+        <span className={stratPositive ? "text-emerald-400 font-medium" : "text-red-400 font-medium"}>
+          {fmt(d.total_strategy_return)}
+        </span>{" "}
+        versus buy-and-hold&apos;s{" "}
+        <span className={d.total_bah_return >= 0 ? "text-emerald-400 font-medium" : "text-red-400 font-medium"}>
+          {fmt(d.total_bah_return)}
+        </span>
+        , with a max drawdown of{" "}
+        <span className="text-zinc-100 font-medium">{d.max_drawdown.toFixed(1)}%</span>.
+      </p>
+
       {/* Summary stats */}
       <div className="grid grid-cols-2 gap-2">
         <StatCard

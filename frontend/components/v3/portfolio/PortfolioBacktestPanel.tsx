@@ -115,6 +115,13 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
   const d = result!;
   const curve = d.equity_curve;
 
+  // Plain-English recap from numbers the backtest already returned.
+  const months = (() => {
+    if (curve.length < 2) return null;
+    const ms = new Date(curve[curve.length - 1].date).getTime() - new Date(curve[0].date).getTime();
+    return Math.max(1, Math.round(ms / (1000 * 60 * 60 * 24 * 30.44)));
+  })();
+
   // Normalise to 100 at start
   const chartData = curve.map((pt) => ({
     date: pt.date,
@@ -140,6 +147,24 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
 
   return (
     <div className="space-y-6 text-xs">
+      {/* Plain-English summary */}
+      <p className="text-sm text-zinc-300 leading-relaxed">
+        Over the past {months ?? "—"} months, this portfolio would have returned{" "}
+        <span className={d.total_return_pct >= 0 ? "text-emerald-400 font-medium" : "text-red-400 font-medium"}>
+          {fmt(d.total_return_pct)}
+        </span>
+        {d.spy_return_pct != null && (
+          <>
+            {" "}versus SPY&apos;s{" "}
+            <span className={d.spy_return_pct >= 0 ? "text-emerald-400 font-medium" : "text-red-400 font-medium"}>
+              {fmt(d.spy_return_pct)}
+            </span>
+          </>
+        )}
+        , with a max drawdown of{" "}
+        <span className="text-zinc-100 font-medium">{d.max_drawdown_pct.toFixed(1)}%</span>.
+      </p>
+
       {/* Stat cards */}
       <div className="grid grid-cols-3 gap-2">
         <StatCard
