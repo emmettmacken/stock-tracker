@@ -15,7 +15,7 @@ export function MarkovDetail({ data }: { data: SignalData }) {
   return (
     <div className="space-y-4">
       {/* Plain-English summary */}
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4 text-sm text-zinc-300 leading-relaxed">
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-4 text-sm text-zinc-300 leading-relaxed">
         {upPct != null ? (
           <p>
             Based on{" "}
@@ -39,8 +39,12 @@ export function MarkovDetail({ data }: { data: SignalData }) {
           limited sample — when it crosses 0%, the edge isn&apos;t statistically reliable.
         </p>
         {lowConfidence && (
-          <div className="mt-2 inline-flex items-center gap-1.5 text-[11px] font-medium text-amber-400 bg-amber-950/30 border border-amber-800/40 rounded px-2 py-1">
-            ⚠ Low-confidence read — only {n} observations at this state
+          <div className="mt-2 inline-flex items-center gap-1.5 text-[11px] font-medium text-amber-400 bg-amber-950/30 border border-amber-800/40 rounded-md px-2 py-1">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+              <path d="M12 9v4M12 17h.01" />
+            </svg>
+            Low-confidence read — only {n} observations at this state
           </div>
         )}
       </div>

@@ -26,25 +26,38 @@ export function StockHeader({ snapshot, refreshing, onRefresh }: Props) {
           {snapshot.hmm_regime && <RegimePill regime={snapshot.hmm_regime} />}
         </div>
         <div className="mt-2 flex items-baseline gap-2">
-          <span className="text-2xl font-semibold text-white">
+          <span className="text-2xl font-semibold text-white tabular-nums tracking-tight">
             ${(snapshot.price ?? 0).toFixed(2)}
           </span>
-          <span className={`text-sm font-medium ${isPositive ? "text-emerald-400" : "text-red-400"}`}>
+          <span className={`text-sm font-medium tabular-nums ${isPositive ? "text-emerald-400" : "text-red-400"}`}>
             {isPositive ? "+" : ""}{change.toFixed(2)}%
           </span>
         </div>
-        <div className="mt-2 flex items-center gap-3 text-xs text-zinc-500">
-          <span className="inline-flex items-center gap-1" title={`Computed at ${snapshot.computed_at}`}>
-            🕒 Updated {relativeTime(snapshot.computed_at)}
+        <div className="mt-2.5 flex items-center gap-3 text-xs text-zinc-500">
+          <span className="inline-flex items-center gap-1.5" title={`Computed at ${snapshot.computed_at}`}>
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 7v5l3 2" />
+            </svg>
+            Updated {relativeTime(snapshot.computed_at)}
           </span>
           <button
             onClick={onRefresh}
             disabled={refreshing}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md
-              bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 transition-colors"
+              bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed
+              transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
             title="Recompute this ticker now"
           >
-            <span className={refreshing ? "animate-spin inline-block" : ""}>⟳</span>
+            <svg
+              width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+              className={refreshing ? "animate-spin" : ""}
+              aria-hidden
+            >
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 3v6h-6" />
+            </svg>
             {refreshing ? "Refreshing…" : "Refresh this ticker"}
           </button>
         </div>

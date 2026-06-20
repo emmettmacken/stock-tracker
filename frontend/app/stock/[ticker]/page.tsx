@@ -22,8 +22,8 @@ function Section({
   return (
     <section className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
       <div className="mb-4">
-        <h2 className="text-sm font-semibold text-zinc-200">{title}</h2>
-        {sub && <p className="text-xs text-zinc-500 mt-0.5">{sub}</p>}
+        <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">{title}</h2>
+        {sub && <p className="text-xs text-zinc-500 mt-1 leading-relaxed max-w-prose">{sub}</p>}
       </div>
       {children}
     </section>
@@ -101,24 +101,25 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
   }
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-white">
+    <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-4xl mx-auto px-4 py-8 space-y-6">
         <Link
           href="/"
-          className="inline-flex items-center gap-1.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors"
+          className="group inline-flex items-center gap-1.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors duration-150 ease-out-quart"
         >
-          ← Back to watchlist
+          <span className="transition-transform duration-150 ease-out-quart group-hover:-translate-x-0.5">←</span>
+          Back to watchlist
         </Link>
 
         {loading ? (
-          <div className="flex items-center justify-center py-24 gap-2 text-zinc-500 text-sm">
-            <span className="inline-block w-5 h-5 border-2 border-zinc-700 border-t-zinc-300 rounded-full animate-spin" />
+          <div className="flex items-center justify-center py-24 gap-2.5 text-zinc-500 text-sm">
+            <span className="inline-block w-5 h-5 border-2 border-zinc-800 border-t-zinc-400 rounded-full animate-spin" />
             Loading {ticker}…
           </div>
         ) : error || !snapshot ? (
           <div className="py-24 text-center">
             <p className="text-red-400 text-sm mb-3">{error ?? `No data for ${ticker}.`}</p>
-            <Link href="/" className="text-zinc-400 hover:text-white text-sm underline">
+            <Link href="/" className="text-zinc-400 hover:text-white text-sm underline underline-offset-2">
               Return to watchlist
             </Link>
           </div>

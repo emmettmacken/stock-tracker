@@ -20,7 +20,7 @@ export function TransitionMatrixTable({
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-xs border-collapse">
+      <table className="w-full text-xs border-collapse tabular-nums">
         <thead>
           <tr>
             <th className="px-1.5 py-1 text-zinc-500 font-normal text-left">→</th>

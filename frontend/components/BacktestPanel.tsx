@@ -13,10 +13,10 @@ function StatCard({ label, value, sub, positive }: {
   const color = positive === undefined ? "text-zinc-100"
     : positive ? "text-emerald-400" : "text-red-400";
   return (
-    <div className="bg-zinc-800 rounded-lg p-3">
+    <div className="bg-zinc-800/50 rounded-lg p-3">
       <div className="text-zinc-500 text-xs mb-1">{label}</div>
-      <div className={`text-lg font-bold ${color}`}>{value}</div>
-      {sub && <div className="text-zinc-600 text-[10px] mt-0.5">{sub}</div>}
+      <div className={`text-lg font-bold tabular-nums ${color}`}>{value}</div>
+      {sub && <div className="text-zinc-600 text-[10px] mt-0.5 tabular-nums">{sub}</div>}
     </div>
   );
 }
@@ -51,7 +51,8 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
         </p>
         <button
           onClick={run}
-          className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 text-white text-sm font-medium rounded-lg transition-colors"
+          className="px-4 py-2 bg-zinc-100 hover:bg-white text-zinc-900 text-sm font-medium rounded-lg
+            transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
         >
           Run backtest
         </button>
@@ -131,7 +132,7 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
 
       {/* Equity curve */}
       <div>
-        <h4 className="font-semibold text-zinc-400 uppercase tracking-wide mb-2">
+        <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
           Equity Curve (base = 100)
         </h4>
         <ResponsiveContainer width="100%" height={180}>
@@ -155,7 +156,7 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
             />
             <Line
               type="monotone" dataKey="Buy & Hold"
-              stroke="#6366f1" strokeWidth={1.5} dot={false} strokeDasharray="4 2"
+              stroke="#a1a1aa" strokeWidth={1.5} dot={false} strokeDasharray="4 2"
             />
           </LineChart>
         </ResponsiveContainer>

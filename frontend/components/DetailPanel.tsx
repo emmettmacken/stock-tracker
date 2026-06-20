@@ -19,12 +19,12 @@ function EdgeStat({
 }) {
   const color = edge > 0 && ciLow > 0 ? (positive ? "text-emerald-400" : "text-red-400") : "text-zinc-400";
   return (
-    <div className="bg-zinc-800 rounded-lg p-2.5">
+    <div className="bg-zinc-800/50 rounded-lg p-2.5">
       <div className="text-zinc-500 text-xs mb-0.5">{label}</div>
-      <div className={`font-semibold text-sm ${color}`}>
+      <div className={`font-semibold text-sm tabular-nums ${color}`}>
         {edge >= 0 ? "+" : ""}{(edge * 100).toFixed(1)}%
       </div>
-      <div className="text-zinc-600 text-[10px] mt-0.5">
+      <div className="text-zinc-600 text-[10px] mt-0.5 tabular-nums">
         CI [{(ciLow * 100).toFixed(1)}%, {(ciHigh * 100).toFixed(1)}%]
       </div>
     </div>
@@ -41,13 +41,13 @@ export function DetailPanel({ data }: { data: SignalData }) {
     <div className="space-y-4 text-xs">
       {/* Stats grid */}
       <div className="grid grid-cols-2 gap-2">
-        <div className="bg-zinc-800 rounded-lg p-2.5">
+        <div className="bg-zinc-800/50 rounded-lg p-2.5">
           <div className="text-zinc-500 mb-0.5">Current State</div>
           <div className="text-zinc-100 font-semibold">{data.current_state}</div>
         </div>
-        <div className="bg-zinc-800 rounded-lg p-2.5">
+        <div className="bg-zinc-800/50 rounded-lg p-2.5">
           <div className="text-zinc-500 mb-0.5">Obs at State</div>
-          <div className={`font-semibold ${data.n_obs_current_state >= 15 ? "text-emerald-400" : "text-amber-400"}`}>
+          <div className={`font-semibold tabular-nums ${data.n_obs_current_state >= 15 ? "text-emerald-400" : "text-amber-400"}`}>
             {data.n_obs_current_state} transitions
           </div>
         </div>
@@ -69,7 +69,7 @@ export function DetailPanel({ data }: { data: SignalData }) {
 
       {/* Volume impact heatmap */}
       <div>
-        <h4 className="font-semibold text-zinc-400 uppercase tracking-wide mb-2">
+        <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
           P(Bullish Next) by State
           <span className="text-sky-400 normal-case font-normal ml-1">(● = current)</span>
         </h4>
@@ -85,7 +85,7 @@ export function DetailPanel({ data }: { data: SignalData }) {
 
       {/* Stationary distribution */}
       <div>
-        <h4 className="font-semibold text-zinc-400 uppercase tracking-wide mb-2">
+        <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
           Stationary Distribution
         </h4>
         <StationaryChart
@@ -96,7 +96,7 @@ export function DetailPanel({ data }: { data: SignalData }) {
 
       {/* 5×5 marginal transition matrix */}
       <div>
-        <h4 className="font-semibold text-zinc-400 uppercase tracking-wide mb-2">
+        <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
           Transition Matrix (return-marginal)
           <span className="text-sky-400 normal-case font-normal ml-1">(● = current row)</span>
         </h4>

@@ -62,26 +62,30 @@ function ShortSection({ ticker }: { ticker: string }) {
   return (
     <div className="space-y-2">
       {isHigh && (
-        <div className="flex items-center gap-1.5 text-amber-400 text-[10px] font-medium bg-amber-950/30 border border-amber-800/40 rounded px-2 py-1">
-          <span>⚠</span> High short interest — potential squeeze setup
+        <div className="flex items-center gap-1.5 text-amber-400 text-[10px] font-medium bg-amber-950/30 border border-amber-800/40 rounded-md px-2 py-1">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+            <path d="M12 9v4M12 17h.01" />
+          </svg>
+          High short interest — potential squeeze setup
         </div>
       )}
       <div className="grid grid-cols-3 gap-2">
-        <div className="bg-zinc-800 rounded p-2">
+        <div className="bg-zinc-800/50 rounded-lg p-2.5">
           <div className="text-zinc-500 text-[10px]">Short Float</div>
-          <div className={`font-semibold ${isHigh ? "text-amber-400" : "text-zinc-200"}`}>
+          <div className={`font-semibold tabular-nums ${isHigh ? "text-amber-400" : "text-zinc-200"}`}>
             {floatPct != null ? `${floatPct.toFixed(1)}%` : "—"}
           </div>
         </div>
-        <div className="bg-zinc-800 rounded p-2">
+        <div className="bg-zinc-800/50 rounded-lg p-2.5">
           <div className="text-zinc-500 text-[10px]">Short Ratio</div>
-          <div className="text-zinc-200 font-semibold">
+          <div className="text-zinc-200 font-semibold tabular-nums">
             {data.short_ratio != null ? data.short_ratio.toFixed(1) : "—"}
           </div>
         </div>
-        <div className="bg-zinc-800 rounded p-2">
+        <div className="bg-zinc-800/50 rounded-lg p-2.5">
           <div className="text-zinc-500 text-[10px]">Shares Short</div>
-          <div className="text-zinc-200 font-semibold text-[11px]">
+          <div className="text-zinc-200 font-semibold tabular-nums text-[11px]">
             {data.shares_short != null
               ? data.shares_short >= 1e6
                 ? `${(data.shares_short / 1e6).toFixed(1)}M`

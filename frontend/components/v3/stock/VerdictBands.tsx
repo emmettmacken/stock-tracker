@@ -22,10 +22,10 @@ export function VerdictBands({ score }: { score: number }) {
           return (
             <div
               key={b.label}
-              className={`rounded-lg border px-3 py-2 transition-colors ${
+              className={`rounded-lg border px-3 py-2 transition-[opacity,border-color,background-color] duration-200 ease-out-quart ${
                 isActive
                   ? `${b.border} ${b.bg}`
-                  : "border-zinc-800 bg-zinc-900/40 opacity-60"
+                  : "border-zinc-800 bg-zinc-900/40 opacity-55"
               }`}
             >
               <div className={`text-xs font-semibold ${isActive ? b.text : "text-zinc-400"}`}>

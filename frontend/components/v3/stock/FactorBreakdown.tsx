@@ -102,7 +102,7 @@ export function FactorBreakdown({ data }: { data: FactorScoreData }) {
               <>
                 <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
                   <div
-                    className={`h-full rounded-full transition-all duration-300 ${scoreBarColor(score)}`}
+                    className={`h-full rounded-full transition-[width] duration-500 ease-out-quart ${scoreBarColor(score)}`}
                     style={{ width: `${score}%` }}
                   />
                 </div>
