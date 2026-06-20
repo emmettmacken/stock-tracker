@@ -3031,6 +3031,232 @@ def api_signal_log(limit: int = 50):
     return db.get_signal_log(limit)
 
 
+# Ordered entry gates, matching the real evaluation order inside _run_signal_job().
+# (key → the skip_reason prefix logged when the ticker stops at that gate.)
+_DECISION_GATES: list[tuple[str, str]] = [
+    ("earnings_within_2d",      "Not within 2 days of earnings"),
+    ("data_unavailable",        "Price & factor data available"),
+    ("hmm_not_buy_transition",  "HMM regime supports buying"),
+    ("hmm_regime_uncertain",    "Smoothed regime confidence sufficient"),
+    ("score_below_threshold",   "Composite score meets threshold"),
+    ("sentiment_too_low",       "Sentiment not strongly negative"),
+    ("vix_too_high",            "Market volatility (VIX) acceptable"),
+    ("already_in_position",     "Not already holding this ticker"),
+    ("volume_below_average",    "Volume confirmation"),
+    ("overextended",            "Not overextended vs 20-day average"),
+    ("momentum_disagreement",   "Momentum agreement (3m & 12m)"),
+    ("reentry_cooldown",        "Re-entry cooldown cleared"),
+    ("sector_concentration",    "Sector concentration within cap"),
+]
+
+
+def _pct(x: Optional[float]) -> str:
+    return f"{x * 100:.0f}%" if x is not None else "—"
+
+
+def _decision_trail_detail(key: str, status: str, anchor: dict, ctx: dict) -> str:
+    """Plain-English detail string for one gate, built from the logged row values.
+
+    Read-only formatting of data already persisted in signal_log — no computation.
+    """
+    regime = anchor.get("hmm_regime")
+    bull_prob = anchor.get("smoothed_bull_prob")
+    score = anchor.get("composite_score")
+    reason = anchor.get("skip_reason") or ""
+
+    if key == "earnings_within_2d":
+        return ("Earnings within 2 trading days — entries paused"
+                if status == "failed" else "No earnings reported in the next 2 trading days")
+    if key == "data_unavailable":
+        return ("Insufficient price/factor data to evaluate"
+                if status == "failed" else "Sufficient price history and factors computed")
+    if key == "hmm_not_buy_transition":
+        regime_txt = regime or "unknown"
+        path = "Gaussian probability" if ctx.get("gaussian_pass") else "transition matrix"
+        if status == "failed":
+            return f"Regime {regime_txt} — neither the transition matrix nor Gaussian HMM (bull prob {_pct(bull_prob)}) confirmed a bull"
+        return f"Regime {regime_txt}, passed via {path} (bull prob {_pct(bull_prob)})"
+    if key == "hmm_regime_uncertain":
+        if status == "failed" and ":" in reason:
+            val = reason.split(":", 1)[1]
+            return f"Smoothed bull probability {val} below the 0.55 floor"
+        return f"Smoothed bull probability {_pct(bull_prob)} (need > 55%)"
+    if key == "score_below_threshold":
+        if status == "failed" and ":" in reason:
+            return f"Composite {reason.split(':', 1)[1]} (below threshold)"
+        thr = ctx.get("threshold")
+        score_txt = f"{score:.1f}" if score is not None else "—"
+        return f"Composite score {score_txt} ≥ threshold {thr:.0f}" if thr is not None else f"Composite score {score_txt}"
+    if key == "sentiment_too_low":
+        sent = anchor.get("sentiment_score")
+        if status == "failed" and ":" in reason:
+            return f"Sentiment {reason.split(':', 1)[1]} (below 35 floor)"
+        return f"Sentiment {sent:.0f} ≥ 35" if sent is not None else "Sentiment not strongly negative (or unavailable)"
+    if key == "vix_too_high":
+        if status == "failed" and ":" in reason:
+            return f"VIX {reason.split(':', 1)[1]} — too high to enter"
+        return "Market volatility (VIX) within acceptable range"
+    if key == "already_in_position":
+        return ("Already holding this ticker — no new entry"
+                if status == "failed" else "Not currently held")
+    if key == "volume_below_average":
+        return ("Volume below the 20-day average — not confirmed"
+                if status == "failed" else "Volume confirmed above the 20-day average")
+    if key == "overextended":
+        return ("Price extended too far above its 20-day average"
+                if status == "failed" else "Price not overextended vs the 20-day average")
+    if key == "momentum_disagreement":
+        return ("3-month and 12-month momentum disagree or are negative"
+                if status == "failed" else "3-month and 12-month momentum agree")
+    if key == "reentry_cooldown":
+        return ("Within the 5-day cooldown after a recent non-signal exit"
+                if status == "failed" else "Outside the re-entry cooldown window")
+    if key == "sector_concentration":
+        return ("Sector already at the open-position cap"
+                if status == "failed" else "Sector concentration within the cap")
+    return ""
+
+
+def _build_decision_trail(ticker: str) -> dict:
+    rows = db.get_recent_signal_rows_for_ticker(ticker, limit=25)
+    if not rows:
+        return {
+            "ticker": ticker, "evaluated": False, "evaluated_at": None,
+            "outcome": "no_data", "would_trade_today": False,
+            "summary": "This ticker has not been evaluated by the signal job yet.",
+            "gates": [], "order": None,
+        }
+
+    # Anchor on the most recent *entry-evaluation* row (ignore stop-loss 'closed' exits,
+    # which are position management, not a buy decision).
+    entry_rows = [r for r in rows if r.get("action") != "closed"]
+    if not entry_rows:
+        return {
+            "ticker": ticker, "evaluated": False, "evaluated_at": rows[0].get("timestamp"),
+            "outcome": "exit_only", "would_trade_today": False,
+            "summary": "The most recent activity was a position exit, not a buy evaluation.",
+            "gates": [], "order": None,
+        }
+
+    anchor = entry_rows[0]
+    anchor_ts = anchor.get("timestamp") or ""
+    # Rows from the same run = same ticker within ~10 min of the anchor.
+    run_rows = [anchor]
+    try:
+        anchor_dt = datetime.fromisoformat(anchor_ts)
+        for r in entry_rows[1:]:
+            try:
+                dt = datetime.fromisoformat(r.get("timestamp") or "")
+            except Exception:
+                continue
+            if abs((anchor_dt - dt).total_seconds()) <= 600:
+                run_rows.append(r)
+    except Exception:
+        pass
+
+    # Informational marker logged when the Gaussian probability (not the matrix) carried HMM.
+    gaussian_pass = any((r.get("skip_reason") or "").startswith("hmm_passed_via_gaussian") for r in run_rows)
+
+    ctx = {
+        "gaussian_pass": gaussian_pass,
+        "threshold": None,
+    }
+    try:
+        # Display context only: the thresholds the gate uses (read from config, not recomputed).
+        bull_thr = float(db.get_config("bull_threshold", "70"))
+        bear_thr = float(db.get_config("bear_threshold", "80"))
+        # Without re-running the macro check we can't know which applied; show the lower
+        # (bull) threshold as the optimistic bar a passing score cleared.
+        ctx["threshold"] = bull_thr
+        ctx["bull_threshold"] = bull_thr
+        ctx["bear_threshold"] = bear_thr
+    except Exception:
+        pass
+
+    action = anchor.get("action")
+    reason = anchor.get("skip_reason") or ""
+
+    # Find which gate the run stopped at.
+    stop_index: Optional[int] = None
+    if action == "ordered":
+        stop_index = None  # passed everything
+    else:
+        for i, (key, _label) in enumerate(_DECISION_GATES):
+            if reason.startswith(key):
+                stop_index = i
+                break
+
+    gates: list[dict] = []
+    ordered = action == "ordered"
+
+    if stop_index is None and not ordered:
+        # Unrecognised outcome (e.g. score_deterioration / order_failed). Report it plainly
+        # without fabricating gate results we can't verify from the log.
+        return {
+            "ticker": ticker, "evaluated": True, "evaluated_at": anchor_ts,
+            "outcome": "other", "would_trade_today": False,
+            "summary": f"Most recent outcome: {reason or action}.",
+            "gates": [], "order": None,
+        }
+
+    last = len(_DECISION_GATES) - 1 if ordered else stop_index
+    for i, (key, label) in enumerate(_DECISION_GATES):
+        if i > last:
+            break
+        status = "failed" if (not ordered and i == stop_index) else "passed"
+        gates.append({
+            "key": key, "label": label, "status": status,
+            "detail": _decision_trail_detail(key, status, anchor, ctx),
+        })
+
+    order = None
+    summary = ""
+    would_trade = False
+    if ordered:
+        price = anchor.get("price_at_signal")
+        order = {
+            "price": price,
+            "kelly_fraction": anchor.get("kelly_fraction"),
+            "sizing_method": anchor.get("sizing_method"),
+        }
+        gates.append({
+            "key": "ordered", "label": "Order placed", "status": "ordered",
+            "detail": (f"Buy order submitted at ${price:.2f}"
+                       + (f" · sizing: {anchor.get('sizing_method')}" if anchor.get("sizing_method") else "")
+                       if price is not None else "Buy order submitted"),
+        })
+        would_trade = True
+        summary = "All gates passed — an order was placed."
+    else:
+        failed_label = _DECISION_GATES[stop_index][1]
+        failed_detail = gates[-1]["detail"] if gates else ""
+        if reason.startswith("already_in_position"):
+            summary = "Already holding this ticker — no new entry today."
+        else:
+            summary = failed_detail or f"Stopped at: {failed_label}."
+
+    return {
+        "ticker": ticker,
+        "evaluated": True,
+        "evaluated_at": anchor_ts,
+        "outcome": "ordered" if ordered else "skipped",
+        "would_trade_today": would_trade,
+        "summary": summary,
+        "gates": gates,
+        "order": order,
+    }
+
+
+@app.get("/api/decision-trail/{ticker}")
+def api_decision_trail(ticker: str):
+    """Read-only reconstruction of the most recent gate-by-gate evaluation for a ticker.
+
+    Reads the latest signal_log rows (already written by _run_signal_job) and formats
+    them as an ordered pass/fail trail. No scoring, gating or trading logic runs here.
+    """
+    return _build_decision_trail(ticker.upper())
+
+
 @app.post("/api/paper/run-now")
 def api_run_now():
     """Trigger the signal job immediately in a background thread."""

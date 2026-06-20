@@ -108,6 +108,30 @@ export interface SnapshotData {
   factors: FactorScoreData | null;
 }
 
+export interface DecisionGate {
+  key: string;
+  label: string;
+  status: "passed" | "failed" | "ordered";
+  detail: string;
+}
+
+export interface DecisionTrailOrder {
+  price: number | null;
+  kelly_fraction: number | null;
+  sizing_method: string | null;
+}
+
+export interface DecisionTrail {
+  ticker: string;
+  evaluated: boolean;
+  evaluated_at: string | null;
+  outcome: "ordered" | "skipped" | "no_data" | "exit_only" | "other";
+  would_trade_today: boolean;
+  summary: string;
+  gates: DecisionGate[];
+  order: DecisionTrailOrder | null;
+}
+
 export type SentimentDirection = "bullish" | "neutral" | "bearish";
 
 export interface SentimentData {

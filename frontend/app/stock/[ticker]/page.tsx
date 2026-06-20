@@ -1,14 +1,15 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { SnapshotData, SignalData } from "@/lib/types";
-import { fetchWatchlistSnapshot, refreshTicker, fetchSignal } from "@/lib/api";
+import { SnapshotData, SignalData, DecisionTrail } from "@/lib/types";
+import { fetchWatchlistSnapshot, refreshTicker, fetchSignal, fetchDecisionTrail } from "@/lib/api";
 import { StockHeader } from "@/components/v3/stock/StockHeader";
 import { VerdictBands } from "@/components/v3/stock/VerdictBands";
 import { FactorBreakdown } from "@/components/v3/stock/FactorBreakdown";
 import { MarkovDetail } from "@/components/v3/stock/MarkovDetail";
 import { AltDataTab } from "@/components/v3/AltDataTab";
 import { BacktestPanel } from "@/components/BacktestPanel";
+import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
 
 function Section({
   title,
@@ -41,6 +42,8 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
   const [signalData, setSignalData] = useState<SignalData | null>(null);
   const [signalLoading, setSignalLoading] = useState(true);
   const [signalError, setSignalError] = useState<string | null>(null);
+
+  const [trail, setTrail] = useState<DecisionTrail | null>(null);
 
   const loadSignal = useCallback(() => {
     setSignalLoading(true);
@@ -87,6 +90,15 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
     loadSignal();
   }, [loadSignal]);
 
+  // Read-only decision trail (most recent gate-by-gate evaluation from signal_log).
+  useEffect(() => {
+    let cancelled = false;
+    fetchDecisionTrail(ticker)
+      .then((d) => { if (!cancelled) setTrail(d); })
+      .catch(() => { if (!cancelled) setTrail(null); });
+    return () => { cancelled = true; };
+  }, [ticker]);
+
   async function handleRefresh() {
     setRefreshing(true);
     try {
@@ -131,7 +143,16 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
           <>
             <StockHeader snapshot={snapshot} refreshing={refreshing} onRefresh={handleRefresh} />
 
+            <EligibilityBanner trail={trail} />
+
             <VerdictBands score={snapshot.composite_score ?? 0} />
+
+            <Section
+              title="Decision trail"
+              sub="How this ticker fared against each gate in the most recent signal-job run, in the order they're actually checked. The list stops at the first gate it failed."
+            >
+              <DecisionTrailList trail={trail} />
+            </Section>
 
             <Section
               title="Factor breakdown"

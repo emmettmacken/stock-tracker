@@ -3,7 +3,7 @@ import {
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
-  AnalyticsData, SnapshotData,
+  AnalyticsData, SnapshotData, DecisionTrail,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -175,5 +175,11 @@ export async function triggerSignalJob(): Promise<{ status: string; message: str
 export async function fetchAnalytics(): Promise<AnalyticsData> {
   const res = await fetch(`${BASE}/api/analytics`);
   if (!res.ok) throw new Error("Failed to fetch analytics");
+  return res.json();
+}
+
+export async function fetchDecisionTrail(ticker: string): Promise<DecisionTrail> {
+  const res = await fetch(`${BASE}/api/decision-trail/${ticker}`);
+  if (!res.ok) throw new Error(`Failed to fetch decision trail for ${ticker}`);
   return res.json();
 }

@@ -287,6 +287,22 @@ def update_trailing_stop(signal_id: int, new_stop: float) -> None:
         )
 
 
+def get_recent_signal_rows_for_ticker(ticker: str, limit: int = 25) -> list[dict]:
+    """Most-recent signal_log rows for one ticker (newest first).
+
+    Read-only — used by the decision-trail endpoint to reconstruct the gate-by-gate
+    evaluation of the most recent signal-job run. No computation, just a lookup.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM signal_log
+               WHERE ticker = ?
+               ORDER BY timestamp DESC LIMIT ?""",
+            (ticker.upper(), limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_last_buy_signal(ticker: str) -> Optional[dict]:
     with _conn() as conn:
         row = conn.execute(
