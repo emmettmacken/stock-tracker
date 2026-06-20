@@ -22,6 +22,7 @@ export function Nav() {
         <div className="flex gap-1 flex-1">
           {([
             ["/", "Watchlist"],
+            ["/briefing", "Briefing"],
             ["/portfolio", "Portfolio"],
             ["/automation", "Automation"],
           ] as const).map(([href, label]) => {

@@ -3,7 +3,7 @@ import {
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
-  AnalyticsData, SnapshotData, DecisionTrail, PriceHistory,
+  AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -181,6 +181,12 @@ export async function fetchAnalytics(): Promise<AnalyticsData> {
 export async function fetchDecisionTrail(ticker: string): Promise<DecisionTrail> {
   const res = await fetch(`${BASE}/api/decision-trail/${ticker}`);
   if (!res.ok) throw new Error(`Failed to fetch decision trail for ${ticker}`);
+  return res.json();
+}
+
+export async function fetchBriefing(): Promise<Briefing> {
+  const res = await fetch(`${BASE}/api/briefing`);
+  if (!res.ok) throw new Error("Failed to fetch briefing");
   return res.json();
 }
 

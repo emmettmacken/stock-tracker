@@ -3273,6 +3273,138 @@ def _build_decision_trail(ticker: str) -> dict:
     }
 
 
+_SKIP_LABELS: dict[str, str] = {
+    "earnings_within_2d":     "Earnings within 2 days",
+    "data_unavailable":       "Data unavailable",
+    "hmm_not_buy_transition": "HMM regime not bullish",
+    "hmm_regime_uncertain":   "Regime confidence too low",
+    "score_below_threshold":  "Score below threshold",
+    "sentiment_too_low":      "Sentiment too negative",
+    "vix_too_high":           "VIX too high",
+    "already_in_position":    "Already held",
+    "volume_below_average":   "Volume not confirmed",
+    "overextended":           "Overextended",
+    "momentum_disagreement":  "Momentum disagreement",
+    "reentry_cooldown":       "Re-entry cooldown",
+    "sector_concentration":   "Sector at concentration cap",
+    "order_failed":           "Order submission failed",
+    "close_failed":           "Position close failed",
+}
+
+
+def _skip_key(reason: Optional[str]) -> str:
+    if not reason:
+        return "other"
+    return reason.split(":", 1)[0]
+
+
+def _build_briefing() -> dict:
+    rows = db.get_latest_run_rows()
+    if not rows:
+        return {
+            "available": False,
+            "run_at": None,
+            "summary_data": {},
+            "evaluated_count": 0,
+            "orders": [], "skip_breakdown": [], "near_misses": [],
+            "macro_flags": [], "positions_closed": 0,
+            "account": {"available": False},
+        }
+
+    eval_rows = [r for r in rows if r.get("action") != "closed"]
+    closed_rows = [r for r in rows if r.get("action") == "closed"]
+    run_at = max((r.get("timestamp") or "") for r in eval_rows) if eval_rows else (rows[-1].get("timestamp"))
+
+    evaluated = sorted({r["ticker"] for r in eval_rows})
+
+    orders = [
+        {
+            "ticker": r["ticker"],
+            "price": r.get("price_at_signal"),
+            "score": r.get("composite_score"),
+            "sizing_method": r.get("sizing_method"),
+        }
+        for r in eval_rows if r.get("action") == "ordered"
+    ]
+
+    # Skip reason counts (one entry per skipped ticker; informational pass-markers excluded).
+    skip_counts: dict[str, int] = {}
+    for r in eval_rows:
+        if r.get("action") != "skipped":
+            continue
+        key = _skip_key(r.get("skip_reason"))
+        if key == "hmm_passed_via_gaussian":
+            continue
+        skip_counts[key] = skip_counts.get(key, 0) + 1
+    skip_breakdown = sorted(
+        ({"key": k, "label": _SKIP_LABELS.get(k, k.replace("_", " ").title()), "count": v}
+         for k, v in skip_counts.items()),
+        key=lambda x: x["count"], reverse=True,
+    )
+
+    # Near-misses: score-gated tickers within 5 points of the threshold (parsed from the
+    # value the gate already logged — no recomputation).
+    near_misses = []
+    for r in eval_rows:
+        reason = r.get("skip_reason") or ""
+        if not reason.startswith("score_below_threshold:"):
+            continue
+        try:
+            payload = reason.split(":", 1)[1]
+            eff_s, thr_s = payload.split("<")
+            eff, thr = float(eff_s), float(thr_s)
+            gap = thr - eff
+            if 0 <= gap <= 5:
+                near_misses.append({
+                    "ticker": r["ticker"], "score": round(eff, 1),
+                    "threshold": round(thr, 0), "gap": round(gap, 1),
+                })
+        except Exception:
+            continue
+    near_misses.sort(key=lambda x: x["gap"])
+
+    macro_flags = []
+    if any(_skip_key(r.get("skip_reason")) == "vix_too_high" for r in eval_rows):
+        macro_flags.append("Volatility circuit breaker active — VIX above threshold, entries paused")
+
+    account = {"available": False}
+    if _alpaca_client is not None:
+        try:
+            acc = _alpaca_client.get_account()
+            equity = round(float(acc.equity), 2)
+            account = {"available": True, "equity": equity}
+            last_equity = getattr(acc, "last_equity", None)
+            if last_equity is not None:
+                le = float(last_equity)
+                if le:
+                    account["equity_change_pct"] = round((equity - le) / le * 100, 2)
+        except Exception as e:
+            account = {"available": False, "error": str(e)}
+
+    return {
+        "available": True,
+        "run_at": run_at,
+        "evaluated_count": len(evaluated),
+        "evaluated_tickers": evaluated,
+        "orders": orders,
+        "skip_breakdown": skip_breakdown,
+        "near_misses": near_misses,
+        "macro_flags": macro_flags,
+        "positions_closed": len(closed_rows),
+        "account": account,
+    }
+
+
+@app.get("/api/briefing")
+def api_briefing():
+    """Read-only aggregation of the most recent signal-job run into a daily briefing.
+
+    Counts skip reasons, lists placed orders and near-miss tickers, and reads account
+    equity — all from already-logged signal_log rows / Alpaca. No scoring or signals run.
+    """
+    return _build_briefing()
+
+
 @app.get("/api/decision-trail/{ticker}")
 def api_decision_trail(ticker: str):
     """Read-only reconstruction of the most recent gate-by-gate evaluation for a ticker.

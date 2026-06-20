@@ -108,6 +108,46 @@ export interface SnapshotData {
   factors: FactorScoreData | null;
 }
 
+export interface BriefingOrder {
+  ticker: string;
+  price: number | null;
+  score: number | null;
+  sizing_method: string | null;
+}
+
+export interface BriefingSkip {
+  key: string;
+  label: string;
+  count: number;
+}
+
+export interface BriefingNearMiss {
+  ticker: string;
+  score: number;
+  threshold: number;
+  gap: number;
+}
+
+export interface BriefingAccount {
+  available: boolean;
+  equity?: number;
+  equity_change_pct?: number;
+  error?: string;
+}
+
+export interface Briefing {
+  available: boolean;
+  run_at: string | null;
+  evaluated_count: number;
+  evaluated_tickers?: string[];
+  orders: BriefingOrder[];
+  skip_breakdown: BriefingSkip[];
+  near_misses: BriefingNearMiss[];
+  macro_flags: string[];
+  positions_closed: number;
+  account: BriefingAccount;
+}
+
 export interface PricePoint {
   date: string;
   close: number;

@@ -287,6 +287,23 @@ def update_trailing_stop(signal_id: int, new_stop: float) -> None:
         )
 
 
+def get_latest_run_rows() -> list[dict]:
+    """All signal_log rows from the most recent signal-job run (same calendar day as
+    the latest non-exit row). Read-only; used by the briefing aggregation."""
+    with _conn() as conn:
+        anchor = conn.execute(
+            "SELECT MAX(timestamp) AS m FROM signal_log WHERE action != 'closed'"
+        ).fetchone()
+        if not anchor or not anchor["m"]:
+            return []
+        day = anchor["m"][:10]
+        rows = conn.execute(
+            "SELECT * FROM signal_log WHERE substr(timestamp,1,10) = ? ORDER BY timestamp",
+            (day,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_recent_signal_rows_for_ticker(ticker: str, limit: int = 25) -> list[dict]:
     """Most-recent signal_log rows for one ticker (newest first).
 
