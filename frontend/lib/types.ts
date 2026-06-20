@@ -108,6 +108,18 @@ export interface SnapshotData {
   factors: FactorScoreData | null;
 }
 
+export interface PricePoint {
+  date: string;
+  close: number;
+  volume: number;
+}
+
+export interface PriceHistory {
+  ticker: string;
+  days: number;
+  points: PricePoint[];
+}
+
 export interface DecisionGate {
   key: string;
   label: string;

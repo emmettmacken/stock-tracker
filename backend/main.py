@@ -534,6 +534,32 @@ def get_quote(ticker: str):
         "change_pct": round((cur - prev) / prev * 100, 4),
     }
 
+# ── /api/price-history ────────────────────────────────────────────────────────
+
+@app.get("/api/price-history/{ticker}")
+def get_price_history(ticker: str, days: int = 760):
+    """Historical closing price + volume for charting.
+
+    Read-only: returns the same OHLCV bars already fetched for factor computation,
+    projected to date/close/volume arrays. No scores, signals or MAs are computed here
+    (moving-average overlays are drawn client-side from these closes for display only).
+    """
+    ticker = ticker.upper()
+    days = max(10, min(int(days), 1100))
+    df = fetch_ohlcv(ticker, days=days, min_bars=2)
+    idx = df.index
+    closes = df["Close"].values
+    vols = df["Volume"].values
+    points = [
+        {
+            "date": idx[i].strftime("%Y-%m-%d"),
+            "close": round(float(closes[i]), 4),
+            "volume": int(vols[i]) if not np.isnan(vols[i]) else 0,
+        }
+        for i in range(len(df))
+    ]
+    return {"ticker": ticker, "days": days, "points": points}
+
 # ── /api/signal ───────────────────────────────────────────────────────────────
 
 @app.get("/api/signal/{ticker}")

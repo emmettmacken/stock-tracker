@@ -11,6 +11,7 @@ import { AltDataTab } from "@/components/v3/AltDataTab";
 import { BacktestPanel } from "@/components/BacktestPanel";
 import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
 import { PositionBanner } from "@/components/v3/stock/PositionBanner";
+import { PriceChart } from "@/components/v3/stock/PriceChart";
 
 function Section({
   title,
@@ -155,6 +156,13 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
               sub="How this ticker fared against each gate in the most recent signal-job run, in the order they're actually checked. The list stops at the first gate it failed."
             >
               <DecisionTrailList trail={trail} />
+            </Section>
+
+            <Section
+              title="Price history"
+              sub="Historical closing price. Toggle moving averages and time ranges; entry/exit markers show where the system has traded this ticker."
+            >
+              <PriceChart ticker={ticker} />
             </Section>
 
             <Section
