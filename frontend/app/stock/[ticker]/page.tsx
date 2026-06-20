@@ -10,6 +10,7 @@ import { MarkovDetail } from "@/components/v3/stock/MarkovDetail";
 import { AltDataTab } from "@/components/v3/AltDataTab";
 import { BacktestPanel } from "@/components/BacktestPanel";
 import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
+import { PositionBanner } from "@/components/v3/stock/PositionBanner";
 
 function Section({
   title,
@@ -142,6 +143,8 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
         ) : (
           <>
             <StockHeader snapshot={snapshot} refreshing={refreshing} onRefresh={handleRefresh} />
+
+            <PositionBanner ticker={ticker} />
 
             <EligibilityBanner trail={trail} />
 
