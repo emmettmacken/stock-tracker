@@ -36,7 +36,7 @@ function ChartSkeleton() {
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
-  return <h3 className="text-xs font-semibold text-zinc-400 mb-3 uppercase tracking-wide">{children}</h3>;
+  return <h3 className="text-xs font-semibold text-zinc-400 mb-3 uppercase tracking-wider">{children}</h3>;
 }
 
 type SortKey = "win_rate" | "avg_return" | "total_trades";
@@ -81,7 +81,7 @@ function TickerTable({ rows }: { rows: AnalyticsTickerPerf[] }) {
             {cols.map((c) => (
               <th
                 key={c.key}
-                className="py-2 pr-4 text-zinc-500 font-medium cursor-pointer hover:text-zinc-300 select-none whitespace-nowrap"
+                className="py-2 pr-4 text-zinc-500 font-medium cursor-pointer hover:text-zinc-300 select-none whitespace-nowrap transition-colors duration-150 ease-out-quart"
                 onClick={() => handleSort(c.key)}
               >
                 {c.label} {sortKey === c.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
@@ -91,7 +91,7 @@ function TickerTable({ rows }: { rows: AnalyticsTickerPerf[] }) {
         </thead>
         <tbody>
           {sorted.map((r) => (
-            <tr key={r.ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+            <tr key={r.ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors duration-150 ease-out-quart">
               <td className="py-2.5 pr-4 font-bold text-zinc-200">{r.ticker}</td>
               <td className={`py-2.5 pr-4 tabular-nums font-semibold ${rowColor(r.win_rate)}`}>
                 {(r.win_rate * 100).toFixed(0)}%
@@ -151,7 +151,8 @@ export function AnalyticsTab() {
         <button
           onClick={load}
           disabled={loading}
-          className="px-3 py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 rounded-lg transition-colors"
+          className="px-3 py-1.5 text-xs text-zinc-200 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 rounded-lg
+            transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
         >
           {loading ? "Loading…" : "Refresh"}
         </button>

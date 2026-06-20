@@ -18,8 +18,8 @@ type Tab = (typeof TABS)[number];
 function SectionHeader({ title, sub }: { title: string; sub?: string }) {
   return (
     <div className="mb-4">
-      <h2 className="text-sm font-semibold text-zinc-300">{title}</h2>
-      {sub && <p className="text-xs text-zinc-600 mt-0.5">{sub}</p>}
+      <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">{title}</h2>
+      {sub && <p className="text-xs text-zinc-500 mt-1 leading-relaxed">{sub}</p>}
     </div>
   );
 }
@@ -31,10 +31,11 @@ function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void 
         <button
           key={t}
           onClick={() => onChange(t)}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
+          aria-current={active === t ? "page" : undefined}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-[color,border-color] duration-150 ease-out-quart ${
             active === t
-              ? "border-zinc-300 text-zinc-100"
-              : "border-transparent text-zinc-500 hover:text-zinc-300"
+              ? "border-zinc-100 text-zinc-100"
+              : "border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-700"
           }`}
         >
           {t}
@@ -118,12 +119,12 @@ export default function AutomationPage() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-white">
-      <div className="max-w-5xl mx-auto px-4 py-8 space-y-6">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100">
+      <div className="max-w-5xl mx-auto px-4 py-8 sm:py-10 space-y-6">
         <header className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">Automation</h1>
-            <p className="mt-1 text-zinc-400 text-sm">
+            <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">Automation</h1>
+            <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
               Paper trading runs daily at 15:45 ET · stop-loss check at 09:35 ET
             </p>
           </div>
@@ -131,11 +132,12 @@ export default function AutomationPage() {
             <button
               onClick={handleRunNow}
               disabled={running}
-              className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap"
+              className="px-4 py-2 bg-zinc-100 hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed text-zinc-900 text-sm font-medium rounded-lg whitespace-nowrap
+                transition-[background-color,transform] duration-150 ease-out-quart active:scale-[0.98]"
             >
               {running ? (
                 <span className="flex items-center gap-2">
-                  <span className="inline-block w-3.5 h-3.5 border-2 border-zinc-500 border-t-zinc-200 rounded-full animate-spin" />
+                  <span className="inline-block w-3.5 h-3.5 border-2 border-zinc-400 border-t-zinc-900 rounded-full animate-spin" />
                   Running…
                 </span>
               ) : "Run signals now"}

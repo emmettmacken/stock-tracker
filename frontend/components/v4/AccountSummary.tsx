@@ -4,8 +4,8 @@ import { PaperAccount } from "@/lib/types";
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
     <div className="flex flex-col">
-      <span className="text-[10px] text-zinc-500 uppercase tracking-widest">{label}</span>
-      <span className="text-lg font-bold text-zinc-100 tabular-nums">{value}</span>
+      <span className="text-[10px] text-zinc-500 uppercase tracking-wider">{label}</span>
+      <span className="text-lg font-bold text-zinc-100 tabular-nums tracking-tight">{value}</span>
       {sub && <span className="text-[10px] text-zinc-600">{sub}</span>}
     </div>
   );
@@ -42,9 +42,12 @@ export function AccountSummary({ data, lastUpdated }: Props) {
       <Stat label="Cash" value={`$${fmt(data.cash ?? 0)}`} />
       <Stat label="Buying Power" value={`$${fmt(data.buying_power ?? 0)}`} />
       <Stat label="Open Positions" value={String(data.positions_count ?? 0)} />
-      <div className="ml-auto text-[10px] text-zinc-700 self-end">
-        {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : ""}
-        <span className="ml-2 text-zinc-600">· auto-refreshes every 60s</span>
+      <div className="ml-auto self-end inline-flex items-center gap-1.5 text-[10px] text-zinc-600">
+        <span className="relative inline-flex h-1.5 w-1.5">
+          <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-500/60 motion-safe:animate-ping" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        </span>
+        {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()} · ` : ""}auto-refreshes every 60s
       </div>
     </div>
   );

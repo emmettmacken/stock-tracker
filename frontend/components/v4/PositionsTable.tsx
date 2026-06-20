@@ -52,7 +52,7 @@ export function PositionsTable({ data, loading, lastUpdated }: Props) {
               const stopPrice  = p.trailing_stop ?? p.atr_stop;
               const atRisk     = stopPrice != null && p.current_price < stopPrice * 1.05;
               return (
-                <tr key={p.ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+                <tr key={p.ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors duration-150 ease-out-quart">
                   <td className="py-2.5 pr-4 font-bold text-zinc-200">{p.ticker}</td>
                   <td className="py-2.5 pr-4 tabular-nums text-zinc-400">${fmt(p.entry_price)}</td>
                   <td className="py-2.5 pr-4 tabular-nums text-zinc-200">${fmt(p.current_price)}</td>

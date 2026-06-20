@@ -6,7 +6,7 @@ import { Skeleton } from "@/components/v3/Skeleton";
 function ActionPill({ action }: { action: string }) {
   const styles: Record<string, string> = {
     ordered: "bg-emerald-900/50 text-emerald-300 border-emerald-700/40",
-    closed:  "bg-indigo-900/50 text-indigo-300 border-indigo-700/40",
+    closed:  "bg-sky-900/50 text-sky-300 border-sky-700/40",
     skipped: "bg-zinc-800 text-zinc-500 border-zinc-700/40",
   };
   const cls = styles[action] ?? styles.skipped;
@@ -85,7 +85,8 @@ export function SignalLogFeed({ entries, loading, error, onRetry }: Props) {
       {entries.map((e) => (
         <div
           key={e.id}
-          className="flex items-start gap-3 bg-zinc-900 border border-zinc-800/60 rounded-lg px-3 py-2.5 text-xs"
+          className="flex items-start gap-3 bg-zinc-900 border border-zinc-800/60 rounded-lg px-3 py-2.5 text-xs
+            hover:border-zinc-700/80 transition-colors duration-150 ease-out-quart"
         >
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">

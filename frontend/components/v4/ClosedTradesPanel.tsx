@@ -12,11 +12,11 @@ const EXIT_LABELS: Record<string, string> = {
 
 function ExitBadge({ reason }: { reason: string }) {
   const styles: Record<string, string> = {
-    sell_signal:               "text-indigo-300 bg-indigo-900/40 border-indigo-700/40",
+    sell_signal:               "text-sky-300 bg-sky-900/40 border-sky-700/40",
     stop_loss:                 "text-red-300 bg-red-900/40 border-red-700/40",
     max_hold_exit:             "text-amber-300 bg-amber-900/40 border-amber-700/40",
     score_deterioration:       "text-orange-300 bg-orange-900/40 border-orange-700/40",
-    macro_drawdown_protection: "text-purple-300 bg-purple-900/40 border-purple-700/40",
+    macro_drawdown_protection: "text-zinc-300 bg-zinc-800 border-zinc-700",
   };
   return (
     <span className={`inline-flex px-1.5 py-0.5 rounded border text-[10px] font-medium ${styles[reason] ?? "text-zinc-400 bg-zinc-800 border-zinc-700"}`}>
@@ -28,7 +28,7 @@ function ExitBadge({ reason }: { reason: string }) {
 function StatChip({ label, value, positive }: { label: string; value: string; positive?: boolean }) {
   const color = positive === undefined ? "text-zinc-200" : positive ? "text-emerald-400" : "text-red-400";
   return (
-    <div className="bg-zinc-800 rounded-lg px-3 py-2 text-center">
+    <div className="bg-zinc-800/50 rounded-lg px-3 py-2 text-center">
       <div className="text-zinc-500 text-[10px] mb-0.5">{label}</div>
       <div className={`text-sm font-bold tabular-nums ${color}`}>{value}</div>
     </div>
@@ -89,7 +89,7 @@ export function ClosedTradesPanel({ trades, loading, error, onRetry }: Props) {
           </thead>
           <tbody>
             {trades.map((t) => (
-              <tr key={t.id} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+              <tr key={t.id} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors duration-150 ease-out-quart">
                 <td className="py-2.5 pr-4 font-bold text-zinc-200">{t.ticker}</td>
                 <td className="py-2.5 pr-4 tabular-nums text-zinc-400">{fmtDate(t.entry_timestamp)}</td>
                 <td className="py-2.5 pr-4 tabular-nums text-zinc-400">{fmtDate(t.exit_timestamp)}</td>
