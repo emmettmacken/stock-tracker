@@ -1323,6 +1323,23 @@ def _get_company_info(ticker: str) -> dict:
             "dividend_yield":     raw.get("dividendYield"),
             "fifty_two_week_high": raw.get("fiftyTwoWeekHigh"),
             "fifty_two_week_low":  raw.get("fiftyTwoWeekLow"),
+            # Financials panel (stock detail page). All from this same .info fetch — no
+            # extra yfinance call. Verified to populate reliably across a diverse ticker
+            # set; individual nulls are hidden client-side.
+            "peg_ratio":          raw.get("pegRatio"),
+            "price_to_sales":     raw.get("priceToSalesTrailing12Months"),
+            "price_to_book":      raw.get("priceToBook"),
+            "ev_to_ebitda":       raw.get("enterpriseToEbitda"),
+            "profit_margin":      raw.get("profitMargins"),
+            "operating_margin":   raw.get("operatingMargins"),
+            "return_on_equity":   raw.get("returnOnEquity"),
+            "revenue_growth":     raw.get("revenueGrowth"),
+            "debt_to_equity":     raw.get("debtToEquity"),
+            "current_ratio":      raw.get("currentRatio"),
+            "free_cash_flow":     raw.get("freeCashflow"),
+            "beta":               raw.get("beta"),
+            "average_volume":     raw.get("averageVolume"),
+            "payout_ratio":       raw.get("payoutRatio"),
         }
         try:
             earnings = _extract_earnings_quarters(tk.earnings_history, n=4)
@@ -1333,7 +1350,12 @@ def _get_company_info(ticker: str) -> dict:
         info = {"ticker": ticker, "name": None, "sector": "Unknown", "industry": None,
                 "summary": None, "market_cap": None, "trailing_pe": None,
                 "forward_pe": None, "dividend_yield": None,
-                "fifty_two_week_high": None, "fifty_two_week_low": None}
+                "fifty_two_week_high": None, "fifty_two_week_low": None,
+                "peg_ratio": None, "price_to_sales": None, "price_to_book": None,
+                "ev_to_ebitda": None, "profit_margin": None, "operating_margin": None,
+                "return_on_equity": None, "revenue_growth": None, "debt_to_equity": None,
+                "current_ratio": None, "free_cash_flow": None, "beta": None,
+                "average_volume": None, "payout_ratio": None}
 
     info["earnings"] = earnings
     info = _sanitize_json(info)

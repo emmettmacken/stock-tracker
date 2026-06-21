@@ -12,6 +12,7 @@ import { BacktestPanel } from "@/components/BacktestPanel";
 import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
 import { PositionBanner } from "@/components/v3/stock/PositionBanner";
 import { CompanyInfo } from "@/components/v3/stock/CompanyInfo";
+import { Financials } from "@/components/v3/stock/Financials";
 import { PriceChart } from "@/components/v3/stock/PriceChart";
 import { TickerAnalytics } from "@/components/v3/stock/TickerAnalytics";
 import { Period, DEFAULT_PERIOD } from "@/lib/period";
@@ -163,6 +164,9 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
             {/* Company info — renders directly after the position banner when held,
                 or directly after the price graph when not (PositionBanner is null). */}
             <CompanyInfo ticker={ticker} />
+
+            {/* Financials — collapsible, directly beneath Company Info. */}
+            <Financials ticker={ticker} />
 
             <EligibilityBanner trail={trail} />
 

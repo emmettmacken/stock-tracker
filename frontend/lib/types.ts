@@ -119,6 +119,22 @@ export interface CompanyInfo {
   dividend_yield: number | null;
   fifty_two_week_high: number | null;
   fifty_two_week_low: number | null;
+  // Financials panel — all optional/nullable; yfinance can omit any of them per ticker,
+  // and older cached snapshots predate these fields entirely.
+  peg_ratio?: number | null;
+  price_to_sales?: number | null;
+  price_to_book?: number | null;
+  ev_to_ebitda?: number | null;
+  profit_margin?: number | null;
+  operating_margin?: number | null;
+  return_on_equity?: number | null;
+  revenue_growth?: number | null;
+  debt_to_equity?: number | null;
+  current_ratio?: number | null;
+  free_cash_flow?: number | null;
+  beta?: number | null;
+  average_volume?: number | null;
+  payout_ratio?: number | null;
   earnings: EarningsQuarter[];
 }
 
