@@ -50,8 +50,8 @@ export function EfficientFrontierChart({ points }: Props) {
 
   return (
     <div>
-      <ResponsiveContainer width="100%" height={290}>
-        <ScatterChart margin={{ top: 10, right: 10, bottom: 36, left: 10 }}>
+      <ResponsiveContainer width="100%" height={300}>
+        <ScatterChart margin={{ top: 10, right: 10, bottom: 48, left: 10 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
           <XAxis
             type="number"
@@ -76,7 +76,7 @@ export function EfficientFrontierChart({ points }: Props) {
           <Tooltip content={<CustomTooltip />} cursor={{ strokeDasharray: "3 3" }} />
           <Legend
             verticalAlign="bottom"
-            wrapperStyle={{ fontSize: 10, paddingTop: 12 }}
+            wrapperStyle={{ fontSize: 10, paddingTop: 28 }}
           />
           <Scatter
             name="Monte Carlo"
