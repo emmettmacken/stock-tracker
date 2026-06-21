@@ -2733,6 +2733,7 @@ def _run_signal_job() -> None:
                 "hmm_regime": hmm_regime, "sentiment": sentiment,
                 "smoothed_bull_prob": smoothed_bull_prob,
                 "hmm_fit_failed": hmm_fit_failed, "sector": sector,
+                "equity": equity,
             })
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
@@ -2801,6 +2802,9 @@ def _run_signal_job() -> None:
                 smoothed_bull_prob=c["smoothed_bull_prob"],
                 kelly_fraction=c["kelly_frac"], sizing_method=c["sizing_method"],
                 hmm_fit_failed=c["hmm_fit_failed"],
+                # c["dollars"] is the actual amount risked (post-normalization + cap/floor);
+                # c["equity"] is the account equity used to size it.
+                entry_dollars=round(c["dollars"], 2), equity_at_entry=round(c["equity"], 2),
             )
             if atr > 0:
                 db.update_trailing_stop(signal_id, price - 1.5 * atr)

@@ -108,6 +108,11 @@ def _run_migrations() -> None:
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN sizing_method TEXT"),
         # Fix 2-D: flag when the HMM fit/predict failed (bull_prob=0.5 was a fallback, not neutral)
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN hmm_fit_failed INTEGER"),
+        # Persist real position sizing on the ordered row, so future trades have a
+        # trustworthy basis for dollar P&L. Nullable: historical rows stay NULL (we
+        # never captured this and must not fake it).
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN entry_dollars REAL"),
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN equity_at_entry REAL"),
     ]
     with _conn() as conn:
         for _, sql in new_columns:
@@ -242,6 +247,8 @@ def log_signal(
     kelly_fraction: Optional[float] = None,
     sizing_method: Optional[str] = None,
     hmm_fit_failed: Optional[bool] = None,
+    entry_dollars: Optional[float] = None,
+    equity_at_entry: Optional[float] = None,
 ) -> int:
     with _conn() as conn:
         cur = conn.execute(
@@ -249,8 +256,9 @@ def log_signal(
                (ticker, timestamp, composite_score, signal, action,
                 skip_reason, price_at_signal, atr_at_signal,
                 hmm_regime, sentiment_score, smoothed_bull_prob,
-                kelly_fraction, sizing_method, hmm_fit_failed)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                kelly_fraction, sizing_method, hmm_fit_failed,
+                entry_dollars, equity_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 datetime.utcnow().isoformat(),
@@ -266,6 +274,8 @@ def log_signal(
                 kelly_fraction,
                 sizing_method,
                 int(hmm_fit_failed) if hmm_fit_failed is not None else None,
+                entry_dollars,
+                equity_at_entry,
             ),
         )
         return cur.lastrowid  # type: ignore[return-value]
