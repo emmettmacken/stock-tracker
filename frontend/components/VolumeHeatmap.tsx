@@ -30,7 +30,7 @@ export function VolumeHeatmap({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-xs border-collapse tabular-nums">
+      <table className="w-full text-xs border-separate [border-spacing:3px] tabular-nums">
         <thead>
           <tr>
             <th className="px-1.5 py-1 text-zinc-500 font-normal text-left" />
@@ -41,8 +41,8 @@ export function VolumeHeatmap({
         </thead>
         <tbody>
           {heatmap.map((row, r) => (
-            <tr key={r} className={r === currentRetIdx ? "ring-1 ring-inset ring-sky-500" : ""}>
-              <td className="px-1.5 py-1 text-zinc-400 font-semibold whitespace-nowrap">
+            <tr key={r}>
+              <td className={`px-1.5 py-1 font-semibold whitespace-nowrap ${r === currentRetIdx ? "text-sky-300" : "text-zinc-400"}`}>
                 {RET_SHORT[r]}
                 {r === currentRetIdx && <span className="ml-1 text-sky-400 text-[10px]">●</span>}
               </td>
@@ -52,9 +52,10 @@ export function VolumeHeatmap({
                 return (
                   <td
                     key={v}
-                    className={`px-1.5 py-1.5 text-center rounded relative
-                      ${heatColor(val)}
-                      ${isCurrent ? "ring-2 ring-sky-400" : ""}`}
+                    aria-current={isCurrent ? "true" : undefined}
+                    className={`px-1.5 py-1.5 text-center rounded-md ${heatColor(val)} ${
+                      isCurrent ? "ring-2 ring-inset ring-sky-400 shadow-[0_0_0_1px_rgba(56,189,248,0.35)]" : ""
+                    }`}
                   >
                     <div className="font-semibold">{(val * 100).toFixed(0)}%</div>
                     <div className={`text-[9px] opacity-70 ${obs < 15 ? "text-amber-300" : ""}`}>

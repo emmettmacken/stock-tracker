@@ -6,11 +6,7 @@ import {
 } from "recharts";
 import { PricePoint, TradeOutcome } from "@/lib/types";
 import { fetchPriceHistory, fetchTradeHistory } from "@/lib/api";
-
-const RANGES = [
-  ["1M", 30], ["3M", 90], ["6M", 180], ["1Y", 365], ["2Y", 730],
-] as const;
-type RangeKey = (typeof RANGES)[number][0];
+import { PERIODS, Period, periodCutoff } from "@/lib/period";
 
 // Simple moving average over the full close series (display-only; not used in scoring).
 function movingAverage(closes: number[], window: number): (number | null)[] {
@@ -32,12 +28,19 @@ interface Row {
   ma200: number | null;
 }
 
-export function PriceChart({ ticker }: { ticker: string }) {
+export function PriceChart({
+  ticker,
+  period,
+  onPeriodChange,
+}: {
+  ticker: string;
+  period: Period;
+  onPeriodChange: (p: Period) => void;
+}) {
   const [points, setPoints] = useState<PricePoint[] | null>(null);
   const [trades, setTrades] = useState<TradeOutcome[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [range, setRange] = useState<RangeKey>("3M");
   const [showMA, setShowMA] = useState({ ma20: false, ma50: false, ma200: false });
 
   useEffect(() => {
@@ -67,16 +70,22 @@ export function PriceChart({ ticker }: { ticker: string }) {
     }));
   }, [points]);
 
-  // Slice to the selected range (MAs stay correct since they were computed on full history).
+  // Slice to the selected period (MAs stay correct since they were computed on full history).
   const rows = useMemo(() => {
     if (!fullRows.length) return [];
-    const days = RANGES.find((r) => r[0] === range)![1];
-    const last = new Date(fullRows[fullRows.length - 1].date);
-    const cutoff = new Date(last);
-    cutoff.setDate(cutoff.getDate() - days);
-    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    const cutoffStr = periodCutoff(period, fullRows[fullRows.length - 1].date);
+    if (!cutoffStr) return fullRows;
     return fullRows.filter((r) => r.date >= cutoffStr);
-  }, [fullRows, range]);
+  }, [fullRows, period]);
+
+  // +/- price change across the visible window, shown next to the period selector.
+  const periodChange = useMemo<number | null>(() => {
+    if (rows.length < 2) return null;
+    const first = rows[0].close;
+    const last = rows[rows.length - 1].close;
+    if (!first) return null;
+    return (last / first - 1) * 100;
+  }, [rows]);
 
   // Snap a trade date to the nearest visible trading day so the marker renders on-axis.
   const markers = useMemo(() => {
@@ -140,18 +149,28 @@ export function PriceChart({ ticker }: { ticker: string }) {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="inline-flex rounded-lg bg-zinc-800/50 p-0.5">
-          {RANGES.map(([key]) => (
-            <button
-              key={key}
-              onClick={() => setRange(key)}
-              className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors duration-150 ${
-                range === key ? "bg-zinc-100 text-zinc-900" : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              {key}
-            </button>
-          ))}
+        <div className="flex items-center gap-3">
+          <div className="inline-flex rounded-lg bg-zinc-800/50 p-0.5">
+            {PERIODS.map((key) => (
+              <button
+                key={key}
+                onClick={() => onPeriodChange(key)}
+                className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors duration-150 ${
+                  period === key ? "bg-zinc-100 text-zinc-900" : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                {key}
+              </button>
+            ))}
+          </div>
+          {periodChange != null && (
+            <span className="text-xs font-medium tabular-nums">
+              <span className="text-zinc-500">{period}:</span>{" "}
+              <span className={periodChange >= 0 ? "text-emerald-400" : "text-red-400"}>
+                {periodChange >= 0 ? "+" : ""}{periodChange.toFixed(1)}%
+              </span>
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1">
           {toggleBtn("ma20", "MA20", "#38bdf8")}

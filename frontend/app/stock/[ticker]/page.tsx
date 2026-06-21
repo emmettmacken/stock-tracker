@@ -12,6 +12,8 @@ import { BacktestPanel } from "@/components/BacktestPanel";
 import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
 import { PositionBanner } from "@/components/v3/stock/PositionBanner";
 import { PriceChart } from "@/components/v3/stock/PriceChart";
+import { TickerAnalytics } from "@/components/v3/stock/TickerAnalytics";
+import { Period, DEFAULT_PERIOD } from "@/lib/period";
 
 function Section({
   title,
@@ -46,6 +48,9 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
   const [signalError, setSignalError] = useState<string | null>(null);
 
   const [trail, setTrail] = useState<DecisionTrail | null>(null);
+
+  // Selected time window — drives the price chart AND the per-ticker analytics below.
+  const [period, setPeriod] = useState<Period>(DEFAULT_PERIOD);
 
   const loadSignal = useCallback(() => {
     setSignalLoading(true);
@@ -145,6 +150,13 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
           <>
             <StockHeader snapshot={snapshot} refreshing={refreshing} onRefresh={handleRefresh} />
 
+            <Section
+              title="Price history"
+              sub="Historical closing price. Pick a time period to scope the whole page; toggle moving averages. Entry/exit markers show where the system has traded this ticker."
+            >
+              <PriceChart ticker={ticker} period={period} onPeriodChange={setPeriod} />
+            </Section>
+
             <PositionBanner ticker={ticker} />
 
             <EligibilityBanner trail={trail} />
@@ -159,10 +171,10 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
             </Section>
 
             <Section
-              title="Price history"
-              sub="Historical closing price. Toggle moving averages and time ranges; entry/exit markers show where the system has traded this ticker."
+              title="Analytics"
+              sub="This system's realized track record on this ticker, scoped to the selected time period, with a buy-and-hold comparison over the same window."
             >
-              <PriceChart ticker={ticker} />
+              <TickerAnalytics ticker={ticker} period={period} />
             </Section>
 
             <Section

@@ -20,7 +20,7 @@ export function TransitionMatrixTable({
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-xs border-collapse tabular-nums">
+      <table className="w-full text-xs border-separate [border-spacing:3px] tabular-nums">
         <thead>
           <tr>
             <th className="px-1.5 py-1 text-zinc-500 font-normal text-left">→</th>
@@ -31,24 +31,33 @@ export function TransitionMatrixTable({
           </tr>
         </thead>
         <tbody>
-          {matrix.map((row, i) => (
-            <tr key={i} className={i === currentStateIdx ? "ring-1 ring-inset ring-sky-500" : ""}>
-              <td className="px-1.5 py-1 text-zinc-400 font-semibold whitespace-nowrap">
-                {STATE_LABELS[i]}
-                {i === currentStateIdx && <span className="ml-1 text-sky-400 text-[10px]">●</span>}
-              </td>
-              {row.map((val, j) => (
-                <td key={j} className={`px-1.5 py-1 text-center rounded ${cellBg(val)}`}>
-                  {(val * 100).toFixed(1)}%
+          {matrix.map((row, i) => {
+            const isCurrent = i === currentStateIdx;
+            return (
+              <tr key={i}>
+                <td className={`px-1.5 py-1 font-semibold whitespace-nowrap ${isCurrent ? "text-sky-300" : "text-zinc-400"}`}>
+                  {STATE_LABELS[i]}
+                  {isCurrent && <span className="ml-1 text-sky-400 text-[10px]">●</span>}
                 </td>
-              ))}
-              {rowObs && (
-                <td className={`px-1.5 py-1 text-center ${rowObs[i] >= 15 ? "text-zinc-500" : "text-amber-500"}`}>
-                  {rowObs[i]}
-                </td>
-              )}
-            </tr>
-          ))}
+                {row.map((val, j) => (
+                  <td
+                    key={j}
+                    aria-current={isCurrent ? "true" : undefined}
+                    className={`px-1.5 py-1 text-center rounded-md ${cellBg(val)} ${
+                      isCurrent ? "ring-2 ring-inset ring-sky-400" : ""
+                    }`}
+                  >
+                    {(val * 100).toFixed(1)}%
+                  </td>
+                ))}
+                {rowObs && (
+                  <td className={`px-1.5 py-1 text-center ${rowObs[i] >= 15 ? "text-zinc-500" : "text-amber-500"}`}>
+                    {rowObs[i]}
+                  </td>
+                )}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
