@@ -653,7 +653,6 @@ def get_backtest(ticker: str):
 
     df = fetch_ohlcv(ticker, days=760, min_bars=260)
     closes, returns, vol, vol_20d = extract_features(df)
-    hmm_returns = _normalize_returns_for_hmm(returns)
     dates = df.index.tolist()[1:]
     n = len(returns)  # = len(closes) - 1
 
@@ -748,39 +747,23 @@ def get_backtest(ticker: str):
         tr_rets, tr_vol, tr_20d = returns[ts:te], vol[ts:te], vol_20d[ts:te]
         tr_states, lo_t, hi_t = make_state_seq(tr_rets, tr_vol, tr_20d)
 
+        # Bug fix: generate the entry signal from the full training-window transition
+        # matrix — the same basis the multi-ticker portfolio backtest uses
+        # (compute_signal on cnt_full/mat_full/stat_full, ~main.py:2065). The previous
+        # version split the window into HMM bull/bear sub-matrices: inside the bull
+        # regime nearly all stationary mass already sits on bull states, so bull_edge
+        # could never clear its Wilson lower bound, and most per-state rows fell below
+        # MIN_OBS (forcing HOLD). Together those drove BUY signals to ~zero, so the
+        # backtest reported no trades even on tickers that clearly should have traded.
         mat_full, _, cnt_full = build_matrix(tr_states)
         stat_full = stationary(mat_full)
-
-        # Fit HMM on training window only — no future data in model parameters
-        try:
-            tr_regime_seq, tr_bull_id, tr_model = fit_regimes(hmm_returns[ts:te])
-            test_len = min(TEST, n - te)
-            test_regime_seq = tr_model.predict(hmm_returns[te:te + test_len].reshape(-1, 1))
-        except Exception:
-            tr_regime_seq = np.zeros(len(tr_rets), dtype=int)
-            test_regime_seq = np.zeros(min(TEST, n - te), dtype=int)
-            tr_bull_id = 0
-
-        bull_tr = [s for s, r in zip(tr_states, tr_regime_seq) if r == tr_bull_id]
-        bear_tr = [s for s, r in zip(tr_states, tr_regime_seq) if r != tr_bull_id]
-
-        mat_bull, _, cnt_bull = build_matrix(bull_tr if len(bull_tr) >= 20 else tr_states, fallback=stat_full)
-        mat_bear, _, cnt_bear = build_matrix(bear_tr if len(bear_tr) >= 20 else tr_states, fallback=stat_full)
-        stat_bull = stationary(mat_bull)
-        stat_bear = stationary(mat_bear)
 
         for idx in range(test_start, min(test_start + TEST, n)):
             r_t    = returns[idx]
             ratio  = vol[idx] / max(vol_20d[idx], 1.0)
             cur_st = si(ret_bucket(r_t), vol_bucket(ratio, lo_t, hi_t))
-            reg_t  = int(test_regime_seq[idx - test_start])
 
-            if reg_t == tr_bull_id:
-                mat_a, cnt_a, stat_a = mat_bull, cnt_bull, stat_bull
-            else:
-                mat_a, cnt_a, stat_a = mat_bear, cnt_bear, stat_bear
-
-            signal = compute_signal(cnt_a[cur_st], mat_a[cur_st], stat_a)["signal"]
+            signal = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)["signal"]
 
             # Portfolio update: earn r_t if already in position BEFORE this signal
             if in_pos:

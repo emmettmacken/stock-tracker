@@ -1,4 +1,5 @@
 "use client";
+import { useState } from "react";
 import { SignalData } from "@/lib/types";
 import { DetailPanel } from "@/components/DetailPanel";
 
@@ -6,6 +7,9 @@ import { DetailPanel } from "@/components/DetailPanel";
 export function MarkovDetail({ data }: { data: SignalData }) {
   const n = data.n_obs_current_state;
   const lowConfidence = n < 15 || !data.high_confidence;
+  // When the read is low-confidence, the colored matrix/heatmap/stationary grids
+  // are misleading, so collapse them behind an explicit opt-in.
+  const [showDetails, setShowDetails] = useState(false);
 
   // P(bullish next) for the exact current state (return bucket × vol bucket).
   const upRaw = data.bullish_heatmap?.[data.current_return_bucket]?.[data.current_vol_bucket];
@@ -49,8 +53,33 @@ export function MarkovDetail({ data }: { data: SignalData }) {
         )}
       </div>
 
-      {/* Existing raw grids: edges + CI, heatmap, stationary dist, transition matrix */}
-      <DetailPanel data={data} />
+      {/* Existing raw grids: edges + CI, heatmap, stationary dist, transition matrix.
+          On a low-confidence read these are demoted behind a "Show anyway" toggle. */}
+      {lowConfidence ? (
+        <div>
+          <button
+            onClick={() => setShowDetails((v) => !v)}
+            aria-expanded={showDetails}
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 border border-zinc-800 rounded-md px-2.5 py-1.5 transition-colors duration-150 ease-out-quart"
+          >
+            <svg
+              width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden
+              className={`transition-transform duration-150 ease-out-quart ${showDetails ? "rotate-90" : ""}`}
+            >
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+            {showDetails ? "Hide detailed matrix" : "Show anyway"}
+          </button>
+          {showDetails && (
+            <div className="mt-4">
+              <DetailPanel data={data} />
+            </div>
+          )}
+        </div>
+      ) : (
+        <DetailPanel data={data} />
+      )}
     </div>
   );
 }

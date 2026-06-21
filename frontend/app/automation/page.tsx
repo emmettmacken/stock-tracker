@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
-import { PaperAccount, PaperPosition, SignalLogEntry, TradeOutcome } from "@/lib/types";
+import Link from "next/link";
+import { PaperAccount, PaperPosition, SignalLogEntry, TradeOutcome, Briefing } from "@/lib/types";
 import { AccountSummary } from "@/components/v4/AccountSummary";
 import { PositionsTable } from "@/components/v4/PositionsTable";
 import { SignalLogFeed } from "@/components/v4/SignalLogFeed";
@@ -9,8 +10,49 @@ import { AnalyticsTab } from "@/components/v4/AnalyticsTab";
 import {
   triggerSignalJob,
   fetchPaperAccount, fetchPaperPositions,
-  fetchSignalLog, fetchTradeHistory,
+  fetchSignalLog, fetchTradeHistory, fetchBriefing,
 } from "@/lib/api";
+
+// Short, glanceable label for a skip-reason key (for the one-line run summary).
+const SHORT_SKIP: Record<string, string> = {
+  score_below_threshold: "score",
+  hmm_regime_uncertain: "regime",
+  hmm_not_buy_transition: "regime",
+  sentiment_too_low: "sentiment",
+  vix_too_high: "VIX",
+  volume_below_average: "volume",
+  overextended: "overextension",
+  momentum_disagreement: "momentum",
+  reentry_cooldown: "cooldown",
+  sector_concentration: "sector cap",
+  already_in_position: "already held",
+  earnings_within_2d: "earnings",
+  data_unavailable: "no data",
+};
+
+function shortSkip(key: string, label: string): string {
+  return SHORT_SKIP[key] ?? label.split(" ")[0].toLowerCase();
+}
+
+// One-line, quick-glance status of the most recent signal-job run.
+function buildRunSummary(b: Briefing): string {
+  const parts: string[] = [`${b.evaluated_count} evaluated`];
+  parts.push(`${b.orders.length} order${b.orders.length === 1 ? "" : "s"} placed`);
+  if (b.positions_closed > 0) parts.push(`${b.positions_closed} closed`);
+  let line = `Last run: ${parts.join(", ")}`;
+
+  // Merge skip counts by short label so e.g. two regime gates read as one "regime".
+  const merged = new Map<string, number>();
+  for (const s of b.skip_breakdown) {
+    const name = shortSkip(s.key, s.label);
+    merged.set(name, (merged.get(name) ?? 0) + s.count);
+  }
+  const top = [...merged.entries()].sort((a, c) => c[1] - a[1]).slice(0, 2);
+  if (top.length) {
+    line += ` — mostly blocked by ${top.map(([n, c]) => `${n} (${c})`).join(" and ")}`;
+  }
+  return line + ".";
+}
 
 const TABS = ["Overview", "Signal Log", "Closed Trades", "Analytics"] as const;
 type Tab = (typeof TABS)[number];
@@ -57,6 +99,7 @@ export default function AutomationPage() {
   } | null>(null);
   const [positionsLoading, setPositionsLoading] = useState(true);
   const [overviewUpdated, setOverviewUpdated] = useState<Date | null>(null);
+  const [briefing, setBriefing] = useState<Briefing | null>(null);
 
   const [signalLog, setSignalLog] = useState<SignalLogEntry[] | null>(null);
   const [signalLogLoading, setSignalLogLoading] = useState(true);
@@ -69,6 +112,7 @@ export default function AutomationPage() {
   // ── Fetch helpers ─────────────────────────────────────────────────────────────
   const loadOverview = useCallback(() => {
     fetchPaperAccount().then(setAccount).catch(() => {});
+    fetchBriefing().then(setBriefing).catch(() => {});
     setPositionsLoading(true);
     fetchPaperPositions()
       .then((d) => { setPositionsData(d); setOverviewUpdated(new Date()); })
@@ -155,6 +199,37 @@ export default function AutomationPage() {
             <section>
               <AccountSummary data={account} lastUpdated={overviewUpdated} />
             </section>
+
+            {briefing?.available && (
+              <section className="space-y-3">
+                <p className="text-sm text-zinc-300 leading-relaxed">
+                  {buildRunSummary(briefing)}
+                </p>
+                {briefing.near_misses.length > 0 && (
+                  <div>
+                    <h3 className="text-[11px] font-semibold text-zinc-500 uppercase tracking-widest mb-2">
+                      Worth watching
+                    </h3>
+                    <div className="flex flex-wrap gap-2">
+                      {briefing.near_misses.map((m) => (
+                        <Link
+                          key={m.ticker}
+                          href={`/stock/${m.ticker}`}
+                          title={`Skipped on score, within ${m.gap.toFixed(1)} of the ${m.threshold.toFixed(0)} threshold`}
+                          className="inline-flex items-center gap-2 rounded-lg bg-amber-950/20 border border-amber-900/30 px-3 py-1.5 hover:bg-amber-950/30 transition-colors"
+                        >
+                          <span className="text-sm font-semibold text-amber-300">{m.ticker}</span>
+                          <span className="text-[11px] text-zinc-500 tabular-nums">
+                            {m.score.toFixed(1)} / {m.threshold.toFixed(0)} · −{m.gap.toFixed(1)}
+                          </span>
+                        </Link>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+
             <section>
               <SectionHeader
                 title="Open Positions"

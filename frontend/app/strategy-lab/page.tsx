@@ -90,7 +90,7 @@ export default function PortfolioPage() {
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-5xl mx-auto px-4 py-8 sm:py-10">
         <header className="mb-8">
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">Portfolio</h1>
+          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">Strategy Lab</h1>
           <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
             Size positions and backtest multi-ticker portfolios using composite factor signals.
           </p>
