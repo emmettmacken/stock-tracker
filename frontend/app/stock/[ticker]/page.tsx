@@ -11,6 +11,7 @@ import { AltDataTab } from "@/components/v3/AltDataTab";
 import { BacktestPanel } from "@/components/BacktestPanel";
 import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
 import { PositionBanner } from "@/components/v3/stock/PositionBanner";
+import { CompanyInfo } from "@/components/v3/stock/CompanyInfo";
 import { PriceChart } from "@/components/v3/stock/PriceChart";
 import { TickerAnalytics } from "@/components/v3/stock/TickerAnalytics";
 import { Period, DEFAULT_PERIOD } from "@/lib/period";
@@ -158,6 +159,10 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
             </Section>
 
             <PositionBanner ticker={ticker} />
+
+            {/* Company info — renders directly after the position banner when held,
+                or directly after the price graph when not (PositionBanner is null). */}
+            <CompanyInfo ticker={ticker} />
 
             <EligibilityBanner trail={trail} />
 

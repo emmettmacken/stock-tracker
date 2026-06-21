@@ -4,7 +4,7 @@ import {
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
   AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
-  EquityHistory,
+  EquityHistory, CompanyInfo,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -43,6 +43,15 @@ export async function fetchFactors(ticker: string): Promise<FactorScoreData> {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? `Failed to fetch factors for ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
+  const res = await fetch(`${BASE}/api/company/${ticker}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to fetch company info for ${ticker}`);
   }
   return res.json();
 }

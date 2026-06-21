@@ -154,6 +154,13 @@ _SENTIMENT_MIN_INTERVAL = 13.0  # ~4.5 req/min, safely under the 5/min AV free-t
 _SECTOR_CACHE: dict[str, tuple[str, float]] = {}  # ticker → (sector, timestamp)
 _SECTOR_TTL = 86400  # 24 hours
 
+# Company info cache — name/sector/industry/summary + a few trader fields and the
+# last ~4 quarters of earnings. This data essentially never changes intraday (and
+# changes only quarterly), so cache it for 7 days, far longer than the 24h sector cache.
+_COMPANY_CACHE: dict[str, tuple[dict, float]] = {}  # ticker → (info dict, timestamp)
+_COMPANY_TTL = 7 * 86400  # 7 days
+_COMPANY_LOCK = threading.Lock()
+
 # Change 5: one lock per cache dict to prevent TOCTOU races during parallel factor computation
 _FACTORS_LOCK = threading.Lock()
 _MACRO_LOCK = threading.Lock()
@@ -957,6 +964,38 @@ def _vol_trend_score(closes: np.ndarray) -> tuple[float | None, dict | None]:
     return float(np.clip(score, 0, 100)), detail
 
 
+def _extract_earnings_quarters(eh: pd.DataFrame | None, n: int = 4) -> list[dict]:
+    """Pull the last ``n`` quarters out of yfinance's earnings_history frame.
+
+    Shares its data source with _earnings_score (ticker.earnings_history) so we never
+    add a separate earnings fetch. Returns newest→oldest; each row has the quarter date,
+    EPS actual, EPS estimate, and surprise % (as a percentage, e.g. 4.2 not 0.042)."""
+    if eh is None or len(eh) == 0:
+        return []
+    if "epsActual" not in eh.columns or "epsEstimate" not in eh.columns:
+        return []
+    rows: list[dict] = []
+    for idx, row in eh.sort_index().tail(n).iterrows():
+        est, act = row.get("epsEstimate"), row.get("epsActual")
+        est = None if pd.isna(est) else float(est)
+        act = None if pd.isna(act) else float(act)
+        surprise_pct: float | None = None
+        if est is not None and act is not None and est != 0:
+            surprise_pct = round((act - est) / abs(est) * 100.0, 2)
+        try:
+            date_str = pd.Timestamp(idx).strftime("%Y-%m-%d")
+        except Exception:
+            date_str = str(idx)
+        rows.append({
+            "date": date_str,
+            "eps_actual": act,
+            "eps_estimate": est,
+            "surprise_pct": surprise_pct,
+        })
+    rows.reverse()  # newest first
+    return rows
+
+
 def _earnings_score(ticker_obj: yf.Ticker) -> tuple[float | None, dict | None]:
     """Return (0–100 score, display detail). Detail carries the last two quarters'
     surprise % (act vs estimate, as fractions) so the UI can show the raw beats/misses."""
@@ -1248,6 +1287,61 @@ def _get_sector(ticker: str) -> str:
     return sector
 
 
+def _get_company_info(ticker: str) -> dict:
+    """Return cached company info for a ticker (name, sector, industry, business
+    summary, a few trader-relevant fields, and the last ~4 quarters of earnings).
+
+    Cached for 7 days — this data essentially never changes (and only quarterly for
+    earnings), so it's cached far more aggressively than price/factor data. Uses the
+    same ticker.info source as _get_sector and seeds the 24h sector cache from the same
+    fetch, so the sector is never fetched twice."""
+    ticker = ticker.upper()
+    with _COMPANY_LOCK:
+        cached, ts = _COMPANY_CACHE.get(ticker, ({}, 0.0))
+        if cached and (time.time() - ts) < _COMPANY_TTL:
+            return cached
+
+    info: dict = {}
+    earnings: list[dict] = []
+    try:
+        tk = yf.Ticker(ticker)
+        raw = tk.info or {}
+        sector = raw.get("sector", "Unknown") or "Unknown"
+        # Seed the sector cache from this same fetch so _get_sector won't re-fetch .info.
+        with _SECTOR_LOCK:
+            _SECTOR_CACHE[ticker] = (sector, time.time())
+        info = {
+            "ticker":             ticker,
+            "name":               raw.get("longName") or raw.get("shortName") or None,
+            "sector":             sector,
+            "industry":           raw.get("industry") or None,
+            "summary":            raw.get("longBusinessSummary") or None,
+            # 2–4 trader-relevant additions that yfinance reliably populates
+            "market_cap":         raw.get("marketCap"),
+            "trailing_pe":        raw.get("trailingPE"),
+            "forward_pe":         raw.get("forwardPE"),
+            "dividend_yield":     raw.get("dividendYield"),
+            "fifty_two_week_high": raw.get("fiftyTwoWeekHigh"),
+            "fifty_two_week_low":  raw.get("fiftyTwoWeekLow"),
+        }
+        try:
+            earnings = _extract_earnings_quarters(tk.earnings_history, n=4)
+        except Exception as e:
+            logger.warning("Earnings history lookup failed for %s: %s", ticker, e)
+    except Exception as e:
+        logger.warning("Company info lookup failed for %s: %s", ticker, e)
+        info = {"ticker": ticker, "name": None, "sector": "Unknown", "industry": None,
+                "summary": None, "market_cap": None, "trailing_pe": None,
+                "forward_pe": None, "dividend_yield": None,
+                "fifty_two_week_high": None, "fifty_two_week_low": None}
+
+    info["earnings"] = earnings
+    info = _sanitize_json(info)
+    with _COMPANY_LOCK:
+        _COMPANY_CACHE[ticker] = (info, time.time())
+    return info
+
+
 def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     """Core factor computation shared by the API endpoint and the scheduler.
 
@@ -1382,6 +1476,10 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     rets_21 = np.diff(closes[-22:]) / closes[-22:-1] if len(closes) >= 22 else np.array([0.0])
     vol_21d = float(rets_21.std())
 
+    # Display-only company info (7-day cache). Reuses a single .info fetch that also
+    # seeds the 24h sector cache, so sector is never fetched twice.
+    company = _get_company_info(ticker)
+
     result = {
         "ticker":              ticker,
         "factors":             factors,
@@ -1409,9 +1507,12 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         "atr":                 atr,
         "vol_21d":             vol_21d,
         "sentiment_score":     round(sentiment_score, 2) if sentiment_score is not None else None,
-        # Display-only: cached sector tag (same _get_sector lookup the concentration gate
-        # uses) so the watchlist can offer a sector filter. Never used in scoring.
-        "sector":              _get_sector(ticker),
+        # Display-only: cached sector tag (sourced from the same .info fetch the
+        # concentration gate's _get_sector uses) so the watchlist can offer a sector
+        # filter. Never used in scoring.
+        "sector":              company.get("sector", "Unknown"),
+        # Display-only: company long name so the watchlist card can show "AAPL — Apple Inc."
+        "company_name":        company.get("name"),
     }
     with _FACTORS_LOCK:
         _FACTORS_CACHE[ticker] = (result, time.time())
@@ -1474,6 +1575,14 @@ def get_factors_cluster(tickers: str = ""):
             results.append({"ticker": ticker, "error": str(e)})
     results.sort(key=lambda x: x.get("composite_score") or 0, reverse=True)
     return {"tickers": results, "count": len(results)}
+
+
+@app.get("/api/company/{ticker}")
+def get_company(ticker: str):
+    """Cached company profile: name, sector, industry, business summary, a few
+    trader-relevant fields (market cap, P/E, dividend yield, 52-week range) and the
+    last ~4 quarters of earnings (date, EPS actual/estimate, surprise %)."""
+    return _get_company_info(ticker.upper())
 
 
 @app.get("/api/factors/{ticker}")

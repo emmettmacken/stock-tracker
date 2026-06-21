@@ -74,6 +74,13 @@ export function TickerCard({ snapshot, onRemove, held = false }: Props) {
             )}
           </div>
 
+          {/* Company name — display only; absent until the first compute caches it. */}
+          {snapshot.factors?.company_name && (
+            <p className="mb-1 truncate text-xs font-medium text-zinc-400" title={snapshot.factors.company_name}>
+              {snapshot.factors.company_name}
+            </p>
+          )}
+
           {ready ? (
             <>
               <div className="flex items-baseline gap-2">

@@ -94,6 +94,32 @@ export interface FactorScoreData {
   earnings_detail?: EarningsDetail | null;
   // Display-only cached sector tag (for the watchlist sector filter). Not used in scoring.
   sector?: string | null;
+  // Display-only company long name (e.g. "Apple Inc."). Null until first compute lands.
+  company_name?: string | null;
+}
+
+// Cached company profile served by /api/company/{ticker}. All fields nullable —
+// yfinance doesn't populate everything for every ticker.
+export interface EarningsQuarter {
+  date: string;
+  eps_actual: number | null;
+  eps_estimate: number | null;
+  surprise_pct: number | null; // as a percentage, e.g. 4.2 means +4.2%
+}
+
+export interface CompanyInfo {
+  ticker: string;
+  name: string | null;
+  sector: string | null;
+  industry: string | null;
+  summary: string | null;
+  market_cap: number | null;
+  trailing_pe: number | null;
+  forward_pe: number | null;
+  dividend_yield: number | null;
+  fifty_two_week_high: number | null;
+  fifty_two_week_low: number | null;
+  earnings: EarningsQuarter[];
 }
 
 // Cached display snapshot served by /api/watchlist/snapshot — no live computation.

@@ -25,6 +25,10 @@ export function StockHeader({ snapshot, refreshing, onRefresh }: Props) {
           {snapshot.signal && <SignalBadge signal={snapshot.signal} />}
           {snapshot.hmm_regime && <RegimePill regime={snapshot.hmm_regime} />}
         </div>
+        {/* Company name — display only; absent until the first compute caches it. */}
+        {snapshot.factors?.company_name && (
+          <p className="mt-1 text-sm font-medium text-zinc-400">{snapshot.factors.company_name}</p>
+        )}
         <div className="mt-2 flex items-baseline gap-2">
           <span className="text-2xl font-semibold text-white tabular-nums tracking-tight">
             ${(snapshot.price ?? 0).toFixed(2)}
