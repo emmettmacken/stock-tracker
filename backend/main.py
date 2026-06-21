@@ -586,35 +586,26 @@ def get_signal(ticker: str):
         regime_seq = np.zeros(len(returns), dtype=int)
         bull_id = 0
 
-    bear_id = 1 - bull_id
-
     # Rolling 252-day window for transition matrices
     w = min(ROLLING_WINDOW, len(returns))
     rets_w    = returns[-w:]
     vol_w     = vol[-w:]
     vol_20d_w = vol_20d[-w:]
-    reg_w     = regime_seq[-w:]
 
     states_all, lo_t, hi_t = make_state_seq(rets_w, vol_w, vol_20d_w)
 
-    # Full-window matrix for fallback stationary
-    mat_all, row_obs_all, cnt_all = build_matrix(states_all)
+    # Full-window, unconditioned transition matrix. The discrete-Markov signal/confidence and
+    # the displayed grids both read from this single matrix. The previous version split the
+    # window into the HMM-active regime's sub-states for the signal, which undersampled each
+    # current-state row (often below MIN_OBS) and pinned confidence at the floor — see the live
+    # signal path in _compute_factors. The Gaussian-HMM regime label (below) is independent and
+    # still surfaced for display.
+    mat_all, row_obs, cnt_all = build_matrix(states_all)
     stat_all = stationary(mat_all)
 
-    # Per-regime state lists
-    bull_st = [s for s, r in zip(states_all, reg_w) if r == bull_id]
-    bear_st = [s for s, r in zip(states_all, reg_w) if r == bear_id]
-
-    # Active regime
+    # HMM hard-label for display only (RegimePill) — not used to condition the Markov signal.
     current_regime_id = int(regime_seq[-1])
     regime_label = "bull" if current_regime_id == bull_id else "bear"
-    active_st = bull_st if current_regime_id == bull_id else bear_st
-
-    if len(active_st) >= 20:
-        mat_active, row_obs, cnt_active = build_matrix(active_st, fallback=stat_all)
-    else:
-        mat_active, row_obs, cnt_active = mat_all, row_obs_all, cnt_all
-    stat_active = stationary(mat_active)
 
     # Current 2D state
     ratios_w = vol_w / np.maximum(vol_20d_w, 1.0)
@@ -622,7 +613,7 @@ def get_signal(ticker: str):
     cur_vb = vol_bucket(float(ratios_w[-1]), lo_t, hi_t)
     cur_st = si(cur_rb, cur_vb)
 
-    sig = compute_signal(cnt_active[cur_st], mat_active[cur_st], stat_active)
+    sig = compute_signal(cnt_all[cur_st], mat_all[cur_st], stat_all)
 
     # Price
     cur_price  = float(closes[-1])
@@ -638,18 +629,18 @@ def get_signal(ticker: str):
         "current_state":          f"{RETURN_LABELS[cur_rb]}-{VOL_LABELS[cur_vb]}",
         "current_return_bucket":  cur_rb,
         "current_vol_bucket":     cur_vb,
-        "transition_matrix_5x5":  marginal_5x5(mat_active, row_obs),
-        "bullish_heatmap":        bullish_heatmap_5x3(mat_active),
+        "transition_matrix_5x5":  marginal_5x5(mat_all, row_obs),
+        "bullish_heatmap":        bullish_heatmap_5x3(mat_all),
         "row_observations":       obs_grid_5x3(row_obs),
         "stationary_distribution": [
-            round(float(sum(stat_active[si(r, v)] for v in range(N_VOL))), 4)
+            round(float(sum(stat_all[si(r, v)] for v in range(N_VOL))), 4)
             for r in range(N_RET)
         ],
         "return_labels":  RETURN_LABELS,
         "vol_labels":     VOL_LABELS,
         "high_confidence": bool(np.all(row_obs >= MIN_OBS)),
         "num_returns":     len(rets_w),
-        "regime_window_size": len(active_st),
+        "regime_window_size": len(states_all),
     }
 
 # ── /api/backtest ─────────────────────────────────────────────────────────────
@@ -1412,25 +1403,23 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         regime_label = "transition"
 
     w = min(ROLLING_WINDOW, len(returns))
-    rets_w, vol_w, vol_20d_w, reg_w = returns[-w:], vol[-w:], vol_20d[-w:], regime_seq[-w:]
+    rets_w, vol_w, vol_20d_w = returns[-w:], vol[-w:], vol_20d[-w:]
     states_all, lo_t, hi_t = make_state_seq(rets_w, vol_w, vol_20d_w)
+    # Discrete-Markov signal/confidence use the full, unconditioned transition matrix over the
+    # whole rolling window. The previous version split the window into the HMM-active regime's
+    # sub-states, which left only a handful of observations per current-state row (often well
+    # below MIN_OBS), pinning confidence at the floor and forcing HOLD. The Gaussian-HMM regime
+    # detector (smoothed_bull_prob / regime_label) is unaffected — it stays the "what regime are
+    # we in" model; this only stops the discrete signal from re-conditioning on it.
     mat_all, _, cnt_all = build_matrix(states_all)
     stat_all = stationary(mat_all)
-
-    active_id = int(regime_seq[-1])
-    active_st = [s for s, r in zip(states_all, reg_w) if r == active_id]
-    if len(active_st) >= 20:
-        mat_act, _, cnt_act = build_matrix(active_st, fallback=stat_all)
-    else:
-        mat_act, cnt_act = mat_all, cnt_all
-    stat_act = stationary(mat_act)
 
     ratios_w = vol_w / np.maximum(vol_20d_w, 1.0)
     # Fix 2-C: use the last *complete* bar [-2] for the current Markov state, consistent with
     # the volume read below — today's bar is partial at signal time. Fall back to [-1] if short.
     _cb = -2 if len(rets_w) >= 2 else -1
     cur_st = si(ret_bucket(float(rets_w[_cb])), vol_bucket(float(ratios_w[_cb]), lo_t, hi_t))
-    sig = compute_signal(cnt_act[cur_st], mat_act[cur_st], stat_act)
+    sig = compute_signal(cnt_all[cur_st], mat_all[cur_st], stat_all)
 
     hmm_score      = _hmm_factor_score(sig["signal"], sig["confidence"])
     mom_score      = _momentum_score(closes)
