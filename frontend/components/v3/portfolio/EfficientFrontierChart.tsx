@@ -50,8 +50,8 @@ export function EfficientFrontierChart({ points }: Props) {
 
   return (
     <div>
-      <ResponsiveContainer width="100%" height={260}>
-        <ScatterChart margin={{ top: 10, right: 10, bottom: 20, left: 10 }}>
+      <ResponsiveContainer width="100%" height={290}>
+        <ScatterChart margin={{ top: 10, right: 10, bottom: 36, left: 10 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
           <XAxis
             type="number"
@@ -75,7 +75,8 @@ export function EfficientFrontierChart({ points }: Props) {
           />
           <Tooltip content={<CustomTooltip />} cursor={{ strokeDasharray: "3 3" }} />
           <Legend
-            wrapperStyle={{ fontSize: 10, paddingTop: 4 }}
+            verticalAlign="bottom"
+            wrapperStyle={{ fontSize: 10, paddingTop: 12 }}
           />
           <Scatter
             name="Monte Carlo"
@@ -100,7 +101,7 @@ export function EfficientFrontierChart({ points }: Props) {
           />
         </ScatterChart>
       </ResponsiveContainer>
-      <div className="flex gap-4 mt-1 text-[10px] text-zinc-500 justify-center">
+      <div className="flex gap-4 mt-4 pt-3 border-t border-zinc-800 text-[10px] text-zinc-500 justify-center">
         <span>
           <span className="text-sky-400 font-bold">●</span> Min Variance: {points[minVarIdx].volatility.toFixed(1)}% vol
         </span>

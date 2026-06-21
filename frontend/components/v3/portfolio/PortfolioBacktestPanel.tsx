@@ -287,7 +287,8 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
               />
               <Tooltip
                 contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6 }}
-                itemStyle={{ fontSize: 10 }}
+                labelStyle={{ color: "#e4e4e7", fontSize: 10 }}
+                itemStyle={{ color: "#e4e4e7", fontSize: 10 }}
                 formatter={(v: number) => [`${v >= 0 ? "+" : ""}${v.toFixed(2)}%`, "Contribution"]}
               />
               <ReferenceLine x={0} stroke="#3f3f46" />

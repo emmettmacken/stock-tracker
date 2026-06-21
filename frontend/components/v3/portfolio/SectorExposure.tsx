@@ -53,9 +53,15 @@ export function SectorExposurePanel() {
                 {s.tickers.join(", ")}
               </span>
             </div>
-            <span className="w-24 shrink-0 text-right text-xs tabular-nums">
-              <span className="text-zinc-300">{s.pct.toFixed(0)}%</span>
-              <span className="text-zinc-600"> · {s.count}/{data.max_per_sector}</span>
+            <span className="w-40 shrink-0 text-right text-[11px] leading-tight tabular-nums">
+              <span className="block">
+                <span className="text-zinc-300 font-medium">{s.pct.toFixed(0)}%</span>
+                <span className="text-zinc-500"> of capital</span>
+              </span>
+              <span className="block">
+                <span className="text-zinc-300 font-medium">{s.count} of {data.max_per_sector}</span>
+                <span className="text-zinc-500"> sector slots</span>
+              </span>
             </span>
             {(s.at_cap || s.near_cap) && (
               <span
