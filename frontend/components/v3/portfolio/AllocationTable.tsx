@@ -60,7 +60,7 @@ export function AllocationTable({ sizing, factorData, method, capital }: Props) 
                     : `${fmt(alloc.vol_targeted_weight * 100, 1)}%`}
                 </td>
                 <td className="py-2.5 pr-3 tabular-nums text-zinc-200 font-medium">
-                  €{dollar.toLocaleString("en-IE", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+                  ${dollar.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
                 </td>
                 <td className="py-2.5 pr-3 tabular-nums text-zinc-400">
                   {fmt(alloc.realised_vol_21d * 100, 1)}%
@@ -91,10 +91,10 @@ export function AllocationTable({ sizing, factorData, method, capital }: Props) 
               )}%
             </td>
             <td className="pt-2 tabular-nums text-zinc-200 font-semibold">
-              €{tickers.reduce((s, t) => {
+              ${tickers.reduce((s, t) => {
                 const a = sizing.allocations[t];
                 return s + (method === "kelly" ? (a?.kelly_dollar ?? 0) : (a?.vol_targeted_dollar ?? 0));
-              }, 0).toLocaleString("en-IE", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+              }, 0).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
             </td>
             <td colSpan={2} />
           </tr>

@@ -141,7 +141,7 @@ export default function PortfolioPage() {
                 Capital
               </label>
               <div className="relative">
-                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 text-sm">€</span>
+                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 text-sm">$</span>
                 <input
                   type="number"
                   value={capital}

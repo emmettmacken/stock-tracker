@@ -195,13 +195,13 @@ export function PriceChart({
             axisLine={false}
             tickLine={false}
             width={52}
-            tickFormatter={(v: number) => `€${v.toFixed(0)}`}
+            tickFormatter={(v: number) => `$${v.toFixed(0)}`}
           />
           <Tooltip
             contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6 }}
             labelStyle={{ color: "#e4e4e7", fontSize: 11 }}
             itemStyle={{ fontSize: 11 }}
-            formatter={(v: number, name: string) => [`€${v.toFixed(2)}`, name]}
+            formatter={(v: number, name: string) => [`$${v.toFixed(2)}`, name]}
           />
           <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4 }} iconType="line" />
           <Line type="monotone" dataKey="close" name="Close" stroke="#10b981" strokeWidth={1.6} dot={false} />
