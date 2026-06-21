@@ -125,7 +125,7 @@ export default function AutomationPage() {
           <div>
             <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">Automation</h1>
             <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
-              Paper trading runs daily at 15:45 ET · stop-loss check at 09:35 ET
+              Paper trading runs daily at 15:30 ET · stop-loss check at 09:35 ET
             </p>
           </div>
           <div className="flex flex-col items-end gap-1.5">

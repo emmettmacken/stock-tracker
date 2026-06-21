@@ -9,7 +9,7 @@ export default function Home() {
             Stock Signal Tracker
           </h1>
           <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
-            Markov chain buy/sell/hold signals from 90 days of price history
+            Six-factor composite with an HMM regime model, over ~2 years of price history
           </p>
         </header>
         <Watchlist />

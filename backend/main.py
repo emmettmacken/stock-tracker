@@ -1080,26 +1080,46 @@ def _get_cik(ticker: str) -> Optional[str]:
         return None
 
 
-def _get_insider_score(ticker: str) -> float | None:
+def _fetch_insider(ticker: str) -> dict:
     """
-    Change 3: 0-100 insider score from EDGAR structured submissions API (not EFTS full-text).
+    Change 3: insider activity from the EDGAR structured submissions API (not EFTS full-text).
     Fetches Form 4 filings for the exact company CIK to avoid false positives.
     P = open-market purchase (bullish), S = open-market sale (bearish) — awards/exercises excluded.
     Filer weight: Officer=1.0×, Director=0.7×, 10%+ holder=0.5×, other=0.3×.
-    Returns None (not 50) on EDGAR failure so the weight drops and renormalises.
+
+    Single source of truth shared by the scored insider factor (_get_insider_score) and the
+    /api/insider detail endpoint, so the Factor Breakdown UI and the composite never disagree.
+
+    Returns a dict:
+      ok                 — EDGAR reachable (CIK + submissions resolved). False ⇒ data unavailable.
+      score              — 0-100 factor score, or None when there is no usable Form 4 data
+                           (so the weight drops and the remaining factors renormalise).
+      net_weighted       — role-weighted net shares (drives score + direction).
+      net_shares         — raw (unweighted) net shares P−S, for display.
+      transaction_count  — number of P/S transactions counted.
+      filings_processed  — Form 4 filings successfully parsed.
+      direction          — "buying" / "selling" / "neutral" (from net_weighted).
+      transactions       — per-transaction line items for the detail view.
     """
     ROLE_WEIGHTS = {"isOfficer": 1.0, "isDirector": 0.7, "isTenPercentOwner": 0.5}
+    ROLE_LABELS  = {"isOfficer": "Officer", "isDirector": "Director", "isTenPercentOwner": "10% owner"}
     headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
+    blank = {
+        "ok": False, "score": None, "net_weighted": 0.0, "net_shares": 0,
+        "transaction_count": 0, "filings_processed": 0, "direction": "neutral",
+        "transactions": [],
+    }
     try:
         cik = _get_cik(ticker)
         if not cik:
-            return None
+            return dict(blank)
 
         sub_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
         resp = _http_client.get(sub_url, headers=headers, timeout=15.0)
         if resp.status_code != 200:
-            return None
+            return dict(blank)
 
+        # EDGAR reachable from here on: ok=True even if no Form 4s exist in the window.
         data = resp.json()
         recent = data.get("filings", {}).get("recent", {})
         forms        = recent.get("form", [])
@@ -1127,13 +1147,16 @@ def _get_insider_score(ticker: str) -> float | None:
                 recent_form4s.append((acc, doc))
 
         if not recent_form4s:
-            # Fix 2-H: no Form 4s = no data, not a neutral signal. Return None so the factor
+            # No Form 4s = no data, not a neutral signal. score stays None so the factor
             # is excluded from the composite and the remaining weights renormalise.
-            return None
+            return {**blank, "ok": True}
 
         cik_int = int(cik)
         net_weighted = 0.0
+        net_shares = 0.0
+        transaction_count = 0
         filings_processed = 0
+        transactions: list[dict] = []
 
         for acc, primary_doc in recent_form4s[:10]:  # cap to avoid excessive HTTP calls
             acc_clean = acc.replace("-", "")
@@ -1150,11 +1173,17 @@ def _get_insider_score(ticker: str) -> float | None:
                     continue
                 tree = ET.fromstring(xml_resp.text)
 
+                owner_el = tree.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
+                owner = (owner_el.text or "").strip() if owner_el is not None else ""
+
                 # Highest role weight for this filer (take max if multiple roles held)
                 role_weight = 0.3
+                role_label = "Other"
                 for role_tag, w in ROLE_WEIGHTS.items():
                     el = tree.find(f".//reportingOwnerRelationship/{role_tag}")
                     if el is not None and (el.text or "").strip() in ("1", "true"):
+                        if w > role_weight:
+                            role_label = ROLE_LABELS[role_tag]
                         role_weight = max(role_weight, w)
 
                 # Non-derivative transactions only; skip awards (A), exercises (M), gifts (G), etc.
@@ -1170,19 +1199,53 @@ def _get_insider_score(ticker: str) -> float | None:
                         shares = float(shares_el.text or 0)
                     except (ValueError, TypeError):
                         continue
-                    net_weighted += shares * role_weight if code == "P" else -shares * role_weight
+
+                    price_el = tx.find(".//transactionAmounts/transactionPricePerShare/value")
+                    date_el  = tx.find(".//transactionDate/value")
+                    try:
+                        price = float(price_el.text) if price_el is not None and price_el.text else None
+                    except (ValueError, TypeError):
+                        price = None
+
+                    signed = shares if code == "P" else -shares
+                    net_weighted += signed * role_weight
+                    net_shares   += signed
+                    transaction_count += 1
+                    transactions.append({
+                        "owner": owner,
+                        "role": role_label,
+                        "type": "buy" if code == "P" else "sell",
+                        "code": code,
+                        "shares": int(shares),
+                        "price": round(price, 2) if price is not None else None,
+                        "date": (date_el.text or "").strip() if date_el is not None else None,
+                    })
 
                 filings_processed += 1
             except Exception:
                 continue
 
         if filings_processed == 0:
-            return None  # Form 4s exist but all failed to parse → drop weight, don't guess
+            # Form 4s exist but all failed to parse → score None (drop weight, don't guess)
+            return {**blank, "ok": True}
 
-        return 70.0 if net_weighted > 0 else (30.0 if net_weighted < 0 else 50.0)
+        score = 70.0 if net_weighted > 0 else (30.0 if net_weighted < 0 else 50.0)
+        direction = "buying" if net_weighted > 0 else ("selling" if net_weighted < 0 else "neutral")
+        return {
+            "ok": True, "score": score, "net_weighted": net_weighted,
+            "net_shares": int(net_shares), "transaction_count": transaction_count,
+            "filings_processed": filings_processed, "direction": direction,
+            "transactions": transactions,
+        }
     except Exception as e:
-        logger.warning("Insider score failed for %s: %s", ticker, e)
-        return None
+        logger.warning("Insider fetch failed for %s: %s", ticker, e)
+        return dict(blank)
+
+
+def _get_insider_score(ticker: str) -> float | None:
+    """0-100 insider factor score, or None on EDGAR failure / no usable Form 4 data.
+    Thin wrapper over the shared _fetch_insider so the factor and detail endpoint agree."""
+    return _fetch_insider(ticker)["score"]
 
 
 def _get_sector(ticker: str) -> str:
@@ -1704,57 +1767,26 @@ def get_sentiment(ticker: str):
 
 @app.get("/api/insider/{ticker}")
 def get_insider(ticker: str):
+    """Insider detail for the Factor Breakdown UI. Backed by the same EDGAR
+    structured-submissions fetch as the scored insider factor (_fetch_insider), so the
+    detail view and the composite factor always describe the same underlying data."""
     ticker = ticker.upper()
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        url = (
-            f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
-            f"&dateRange=custom&startdt={start}&enddt={today}&forms=4"
-        )
-        headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
-        resp = _http_client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return {"available": False}
-        data = resp.json()
-        hits = data.get("hits", {}).get("hits", [])
-        if not hits:
-            return {"available": False, "ticker": ticker, "net_shares": 0, "transaction_count": 0, "direction": "neutral"}
-
-        net_shares = 0
-        tx_count = 0
-        for hit in hits:
-            src = hit.get("_source", {})
-            tx_type = src.get("transaction_type", "")
-            shares_raw = src.get("shares", 0)
-            try:
-                shares = float(shares_raw) if shares_raw else 0
-            except (ValueError, TypeError):
-                shares = 0
-            if tx_type == "P":
-                net_shares += shares
-                tx_count += 1
-            elif tx_type == "S":
-                net_shares -= shares
-                tx_count += 1
-
-        if net_shares > 0:
-            direction = "buying"
-        elif net_shares < 0:
-            direction = "selling"
-        else:
-            direction = "neutral"
-
-        return {
-            "available": True,
-            "ticker": ticker,
-            "net_shares": int(net_shares),
-            "transaction_count": tx_count,
-            "direction": direction,
-            "period_days": 30,
-        }
-    except Exception as e:
-        return {"available": False, "error": str(e)}
+    data = _fetch_insider(ticker)
+    # "available" mirrors the scored factor: present iff there is usable Form 4 data
+    # (data["score"] is not None). EDGAR-unreachable and no-filings both fall here, matching
+    # the factor showing null — so the detail view and composite never tell different stories.
+    if data["score"] is None:
+        return {"available": False, "ticker": ticker}
+    return {
+        "available": True,
+        "ticker": ticker,
+        "score": data["score"],
+        "net_shares": data["net_shares"],
+        "transaction_count": data["transaction_count"],
+        "direction": data["direction"],
+        "transactions": data["transactions"],
+        "period_days": 30,
+    }
 
 
 @app.get("/api/shortinterest/{ticker}")
@@ -1910,10 +1942,8 @@ def portfolio_sizing(req: SizingRequest):
             kf = _kelly_fraction(score, rvol) * corr_penalties[t]
             kelly_fracs[t] = kf
 
-        # Normalize so total Kelly allocation never exceeds 100%
-        total_kelly = sum(kelly_fracs.values())
-        if total_kelly > 1.0:
-            kelly_fracs = {t: v / total_kelly for t, v in kelly_fracs.items()}
+        # Normalize so total Kelly allocation never exceeds 100% (shared with live trader)
+        kelly_fracs = _normalize_portfolio_sizing(kelly_fracs, PORTFOLIO_KELLY_CAP)
 
         # Vol-targeted allocations: 1/vol weight, normalised
         inv_vol = {t: (1.0 / max(vols_map[t], 0.01)) * corr_penalties[t] for t in tickers}
@@ -2255,8 +2285,14 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
                         break
                 except Exception:
                     pass
-    except Exception:
-        pass
+    except Exception as exc:
+        # Fail OPEN (return False → allow the trade) when earnings data is genuinely
+        # unavailable, but never silently: surface the failure in server logs and as a
+        # flagged signal_log row so the gate shows up as uncertain in the UI rather than
+        # an invisible pass right before a possible earnings announcement.
+        logger.warning("%s: earnings_within_2d gate data unavailable: %s", ticker, exc)
+        db.log_signal(ticker, None, None, "evaluated",
+                      f"earnings_check_failed:{exc}", None, None)
     with _EARNINGS_LOCK:
         _EARNINGS_CACHE[ticker] = (result, time.time())
     return result
@@ -2273,6 +2309,30 @@ def _compute_kelly_params(trades: list[dict]) -> Optional[tuple[float, float, fl
     b = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
     f_star = max(0.0, (p * b - q) / b)
     return p, b, f_star
+
+
+# Maximum aggregate Kelly-derived exposure across all positions opened in a single
+# run, as a fraction of equity. 1.0 → total exposure capped at 100% of equity.
+PORTFOLIO_KELLY_CAP = 1.0
+
+# Minimum per-position size as a fraction of equity. A position sized below this
+# (including after portfolio normalization scales it down) is not worth opening and
+# is dropped from the run. Shared by _position_dollars and the live-job normalization.
+POSITION_FLOOR_PCT = 0.005
+
+
+def _normalize_portfolio_sizing(sizes: dict[str, float], cap: float) -> dict[str, float]:
+    """Scale a map of per-position sizes down proportionally so their sum does not
+    exceed `cap`, returning the sizes unchanged when already within the cap.
+
+    Shared by the live signal job (sizes are dollar amounts, cap = PORTFOLIO_KELLY_CAP ×
+    equity) and the /api/portfolio/sizing endpoint (sizes are Kelly fractions, cap =
+    PORTFOLIO_KELLY_CAP) so the two paths can never drift apart.
+    """
+    total = sum(sizes.values())
+    if total > cap and total > 0:
+        return {k: v / total * cap for k, v in sizes.items()}
+    return dict(sizes)
 
 
 def _position_dollars(
@@ -2341,12 +2401,12 @@ def _position_dollars(
                 ticker, kelly_dollars, cap_3x,
             )
             kelly_dollars = cap_3x
-        # Hard cap 10%, floor 0.5%
-        kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * 0.005)
+        # Hard cap 10%, floor POSITION_FLOOR_PCT
+        kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * POSITION_FLOOR_PCT)
         return kelly_dollars, round(kelly_frac, 6), sizing_method
 
     # Vol-targeting fallback
-    raw_dollars = max(min(vol_base, equity * 0.10), equity * 0.005)
+    raw_dollars = max(min(vol_base, equity * 0.10), equity * POSITION_FLOOR_PCT)
     return raw_dollars, 0.0, "vol_target_fallback"
 
 
@@ -2513,7 +2573,10 @@ def _run_signal_job() -> None:
             except Exception as e:
                 logger.warning("snapshot write failed for %s: %s", _t, e)
 
-    # Sequential gate evaluation and order submission (must not be parallelised)
+    # Sequential gate evaluation (must not be parallelised). Order submission is
+    # deferred until after the loop so portfolio-wide Kelly normalization can be
+    # applied across all BUY candidates in this run before any order is placed.
+    buy_candidates: list[dict] = []
     for ticker in watchlist:
         try:
             if _earnings_within_days(ticker):
@@ -2669,36 +2732,103 @@ def _run_signal_job() -> None:
             dollars, kelly_frac, sizing_method = _position_dollars(
                 ticker, equity, effective_composite, vol_21d=result.get("vol_21d")
             )
-            try:
-                try:
-                    api.submit_order(MarketOrderRequest(
-                        symbol=ticker, notional=round(dollars, 2),
-                        side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                except Exception:
-                    qty = max(1, int(dollars // price))
-                    api.submit_order(MarketOrderRequest(
-                        symbol=ticker, qty=qty,
-                        side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                signal_id = db.log_signal(
-                    ticker, effective_composite, "BUY", "ordered", None, price, atr,
-                    hmm_regime=hmm_regime, sentiment_score=sentiment,
-                    smoothed_bull_prob=smoothed_bull_prob,
-                    kelly_fraction=kelly_frac, sizing_method=sizing_method,
-                    hmm_fit_failed=hmm_fit_failed,
-                )
-                if atr > 0:
-                    db.update_trailing_stop(signal_id, price - 1.5 * atr)
-                open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
-                logger.info(
-                    "%s: BUY $%.0f score=%.1f regime=%s bull_prob=%.2f sizing=%s kelly=%.3f sector=%s",
-                    ticker, dollars, effective_composite, hmm_regime,
-                    smoothed_bull_prob, sizing_method, kelly_frac, sector,
-                )
-            except Exception as e:
-                db.log_signal(ticker, composite, "BUY", "skipped",
-                              f"order_failed:{e}", price, atr)
+            # Candidate accepted: reserve its sector slot now (so later same-sector
+            # tickers in this run still see the concentration cap) and defer the order
+            # to the post-loop normalization + submission pass below.
+            #
+            # Intentional: the slot is reserved at acceptance, not on confirmed fill. A
+            # candidate that later fails at order submission (or is dropped sub-floor) keeps
+            # its slot for the rest of this run, which can block a later same-sector
+            # candidate. This is by design — we favor conservative sector exposure over
+            # maximizing fill count within a single cycle. Not a bug; do not "fix" it by
+            # moving the increment to the submission pass.
+            open_sector_counts[sector] = open_sector_counts.get(sector, 0) + 1
+            buy_candidates.append({
+                "ticker": ticker, "dollars": dollars, "kelly_frac": kelly_frac,
+                "sizing_method": sizing_method, "price": price, "atr": atr,
+                "composite": composite, "effective_composite": effective_composite,
+                "hmm_regime": hmm_regime, "sentiment": sentiment,
+                "smoothed_bull_prob": smoothed_bull_prob,
+                "hmm_fit_failed": hmm_fit_failed, "sector": sector,
+            })
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
+
+    # Portfolio-wide Kelly normalization with sub-floor dropping. Cap aggregate exposure
+    # across all BUYs in this run at PORTFOLIO_KELLY_CAP × equity, scaling each position
+    # down proportionally when the sum would exceed it (the per-position 10% cap is already
+    # applied inside _position_dollars; both constraints apply, whichever binds first).
+    #
+    # Proportional scaling can push a position below the POSITION_FLOOR_PCT floor; such
+    # positions aren't worth opening, so we drop them and re-normalize the survivors against
+    # the same cap — dropping frees headroom the remaining positions should use. This
+    # converges in ≤2 iterations (dropping only shrinks the total, so survivors only grow
+    # and never re-cross the floor), but we cap the loop and warn so a pathological input
+    # can't hang the job. Normalize from each candidate's original size every pass so freed
+    # headroom is redistributed rather than lost.
+    floor = POSITION_FLOOR_PCT * equity
+    raw_dollars = {c["ticker"]: c["dollars"] for c in buy_candidates}
+    dropped: list[dict] = []
+    converged = False
+    for _ in range(5):
+        if not buy_candidates:
+            converged = True
+            break
+        size_map = {c["ticker"]: raw_dollars[c["ticker"]] for c in buy_candidates}
+        normalized = _normalize_portfolio_sizing(size_map, PORTFOLIO_KELLY_CAP * equity)
+        for c in buy_candidates:
+            c["dollars"] = normalized[c["ticker"]]
+        sub_floor = [c for c in buy_candidates if c["dollars"] < floor]
+        if not sub_floor:
+            converged = True
+            break
+        dropped.extend(sub_floor)
+        buy_candidates = [c for c in buy_candidates if c["dollars"] >= floor]
+    if not converged:
+        logger.warning(
+            "Portfolio normalization did not converge in 5 iterations; proceeding with "
+            "%d candidate(s), dropped %d", len(buy_candidates), len(dropped),
+        )
+
+    for c in dropped:
+        db.log_signal(
+            c["ticker"], c["effective_composite"], "BUY", "skipped",
+            "below_floor_after_normalization", c["price"], c["atr"],
+            hmm_regime=c["hmm_regime"], sentiment_score=c["sentiment"],
+            smoothed_bull_prob=c["smoothed_bull_prob"],
+        )
+        logger.info("%s: skipped (below %.1f%% floor after portfolio normalization)",
+                    c["ticker"], POSITION_FLOOR_PCT * 100)
+
+    for c in buy_candidates:
+        ticker, dollars, price, atr = c["ticker"], c["dollars"], c["price"], c["atr"]
+        try:
+            try:
+                api.submit_order(MarketOrderRequest(
+                    symbol=ticker, notional=round(dollars, 2),
+                    side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+            except Exception:
+                qty = max(1, int(dollars // price))
+                api.submit_order(MarketOrderRequest(
+                    symbol=ticker, qty=qty,
+                    side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+            signal_id = db.log_signal(
+                ticker, c["effective_composite"], "BUY", "ordered", None, price, atr,
+                hmm_regime=c["hmm_regime"], sentiment_score=c["sentiment"],
+                smoothed_bull_prob=c["smoothed_bull_prob"],
+                kelly_fraction=c["kelly_frac"], sizing_method=c["sizing_method"],
+                hmm_fit_failed=c["hmm_fit_failed"],
+            )
+            if atr > 0:
+                db.update_trailing_stop(signal_id, price - 1.5 * atr)
+            logger.info(
+                "%s: BUY $%.0f score=%.1f regime=%s bull_prob=%.2f sizing=%s kelly=%.3f sector=%s",
+                ticker, dollars, c["effective_composite"], c["hmm_regime"],
+                c["smoothed_bull_prob"], c["sizing_method"], c["kelly_frac"], c["sector"],
+            )
+        except Exception as e:
+            db.log_signal(ticker, c["composite"], "BUY", "skipped",
+                          f"order_failed:{e}", price, atr)
 
     # Change 5: log wall-clock time to confirm parallelisation speedup
     elapsed = round(time.time() - job_start, 2)
