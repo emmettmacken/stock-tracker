@@ -4,7 +4,7 @@ import { CompanyInfo as CompanyInfoData } from "@/lib/types";
 import { fetchCompany } from "@/lib/api";
 
 // Cached company profile for the stock detail page: sector/industry, business
-// summary, a few trader-relevant fields and the last ~4 quarters of earnings.
+// summary and a few trader-relevant fields. (Recent earnings live in Financials.)
 // Pure read of /api/company/{ticker} (7-day backend cache).
 
 function fmtMarketCap(n: number | null): string | null {
@@ -78,8 +78,7 @@ export function CompanyInfo({ ticker }: { ticker: string }) {
     },
   ].filter((s) => s.value) as { label: string; value: string }[];
 
-  const earnings = data.earnings ?? [];
-  if (!hasProfile && stats.length === 0 && earnings.length === 0) return null;
+  if (!hasProfile && stats.length === 0) return null;
 
   const summary = data.summary ?? "";
   const isLong = summary.length > SUMMARY_LIMIT;
@@ -118,54 +117,6 @@ export function CompanyInfo({ ticker }: { ticker: string }) {
               {expanded ? "Show less" : "Show more"}
             </button>
           )}
-        </div>
-      )}
-
-      {/* Recent earnings */}
-      {earnings.length > 0 && (
-        <div>
-          <h3 className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Recent earnings</h3>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-[10px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
-                  <th className="text-left font-medium py-1.5 pr-4">Quarter</th>
-                  <th className="text-right font-medium py-1.5 px-4">EPS actual</th>
-                  <th className="text-right font-medium py-1.5 px-4">EPS est.</th>
-                  <th className="text-right font-medium py-1.5 pl-4">Surprise</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-zinc-800/60">
-                {earnings.map((q) => {
-                  const surprisePos = q.surprise_pct != null && q.surprise_pct >= 0;
-                  return (
-                    <tr key={q.date} className="text-zinc-200">
-                      <td className="text-left py-1.5 pr-4 tabular-nums text-zinc-400">{q.date}</td>
-                      <td className="text-right py-1.5 px-4 tabular-nums">
-                        {q.eps_actual != null ? q.eps_actual.toFixed(2) : "—"}
-                      </td>
-                      <td className="text-right py-1.5 px-4 tabular-nums text-zinc-400">
-                        {q.eps_estimate != null ? q.eps_estimate.toFixed(2) : "—"}
-                      </td>
-                      <td
-                        className={`text-right py-1.5 pl-4 tabular-nums font-medium ${
-                          q.surprise_pct == null
-                            ? "text-zinc-500"
-                            : surprisePos
-                            ? "text-emerald-400"
-                            : "text-red-400"
-                        }`}
-                      >
-                        {q.surprise_pct != null
-                          ? `${surprisePos ? "+" : ""}${q.surprise_pct.toFixed(1)}%`
-                          : "—"}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
         </div>
       )}
     </section>

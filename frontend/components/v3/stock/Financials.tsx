@@ -5,8 +5,10 @@ import { fetchCompany } from "@/lib/api";
 
 // Financials panel for the stock detail page — sits directly beneath Company Info.
 // Collapsed by default (same interaction as the Markov "Show anyway" toggle).
-// Pure read of /api/company/{ticker}; shares the backend's 7-day cache with Company
-// Info, so no extra yfinance fetch. Individual null fields are hidden per-ticker.
+// Groups: Valuation / Profitability & quality / Financial health / Market behavior,
+// plus a Recent earnings table. Pure read of /api/company/{ticker}; shares the
+// backend's 7-day cache with Company Info, so no extra yfinance fetch. Individual
+// null fields are hidden per-ticker.
 
 // Plain multiple (PEG, P/S, P/B, EV/EBITDA, current ratio, beta).
 function fmtRatio(n: number | null | undefined): string | null {
@@ -125,8 +127,10 @@ export function Financials({ ticker }: { ticker: string }) {
     .map((g) => ({ ...g, items: g.items.filter((i) => i.value) as { label: string; value: string }[] }))
     .filter((g) => g.items.length > 0);
 
+  const earnings = data.earnings ?? [];
+
   // Nothing populated for this ticker → stay quiet (same convention as Company Info).
-  if (groups.length === 0) return null;
+  if (groups.length === 0 && earnings.length === 0) return null;
 
   return (
     <section className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
@@ -160,6 +164,54 @@ export function Financials({ ticker }: { ticker: string }) {
               </div>
             </div>
           ))}
+
+          {/* Earnings — last ~4 quarters (date, EPS actual/estimate, surprise %). */}
+          {earnings.length > 0 && (
+            <div>
+              <h3 className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2.5">Earnings</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-[10px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
+                      <th className="text-left font-medium py-1.5 pr-4">Quarter</th>
+                      <th className="text-right font-medium py-1.5 px-4">EPS actual</th>
+                      <th className="text-right font-medium py-1.5 px-4">EPS est.</th>
+                      <th className="text-right font-medium py-1.5 pl-4">Surprise</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/60">
+                    {earnings.map((q) => {
+                      const surprisePos = q.surprise_pct != null && q.surprise_pct >= 0;
+                      return (
+                        <tr key={q.date} className="text-zinc-200">
+                          <td className="text-left py-1.5 pr-4 tabular-nums text-zinc-400">{q.date}</td>
+                          <td className="text-right py-1.5 px-4 tabular-nums">
+                            {q.eps_actual != null ? q.eps_actual.toFixed(2) : "—"}
+                          </td>
+                          <td className="text-right py-1.5 px-4 tabular-nums text-zinc-400">
+                            {q.eps_estimate != null ? q.eps_estimate.toFixed(2) : "—"}
+                          </td>
+                          <td
+                            className={`text-right py-1.5 pl-4 tabular-nums font-medium ${
+                              q.surprise_pct == null
+                                ? "text-zinc-500"
+                                : surprisePos
+                                ? "text-emerald-400"
+                                : "text-red-400"
+                            }`}
+                          >
+                            {q.surprise_pct != null
+                              ? `${surprisePos ? "+" : ""}${q.surprise_pct.toFixed(1)}%`
+                              : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </section>
