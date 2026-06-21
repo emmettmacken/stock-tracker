@@ -161,6 +161,14 @@ _COMPANY_CACHE: dict[str, tuple[dict, float]] = {}  # ticker → (info dict, tim
 _COMPANY_TTL = 7 * 86400  # 7 days
 _COMPANY_LOCK = threading.Lock()
 
+# Full-history price cache for the chart's "Max" range. A period="max" fetch can span
+# 20+ years (~270 KB for NVDA) and is user-triggered, so cache the projected points for
+# 1 h to avoid re-pulling the whole series on every revisit. Independent of the 760-day
+# signal/factor window — see fetch_ohlcv_max / get_price_history.
+_PRICE_HISTORY_CACHE: dict[str, tuple[list, float]] = {}  # ticker → (points, timestamp)
+_PRICE_HISTORY_TTL = 3600  # 1 hour
+_PRICE_HISTORY_LOCK = threading.Lock()
+
 # Change 5: one lock per cache dict to prevent TOCTOU races during parallel factor computation
 _FACTORS_LOCK = threading.Lock()
 _MACRO_LOCK = threading.Lock()
@@ -501,6 +509,40 @@ def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: i
         raise HTTPException(status_code=404, detail=f"'{ticker}' not found after {max_retries} attempts")
     raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
 
+def fetch_ohlcv_max(ticker: str, min_bars: int = 2, max_retries: int = 3) -> pd.DataFrame:
+    """Fetch the full available daily history for charting (yfinance period="max").
+
+    Deliberately separate from fetch_ohlcv so the chart's price-history window is
+    decoupled from the 760-day window used by _compute_factors / the signal job — neither
+    constrains the other. Uses the same auto_adjust=True as fetch_ohlcv, so split/dividend
+    adjustment is consistent across both paths (no artificial cliff at split dates)."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            df = yf.Ticker(ticker).history(period="max", auto_adjust=True, raise_errors=True)
+            if df.empty or len(df) < min_bars:
+                raise HTTPException(status_code=404, detail=f"Insufficient data for '{ticker}'")
+            return df[["High", "Low", "Close", "Volume"]].dropna()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if "Quote not found" in str(exc) or isinstance(exc, YFTickerMissingError):
+                raise HTTPException(status_code=404, detail=f"'{ticker}' not found")
+            if _transient(exc):
+                wait = 1.5 * (attempt + 1)
+                logger.warning("Transient %s attempt %d: %s (retry %.1fs)", ticker, attempt + 1, exc, wait)
+                time.sleep(wait)
+                continue
+            if attempt < max_retries - 1:
+                time.sleep(1.0)
+                continue
+            break
+    if isinstance(last_exc, (YFTzMissingError, YFTickerMissingError)):
+        raise HTTPException(status_code=404, detail=f"'{ticker}' not found after {max_retries} attempts")
+    raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
+
+
 def _wilder_atr(tr: np.ndarray, period: int = 21) -> np.ndarray:
     """Wilder's EMA of a true-range series, seeded with the SMA of the first `period`
     TRs. Returns an array the same length as `tr`; indices before the seed are NaN."""
@@ -543,21 +585,12 @@ def get_quote(ticker: str):
 
 # ── /api/price-history ────────────────────────────────────────────────────────
 
-@app.get("/api/price-history/{ticker}")
-def get_price_history(ticker: str, days: int = 760):
-    """Historical closing price + volume for charting.
-
-    Read-only: returns the same OHLCV bars already fetched for factor computation,
-    projected to date/close/volume arrays. No scores, signals or MAs are computed here
-    (moving-average overlays are drawn client-side from these closes for display only).
-    """
-    ticker = ticker.upper()
-    days = max(10, min(int(days), 1100))
-    df = fetch_ohlcv(ticker, days=days, min_bars=2)
+def _project_points(df: pd.DataFrame) -> list:
+    """Project an OHLCV frame to the [{date, close, volume}] shape the chart consumes."""
     idx = df.index
     closes = df["Close"].values
     vols = df["Volume"].values
-    points = [
+    return [
         {
             "date": idx[i].strftime("%Y-%m-%d"),
             "close": round(float(closes[i]), 4),
@@ -565,7 +598,33 @@ def get_price_history(ticker: str, days: int = 760):
         }
         for i in range(len(df))
     ]
-    return {"ticker": ticker, "days": days, "points": points}
+
+
+@app.get("/api/price-history/{ticker}")
+def get_price_history(ticker: str, days: int = 760, period: Optional[str] = None):
+    """Historical closing price + volume for charting.
+
+    Read-only and independent of the signal path: it makes its own yfinance fetch and does
+    NOT share the 760-day window used by _compute_factors / the signal job. When period="max"
+    the full available history is returned (yfinance period="max", cached 1 h since it's a
+    heavy multi-decade payload); otherwise a `days`-bar window is fetched (default 760, the
+    chart's lead-in for client-side MA200), capped at 1100. No scores, signals or MAs are
+    computed here (moving-average overlays are drawn client-side from these closes).
+    """
+    ticker = ticker.upper()
+    if period and period.lower() == "max":
+        with _PRICE_HISTORY_LOCK:
+            cached, ts = _PRICE_HISTORY_CACHE.get(ticker, (None, 0.0))
+            if cached is not None and (time.time() - ts) < _PRICE_HISTORY_TTL:
+                return {"ticker": ticker, "period": "max", "points": cached}
+        points = _project_points(fetch_ohlcv_max(ticker, min_bars=2))
+        with _PRICE_HISTORY_LOCK:
+            _PRICE_HISTORY_CACHE[ticker] = (points, time.time())
+        return {"ticker": ticker, "period": "max", "points": points}
+
+    days = max(10, min(int(days), 1100))
+    df = fetch_ohlcv(ticker, days=days, min_bars=2)
+    return {"ticker": ticker, "days": days, "points": _project_points(df)}
 
 # ── /api/signal ───────────────────────────────────────────────────────────────
 

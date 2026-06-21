@@ -212,8 +212,15 @@ export async function fetchBriefing(): Promise<Briefing> {
   return res.json();
 }
 
-export async function fetchPriceHistory(ticker: string, days = 760): Promise<PriceHistory> {
-  const res = await fetch(`${BASE}/api/price-history/${ticker}?days=${days}`);
+// Pass { max: true } for the chart's "Max" range (full available history); otherwise a
+// `days`-bar window is fetched (760 gives MA200 lead-in for shorter views sliced client-side).
+export async function fetchPriceHistory(
+  ticker: string,
+  opts: { days?: number; max?: boolean } = {},
+): Promise<PriceHistory> {
+  const { days = 760, max = false } = opts;
+  const query = max ? "period=max" : `days=${days}`;
+  const res = await fetch(`${BASE}/api/price-history/${ticker}?${query}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? `Failed to fetch price history for ${ticker}`);

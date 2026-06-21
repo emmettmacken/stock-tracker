@@ -40,19 +40,23 @@ export function TickerAnalytics({ ticker, period }: { ticker: string; period: Pe
   const [trades, setTrades] = useState<TradeOutcome[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Buy & hold over the "Max" / all-time window needs full history; shorter windows are
+  // sliced from the 760-bar fetch. Re-fetch only when crossing the Max boundary.
+  const wantMax = period === "Max";
+
   useEffect(() => {
     let cancelled = false;
     setError(null);
     setPoints(null);
     setTrades(null);
-    fetchPriceHistory(ticker, 760)
+    fetchPriceHistory(ticker, wantMax ? { max: true } : { days: 760 })
       .then((d) => { if (!cancelled) setPoints(d.points); })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load"); });
     fetchTradeHistory()
       .then((all) => { if (!cancelled) setTrades(all.filter((t) => t.ticker === ticker)); })
       .catch(() => { if (!cancelled) setTrades([]); });
     return () => { cancelled = true; };
-  }, [ticker]);
+  }, [ticker, wantMax]);
 
   // Anchor the window to the most recent price point so it matches the chart.
   const cutoff = useMemo(() => {

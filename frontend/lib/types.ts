@@ -230,7 +230,8 @@ export interface PricePoint {
 
 export interface PriceHistory {
   ticker: string;
-  days: number;
+  days?: number;      // present for windowed fetches
+  period?: string;    // "max" for the full-history fetch
   points: PricePoint[];
 }
 

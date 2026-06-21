@@ -28,6 +28,23 @@ interface Row {
   ma200: number | null;
 }
 
+// A plotted entry/exit dot. `price` is the actual fill price (Alpaca) — what we plot on Y;
+// `close` is the same date's daily close (yfinance) from the price line, for the gap explainer.
+interface Marker {
+  date: string;
+  price: number;
+  close: number | null;
+  gapPct: number | null;
+  kind: "entry" | "exit";
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// Format "2026-06-18" → "Jun 18" without going through Date() (avoids UTC→local off-by-one).
+function fmtShortDate(iso: string): string {
+  const [, mo, d] = iso.split("-").map(Number);
+  return `${MONTHS[mo - 1]} ${Number(d)}`;
+}
+
 export function PriceChart({
   ticker,
   period,
@@ -42,12 +59,19 @@ export function PriceChart({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showMA, setShowMA] = useState({ ma20: false, ma50: false, ma200: false });
+  // Marker the user is hovering/tapping, with its pixel coords from Recharts, for the explainer tooltip.
+  const [activeMarker, setActiveMarker] = useState<{ m: Marker; cx: number; cy: number } | null>(null);
+
+  // "Max" needs the full available history; every shorter range is served from the 760-bar
+  // window (which carries MA200 lead-in) and sliced client-side. Re-fetch only when crossing
+  // the Max boundary, not on every period switch.
+  const wantMax = period === "Max";
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchPriceHistory(ticker, 760)
+    fetchPriceHistory(ticker, wantMax ? { max: true } : { days: 760 })
       .then((d) => { if (!cancelled) setPoints(d.points); })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load prices"); })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -55,7 +79,7 @@ export function PriceChart({
       .then((all) => { if (!cancelled) setTrades(all.filter((t) => t.ticker === ticker)); })
       .catch(() => { /* markers are optional */ });
     return () => { cancelled = true; };
-  }, [ticker]);
+  }, [ticker, wantMax]);
 
   // Full-series rows with MAs computed over all available history.
   const fullRows: Row[] = useMemo(() => {
@@ -89,8 +113,10 @@ export function PriceChart({
 
   // Snap a trade date to the nearest visible trading day so the marker renders on-axis.
   const markers = useMemo(() => {
-    if (!rows.length) return [] as { date: string; price: number; kind: "entry" | "exit" }[];
+    if (!rows.length) return [] as Marker[];
     const dates = rows.map((r) => r.date);
+    // Reuse the already-loaded price-history closes (no extra fetch) to explain the marker-vs-line gap.
+    const closeByDate = new Map(rows.map((r) => [r.date, r.close]));
     const first = dates[0];
     const lastD = dates[dates.length - 1];
     const snap = (iso: string | null): string | null => {
@@ -105,12 +131,17 @@ export function PriceChart({
       }
       return best;
     };
-    const out: { date: string; price: number; kind: "entry" | "exit" }[] = [];
+    const build = (date: string, price: number, kind: "entry" | "exit"): Marker => {
+      const close = closeByDate.get(date) ?? null;
+      const gapPct = close ? (price / close - 1) * 100 : null;
+      return { date, price, close, gapPct, kind };
+    };
+    const out: Marker[] = [];
     for (const t of trades) {
       const e = snap(t.entry_timestamp);
-      if (e) out.push({ date: e, price: t.entry_price, kind: "entry" });
+      if (e) out.push(build(e, t.entry_price, "entry"));
       const x = snap(t.exit_timestamp);
-      if (x) out.push({ date: x, price: t.exit_price, kind: "exit" });
+      if (x) out.push(build(x, t.exit_price, "exit"));
     }
     return out;
   }, [rows, trades]);
@@ -179,6 +210,7 @@ export function PriceChart({
         </div>
       </div>
 
+      <div className="relative">
       <ResponsiveContainer width="100%" height={260}>
         <LineChart data={rows} margin={{ top: 6, right: 8, bottom: 0, left: -8 }}>
           <XAxis
@@ -213,15 +245,65 @@ export function PriceChart({
               key={`${m.kind}-${m.date}-${i}`}
               x={m.date}
               y={m.price}
-              r={4}
-              fill={m.kind === "entry" ? "#10b981" : "#ef4444"}
-              stroke="#09090b"
-              strokeWidth={1.5}
               isFront
+              shape={(props: { cx?: number; cy?: number }) => {
+                const cx = props.cx ?? 0;
+                const cy = props.cy ?? 0;
+                const fill = m.kind === "entry" ? "#10b981" : "#ef4444";
+                const show = () => setActiveMarker({ m, cx, cy });
+                return (
+                  <g>
+                    {/* Visible dot — unchanged size/position. */}
+                    <circle cx={cx} cy={cy} r={4} fill={fill} stroke="#09090b" strokeWidth={1.5} />
+                    {/* Larger transparent hit area so the tooltip is easy to hover/tap. */}
+                    <circle
+                      cx={cx}
+                      cy={cy}
+                      r={11}
+                      fill="transparent"
+                      style={{ cursor: "pointer" }}
+                      onMouseEnter={show}
+                      onMouseLeave={() => setActiveMarker(null)}
+                      onClick={() =>
+                        setActiveMarker((cur) => (cur?.m === m ? null : { m, cx, cy }))
+                      }
+                    />
+                  </g>
+                );
+              }}
             />
           ))}
         </LineChart>
       </ResponsiveContainer>
+
+      {activeMarker && (
+        <div
+          className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-[11px] leading-tight shadow-lg"
+          style={{ left: activeMarker.cx, top: activeMarker.cy - 10 }}
+        >
+          <div className="font-semibold text-zinc-100">
+            {activeMarker.m.kind === "entry" ? "Entry" : "Exit"}
+            <span className="text-zinc-500"> · {fmtShortDate(activeMarker.m.date)}</span>
+          </div>
+          <div className="mt-0.5 whitespace-nowrap text-zinc-300 tabular-nums">
+            Filled ${activeMarker.m.price.toFixed(2)}
+            {activeMarker.m.close != null && (
+              <span className="text-zinc-500"> · Day close ${activeMarker.m.close.toFixed(2)}</span>
+            )}
+          </div>
+          {activeMarker.m.gapPct != null && (
+            <div
+              className={`mt-0.5 font-semibold tabular-nums ${
+                activeMarker.m.gapPct >= 0 ? "text-emerald-400" : "text-red-400"
+              }`}
+            >
+              {activeMarker.m.gapPct >= 0 ? "+" : "−"}
+              {Math.abs(activeMarker.m.gapPct).toFixed(1)}% vs. close
+            </div>
+          )}
+        </div>
+      )}
+      </div>
 
       {markers.length > 0 && (
         <div className="flex items-center gap-4 text-[10px] text-zinc-500">
