@@ -191,6 +191,11 @@ _PORTFOLIO_HISTORY_TTL = 300  # 5 minutes
 # specially via the account's creation date (see api_portfolio_history).
 _ALPACA_HISTORY_PERIOD = {"1W": "1W", "1M": "1M", "3M": "3M", "6M": "6M", "1Y": "1A"}
 
+# Aggregate-expectancy cache for the /portfolio Edge Statistics section. Read-only
+# aggregation over closed trades; 10-min TTL since it changes only when a trade exits.
+_EDGE_STATS_CACHE: Optional[tuple[dict, float]] = None  # (result, timestamp)
+_EDGE_STATS_TTL = 600  # 10 minutes
+
 # Change 5: one lock per cache dict to prevent TOCTOU races during parallel factor computation
 _FACTORS_LOCK = threading.Lock()
 _MACRO_LOCK = threading.Lock()
@@ -3598,6 +3603,27 @@ def api_portfolio_close_position(req: ClosePositionRequest):
         return {"success": True, "order_id": str(order.id)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@app.get("/api/portfolio/edge-stats")
+def api_portfolio_edge_stats():
+    """Aggregate expectancy across all closed trades (signal_log JOIN trade_outcomes).
+
+    Read-only; cached 10 min. Returns n, win_rate (%), avg win/loss %, expectancy %
+    per trade and avg holding days. Adds low_sample=true when there are <10 closed
+    trades (too few to draw conclusions from).
+    """
+    global _EDGE_STATS_CACHE
+    if _EDGE_STATS_CACHE is not None:
+        cached, ts = _EDGE_STATS_CACHE
+        if (time.time() - ts) < _EDGE_STATS_TTL:
+            return cached
+
+    stats = db.get_edge_stats()
+    if stats["n"] < 10:
+        stats["low_sample"] = True
+    _EDGE_STATS_CACHE = (stats, time.time())
+    return stats
 
 
 @app.get("/api/paper/history")

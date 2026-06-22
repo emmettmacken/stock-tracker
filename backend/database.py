@@ -632,3 +632,47 @@ def get_all_trades_for_kelly() -> list[dict]:
             "SELECT return_pct FROM trade_outcomes ORDER BY exit_timestamp DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Edge statistics ───────────────────────────────────────────────────────────
+
+def get_edge_stats() -> dict:
+    """Aggregate expectancy across all closed trades (rows in trade_outcomes).
+
+    A closed trade is one with a trade_outcomes row (written when a position exits).
+    return_pct is stored as a percent. Returns counts and per-trade edge metrics:
+    win_rate (as a percentage), avg win/loss percent, expectancy percent per trade,
+    and average holding days. All zeroed when there are no closed trades.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT return_pct, holding_days FROM trade_outcomes WHERE return_pct IS NOT NULL"
+        ).fetchall()
+
+    n = len(rows)
+    if n == 0:
+        return {
+            "n": 0, "win_rate": 0.0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0,
+            "expectancy_pct": 0.0, "avg_hold_days": 0.0,
+        }
+
+    returns = [r["return_pct"] for r in rows]
+    wins   = [r for r in returns if r > 0]
+    losses = [r for r in returns if r <= 0]          # avg_loss_pct stays ≤ 0
+    win_frac = len(wins) / n
+    avg_win  = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+    # Expectancy uses the win *fraction* (0–1); win_rate is returned as a percentage.
+    expectancy = win_frac * avg_win + (1 - win_frac) * avg_loss
+
+    holds = [r["holding_days"] for r in rows if r["holding_days"] is not None]
+    avg_hold = sum(holds) / len(holds) if holds else 0.0
+
+    return {
+        "n": n,
+        "win_rate": round(win_frac * 100, 2),
+        "avg_win_pct": round(avg_win, 2),
+        "avg_loss_pct": round(avg_loss, 2),
+        "expectancy_pct": round(expectancy, 2),
+        "avg_hold_days": round(avg_hold, 1),
+    }

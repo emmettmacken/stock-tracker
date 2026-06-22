@@ -71,6 +71,17 @@ export function EquityCurve() {
     return { abs: last - first, pct: (last / first - 1) * 100 };
   }, [rows]);
 
+  // Current drawdown from the all-time peak equity within the visible window.
+  // Informational (not an alert) — recomputes whenever the period selector changes.
+  const drawdown = useMemo(() => {
+    if (!rows.length) return null;
+    const peak = Math.max(...rows.map((r) => r.equity));
+    const current = rows[rows.length - 1].equity;
+    if (!peak) return null;
+    const pct = ((current - peak) / peak) * 100;
+    return { pct, atPeak: current >= peak };
+  }, [rows]);
+
   const yDomain = useMemo<[number, number] | undefined>(() => {
     if (!rows.length) return undefined;
     const vals = rows.map((r) => r.equity);
@@ -96,6 +107,13 @@ export function EquityCurve() {
             </p>
           ) : (
             <p className="mt-1 text-xs text-zinc-600">Account equity over time</p>
+          )}
+          {drawdown != null && (
+            <p className={`mt-0.5 text-[11px] tabular-nums ${drawdown.atPeak ? "text-emerald-500/70" : "text-zinc-500"}`}>
+              {drawdown.atPeak
+                ? "Drawdown from peak: 0.00% (at peak)"
+                : `Drawdown from peak: ${drawdown.pct.toFixed(2)}%`}
+            </p>
           )}
         </div>
         <div className="inline-flex rounded-lg bg-zinc-800/50 p-0.5">

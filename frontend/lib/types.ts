@@ -407,6 +407,17 @@ export interface PaperAccount {
   error?: string;
 }
 
+// Aggregate expectancy across all closed trades (Portfolio → Edge Statistics).
+export interface EdgeStats {
+  n: number;
+  win_rate: number;        // percentage of trades with return_pct > 0
+  avg_win_pct: number;     // average return_pct of winning trades
+  avg_loss_pct: number;    // average return_pct of losing trades (≤ 0)
+  expectancy_pct: number;  // expected return per trade, %
+  avg_hold_days: number;
+  low_sample?: boolean;    // true when n < 10
+}
+
 export interface PortfolioBacktestResult {
   tickers: string[];
   capital: number;

@@ -4,7 +4,7 @@ import {
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
   AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
-  EquityHistory, CompanyInfo, PortfolioHistory, EntrySignals,
+  EquityHistory, CompanyInfo, PortfolioHistory, EntrySignals, EdgeStats,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -200,6 +200,14 @@ export async function closePosition(
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? `Failed to close position for ${ticker}`);
   }
+  return res.json();
+}
+
+// Aggregate expectancy across all closed trades, for the Portfolio Edge Statistics
+// section and the Strategy Lab sample-size caveat (uses the `n` field).
+export async function fetchEdgeStats(): Promise<EdgeStats> {
+  const res = await fetch(`${BASE}/api/portfolio/edge-stats`);
+  if (!res.ok) throw new Error("Failed to fetch edge stats");
   return res.json();
 }
 

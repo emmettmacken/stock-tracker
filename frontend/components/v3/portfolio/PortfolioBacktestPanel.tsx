@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   LineChart, Line, AreaChart, Area,
   BarChart, Bar, Cell,
@@ -7,7 +7,7 @@ import {
   ResponsiveContainer, ReferenceLine, CartesianGrid,
 } from "recharts";
 import { PortfolioBacktestResult } from "@/lib/types";
-import { fetchPortfolioBacktest } from "@/lib/api";
+import { fetchPortfolioBacktest, fetchEdgeStats } from "@/lib/api";
 import { EfficientFrontierChart } from "./EfficientFrontierChart";
 
 interface Props {
@@ -58,6 +58,16 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
   const [result, setResult] = useState<PortfolioBacktestResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Live closed-trade count for the sample-size caveat. null = unknown (omit gracefully).
+  const [liveClosed, setLiveClosed] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchEdgeStats()
+      .then((d) => { if (!cancelled) setLiveClosed(d.n); })
+      .catch(() => { if (!cancelled) setLiveClosed(null); });
+    return () => { cancelled = true; };
+  }, []);
 
   async function run() {
     setLoading(true);
@@ -199,6 +209,14 @@ export function PortfolioBacktestPanel({ tickers, capital }: Props) {
           positive={worstMonth >= 0}
         />
       </div>
+
+      {/* Sample-size caveat — backtest trade count vs. live closed trades. */}
+      <p className="text-zinc-600 text-[10px] leading-relaxed">
+        Backtest results across {d.rebalance_events.length} trades.
+        {liveClosed != null && ` Live paper trading: ${liveClosed} closed trades.`}
+        {" "}Statistical edge requires a large sample — treat{" "}
+        {liveClosed != null ? "both figures" : "this figure"} as directional only.
+      </p>
 
       {/* Equity curve */}
       <div>

@@ -5,6 +5,7 @@ import { fetchPaperAccount } from "@/lib/api";
 import { StatCard } from "@/components/v4/portfolio/StatCard";
 import { EquityCurve } from "@/components/v4/portfolio/EquityCurve";
 import { PositionsPanel } from "@/components/v4/portfolio/PositionsPanel";
+import { EdgeStats } from "@/components/v4/portfolio/EdgeStats";
 import { Skeleton } from "@/components/v3/Skeleton";
 import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 
@@ -84,6 +85,10 @@ export default function PortfolioPage() {
 
         <section>
           <PositionsPanel />
+        </section>
+
+        <section>
+          <EdgeStats />
         </section>
       </div>
     </div>
