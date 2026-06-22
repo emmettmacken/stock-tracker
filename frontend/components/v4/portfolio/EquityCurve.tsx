@@ -1,11 +1,21 @@
 "use client";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
 import { PortfolioHistoryPoint } from "@/lib/types";
-import { fetchPortfolioHistory } from "@/lib/api";
+import { fetchPortfolioHistory, fetchLiveEquity } from "@/lib/api";
 import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
+
+// Roughly "is the US market open right now?" — 14:30–21:00 UTC, Mon–Fri. Used only to gate
+// the live-tip poll, so an approximation (no holiday calendar) is fine; off-hours we don't
+// poll at all. Comparing as integer HHMM avoids minute-by-minute float math.
+function isMarketLikelyOpen(now: Date = new Date()): boolean {
+  const day = now.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const hhmm = now.getUTCHours() * 100 + now.getUTCMinutes();
+  return hhmm >= 1430 && hhmm < 2100;
+}
 
 // Selector labels are passed straight through to the backend, which maps each to an
 // Alpaca period + resolution (15-min bars for 1D, hourly for 1W, daily beyond) and
@@ -43,11 +53,9 @@ export function EquityCurve() {
   const [error, setError] = useState<string | null>(null);
   // Index of the data point the cursor is nearest to — drives the vertical crosshair.
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  // True while the cursor is over the chart. A ref (not state) so toggling it never
-  // re-renders — that's the whole point: the live 1D poll must not redraw mid-hover.
-  const isHovering = useRef(false);
 
-  // Initial / range-change load — shows the spinner and resets the crosshair.
+  // Initial / range-change load — the only time the full dataset is fetched. Shows the
+  // spinner and resets the crosshair. Live updates (1D) extend just the tip below.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -64,30 +72,31 @@ export function EquityCurve() {
     return () => { cancelled = true; };
   }, [range]);
 
-  // Background refetch (no spinner, keeps last good data on error) for the live poll and
-  // the hover-release catch-up. Only the points update, so the chart redraws in place.
-  const refetch = useCallback(() => {
-    fetchPortfolioHistory(range)
-      .then((d) => { if (d.available) setPoints(d.points ?? []); })
-      .catch(() => { /* keep the last good curve on a transient background failure */ });
-  }, [range]);
-
-  // The 1D view is live intraday — poll every 60s (matching the backend's 1D cache TTL),
-  // but skip any tick while the cursor is over the chart so dragging never flickers. Longer
-  // ranges are effectively static, so they don't poll. Positions/edge stats poll elsewhere.
+  // Live tip (1D only): poll just the current equity value every 10s during market hours and
+  // mutate only the last point — replacing today's tip in place, or appending the first bar
+  // of a new session. The functional update touches just the tail, so Recharts animates the
+  // line extending rather than re-rendering the whole series. Longer ranges are historical and
+  // never poll. No hover guard is needed since the full dataset never reloads.
   useEffect(() => {
     if (range !== "1D") return;
-    const id = setInterval(() => { if (!isHovering.current) refetch(); }, 60_000);
+    const tick = () => {
+      if (!isMarketLikelyOpen()) return;
+      fetchLiveEquity()
+        .then((d) => {
+          if (typeof d?.equity !== "number") return;
+          const tip = { timestamp: d.timestamp, equity: d.equity };
+          setPoints((prev) => {
+            if (!prev || prev.length === 0) return prev;
+            const last = prev[prev.length - 1];
+            const sameDay = last.timestamp.slice(0, 10) === tip.timestamp.slice(0, 10);
+            return sameDay ? [...prev.slice(0, -1), tip] : [...prev, tip];
+          });
+        })
+        .catch(() => { /* transient — keep the last good tip, try again next tick */ });
+    };
+    const id = setInterval(tick, 10_000);
     return () => clearInterval(id);
-  }, [range, refetch]);
-
-  const onChartEnter = useCallback(() => { isHovering.current = true; }, []);
-  const onChartLeave = useCallback(() => {
-    isHovering.current = false;
-    setActiveIndex(null);
-    // Catch up on any 1D updates skipped while the user was interacting.
-    if (range === "1D") refetch();
-  }, [range, refetch]);
+  }, [range]);
 
   const rows = useMemo<Row[]>(() => {
     if (!points) return [];
@@ -175,7 +184,6 @@ export function EquityCurve() {
       ) : rows.length < 2 ? (
         <p className="text-zinc-500 text-xs py-12 text-center">Not enough equity history for this range yet.</p>
       ) : (
-        <div onMouseEnter={onChartEnter} onMouseLeave={onChartLeave}>
         <ResponsiveContainer width="100%" height={260}>
           <AreaChart
             data={rows}
@@ -234,10 +242,10 @@ export function EquityCurve() {
               strokeWidth={1.6}
               fill="url(#equityFill)"
               dot={false}
+              isAnimationActive={true}
             />
           </AreaChart>
         </ResponsiveContainer>
-        </div>
       )}
     </div>
   );

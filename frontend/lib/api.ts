@@ -178,6 +178,14 @@ export async function fetchPortfolioHistory(period: string): Promise<PortfolioHi
   return res.json();
 }
 
+// Current account equity + timestamp for the 1D equity curve's live tip. Uncached on the
+// backend — fetched every ~10s during market hours to extend only the line's last point.
+export async function fetchLiveEquity(): Promise<{ equity: number; timestamp: string }> {
+  const res = await fetch(`${BASE}/api/portfolio/live-equity`);
+  if (!res.ok) throw new Error("Failed to fetch live equity");
+  return res.json();
+}
+
 // Entry data ({ticker: {entry_score, entry_date, entry_price}}) for open positions,
 // joined from signal_log's most recent BUY per still-open ticker.
 export async function fetchEntrySignals(): Promise<EntrySignals> {

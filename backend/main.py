@@ -3676,6 +3676,23 @@ def api_portfolio_history(period: str = "1D"):
         return {"available": False, "error": str(e), "period": period}
 
 
+@app.get("/api/portfolio/live-equity")
+def api_portfolio_live_equity():
+    """Current account equity + timestamp, for the 1D equity curve's live tip.
+
+    Deliberately uncached and tiny: the chart fetches its full history once, then polls this
+    every ~10s during market hours to extend only the line's tip (see EquityCurve.tsx).
+    Returns {equity, timestamp} where timestamp is a UTC ISO string.
+    """
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err}
+    try:
+        equity = round(float(_alpaca_client.get_account().equity), 2)
+        return {"equity": equity, "timestamp": datetime.utcnow().isoformat() + "Z"}
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
 @app.get("/api/portfolio/positions/entry-signals")
 def api_portfolio_entry_signals():
     """Entry data for currently-open positions: {ticker: {entry_score, entry_date, entry_price}}.
