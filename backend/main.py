@@ -945,6 +945,26 @@ def get_backtest(ticker: str):
     }
     total_buy_signals_raw = 0  # HMM=BUY signals before any gate
 
+    # Diagnostic-only: per-event log of high-confidence BUY signals that a gate blocked.
+    # Visibility change only — does not affect signals, gate logic, or trade outcomes.
+    # Only signals scoring >= this threshold are logged (BUYs map to >=75 via the HMM
+    # factor score, so low-score days that were never going to trade are excluded).
+    REJECTION_SCORE_FLOOR = 40.0
+    rejection_events: list[dict] = []
+
+    def _log_rejection(idx: int, gate: str, score: float, detail: str) -> None:
+        if score < REJECTION_SCORE_FLOOR:
+            return
+        raw_d = dates[idx]
+        d_str = raw_d.strftime("%Y-%m-%d") if hasattr(raw_d, "strftime") else str(raw_d)[:10]
+        rejection_events.append({
+            "date":   d_str,
+            "ticker": ticker,
+            "gate":   gate,
+            "score":  round(float(score), 1),
+            "detail": detail,
+        })
+
     test_start = TRAIN
     while test_start + TEST <= n:
         ts, te = test_start - TRAIN, test_start
@@ -968,7 +988,8 @@ def get_backtest(ticker: str):
             ratio  = vol[idx] / max(vol_20d[idx], 1.0)
             cur_st = si(ret_bucket(r_t), vol_bucket(ratio, lo_t, hi_t))
 
-            signal = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)["signal"]
+            sig_res = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)
+            signal = sig_res["signal"]
 
             # Portfolio update: earn r_t if already in position BEFORE this signal
             if in_pos:
@@ -999,7 +1020,13 @@ def get_backtest(ticker: str):
             else:
                 daily_strat.append(0.0)
                 if signal == "BUY":
+                    # Diagnostic score for this BUY signal (0–100), same mapping the live
+                    # factor engine uses; logging only, never affects trade decisions.
+                    buy_score = _hmm_factor_score("BUY", sig_res["confidence"])
                     spy_ok = (spy_above_ma is None) or bool(spy_above_ma[idx])
+                    if macro_filter and not spy_ok:
+                        _log_rejection(idx, "macro_circuit_breaker", buy_score,
+                                       "SPY below its 200-day MA")
                     if not macro_filter or spy_ok:
                         total_buy_signals_raw += 1
 
@@ -1007,6 +1034,8 @@ def get_backtest(ticker: str):
                         if vix_series_bt is not None and idx < len(vix_series_bt):
                             if vix_series_bt[idx] > 30.0:
                                 gate_rejections["vix_too_high"] += 1
+                                _log_rejection(idx, "vix_too_high", buy_score,
+                                               f"VIX={vix_series_bt[idx]:.1f} > 30")
                                 continue
 
                         # Change 1: overextension gate (price > 1.25×MA20 unless top-quartile momentum)
@@ -1019,6 +1048,8 @@ def get_backtest(ticker: str):
                             )
                             if price_ratio > 1.25 and not top_q_mom:
                                 gate_rejections["overextended"] += 1
+                                _log_rejection(idx, "overextended", buy_score,
+                                               f"price {price_ratio:.2f}× MA20 (>1.25), not top-quartile momentum")
                                 continue
 
                         # Change 1: momentum disagreement gate
@@ -1027,11 +1058,15 @@ def get_backtest(ticker: str):
                         if not np.isnan(r3) and not np.isnan(r12):
                             if (r3 + r12) <= 0 or r3 < -0.10 or r12 < -0.10:
                                 gate_rejections["momentum_disagreement"] += 1
+                                _log_rejection(idx, "momentum_disagreement", buy_score,
+                                               f"3m={r3:+.1%}, 12m={r12:+.1%}")
                                 continue
 
                         # Change 1: re-entry cooldown (5 trading days after last exit)
                         if idx - last_exit_idx < 5:
                             gate_rejections["reentry_cooldown"] += 1
+                            _log_rejection(idx, "reentry_cooldown", buy_score,
+                                           f"{idx - last_exit_idx} days since last exit, cooldown=5")
                             continue
 
                         in_pos = True
@@ -1066,6 +1101,17 @@ def get_backtest(ticker: str):
     win_rate_trades = float(sum(trade_results) / len(trade_results) * 100) if trade_results else 0.0
 
     trades_after_gates = total_buy_signals_raw - sum(gate_rejections.values())
+
+    # Diagnostic-only: per-gate count of how often each gate was the primary blocker
+    # (the first gate that fired for a logged signal), descending. Built from the
+    # logged events so the summary and the event table always agree.
+    gate_rejection_summary: dict[str, int] = {}
+    for _ev in rejection_events:
+        gate_rejection_summary[_ev["gate"]] = gate_rejection_summary.get(_ev["gate"], 0) + 1
+    gate_rejection_summary = dict(
+        sorted(gate_rejection_summary.items(), key=lambda kv: kv[1], reverse=True)
+    )
+
     return {
         "ticker":                  ticker,
         "equity_curve":            equity_curve,
@@ -1076,6 +1122,9 @@ def get_backtest(ticker: str):
         "win_rate_trades":         round(win_rate_trades, 1),
         "num_trades":              len(trade_results),
         "num_windows":             (n - TRAIN) // TEST,
+        # Diagnostic-only: why high-confidence BUY signals didn't convert to trades
+        "gate_rejections":         rejection_events,
+        "gate_rejection_summary":  gate_rejection_summary,
         # Change 1: gate comparison — how many BUY signals each gate filtered
         "gate_comparison": {
             "total_buy_signals_raw":     total_buy_signals_raw,

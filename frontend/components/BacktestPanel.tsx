@@ -7,6 +7,11 @@ import {
 import { BacktestData } from "@/lib/types";
 import { fetchBacktest } from "@/lib/api";
 
+// Gate names arrive as short snake_case strings — render them readably.
+function gateLabel(gate: string) {
+  return gate.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 function StatCard({ label, value, sub, positive }: {
   label: string; value: string; sub?: string; positive?: boolean;
 }) {
@@ -29,6 +34,7 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
   const [result, setResult] = useState<BacktestData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [gatesOpen, setGatesOpen] = useState(false);
 
   async function run() {
     setLoading(true);
@@ -183,6 +189,79 @@ export function BacktestPanel({ ticker }: { ticker: string }) {
           </LineChart>
         </ResponsiveContainer>
       </div>
+
+      {/* Gate Rejections — diagnostic: why high-confidence signals didn't trade */}
+      {(() => {
+        const events = d.gate_rejections ?? [];
+        const summary = d.gate_rejection_summary ?? {};
+        const ranked = Object.entries(summary).sort((a, b) => b[1] - a[1]);
+        const maxCount = ranked.length ? ranked[0][1] : 0;
+        return (
+          <div className="border-t border-zinc-800 pt-3">
+            <button
+              onClick={() => setGatesOpen((o) => !o)}
+              className="w-full flex items-center justify-between text-left group"
+            >
+              <span className="text-zinc-400 group-hover:text-zinc-200 transition-colors">
+                {events.length === 0
+                  ? "No high-confidence signals were blocked"
+                  : `${events.length} high-confidence signal${events.length === 1 ? "" : "s"} blocked by gates — ${gatesOpen ? "collapse" : "expand to see breakdown"}`}
+              </span>
+              {events.length > 0 && (
+                <span className={`text-zinc-600 transition-transform duration-150 ${gatesOpen ? "rotate-90" : ""}`}>
+                  ▶
+                </span>
+              )}
+            </button>
+
+            {gatesOpen && events.length > 0 && (
+              <div className="mt-3 space-y-4">
+                {/* A) Ranked bars — which gates fired most */}
+                <div className="space-y-1.5">
+                  {ranked.map(([gate, count]) => (
+                    <div key={gate} className="flex items-center gap-2">
+                      <div className="w-36 shrink-0 text-zinc-400 truncate" title={gateLabel(gate)}>
+                        {gateLabel(gate)}
+                      </div>
+                      <div className="flex-1 bg-zinc-800/50 rounded h-4 overflow-hidden">
+                        <div
+                          className="h-full bg-amber-500/70 rounded"
+                          style={{ width: `${maxCount ? (count / maxCount) * 100 : 0}%` }}
+                        />
+                      </div>
+                      <div className="w-6 shrink-0 text-right tabular-nums text-zinc-300">{count}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* B) Individual rejection events */}
+                <div className="max-h-48 overflow-y-auto rounded-lg border border-zinc-800">
+                  <table className="w-full text-left">
+                    <thead className="sticky top-0 bg-zinc-900">
+                      <tr className="text-zinc-500 text-[10px] uppercase tracking-wider">
+                        <th className="px-2 py-1.5 font-medium">Date</th>
+                        <th className="px-2 py-1.5 font-medium">Gate</th>
+                        <th className="px-2 py-1.5 font-medium text-right">Score</th>
+                        <th className="px-2 py-1.5 font-medium">Detail</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {events.map((ev, i) => (
+                        <tr key={i} className="border-t border-zinc-800/60 text-zinc-300">
+                          <td className="px-2 py-1.5 tabular-nums whitespace-nowrap">{ev.date}</td>
+                          <td className="px-2 py-1.5 whitespace-nowrap">{gateLabel(ev.gate)}</td>
+                          <td className="px-2 py-1.5 tabular-nums text-right">{ev.score.toFixed(1)}</td>
+                          <td className="px-2 py-1.5 text-zinc-500">{ev.detail}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       <button
         onClick={run}

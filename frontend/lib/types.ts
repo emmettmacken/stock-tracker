@@ -39,6 +39,14 @@ export interface EquityPoint {
   bah: number;
 }
 
+export interface GateRejection {
+  date: string;
+  ticker: string;
+  gate: string;
+  score: number;
+  detail: string;
+}
+
 export interface BacktestData {
   ticker: string;
   equity_curve: EquityPoint[];
@@ -49,6 +57,8 @@ export interface BacktestData {
   win_rate_trades: number;
   num_trades: number;
   num_windows: number;
+  gate_rejections?: GateRejection[];
+  gate_rejection_summary?: Record<string, number>;
 }
 
 // ── V3 Types ──────────────────────────────────────────────────────────────────
