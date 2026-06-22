@@ -47,7 +47,7 @@ export function DetailPanel({ data }: { data: SignalData }) {
         </div>
         <div className="bg-zinc-800/50 rounded-lg p-2.5">
           <div className="text-zinc-500 mb-0.5">Obs at State</div>
-          <div className={`font-semibold tabular-nums ${data.n_obs_current_state >= 15 ? "text-emerald-400" : "text-amber-400"}`}>
+          <div className={`font-semibold tabular-nums ${data.n_obs_current_state >= 10 ? "text-emerald-400" : "text-amber-400"}`}>
             {data.n_obs_current_state} transitions
           </div>
         </div>

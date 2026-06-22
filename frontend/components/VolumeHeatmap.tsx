@@ -26,15 +26,15 @@ export function VolumeHeatmap({
   currentRetIdx: number;
   currentVolIdx: number;
 }) {
-  const shortVol = ["Low", "Mid", "High"];
-
+  // Column headers come from the API's vol labels — the vol dimension is collapsed
+  // (single "All Vol" column), so don't assume a fixed 3-column layout.
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-xs border-separate [border-spacing:3px] tabular-nums">
         <thead>
           <tr>
             <th className="px-1.5 py-1 text-zinc-500 font-normal text-left" />
-            {shortVol.map((v) => (
+            {volLabels.map((v) => (
               <th key={v} className="px-1.5 py-1 text-zinc-400 font-semibold text-center">{v}</th>
             ))}
           </tr>
@@ -58,7 +58,7 @@ export function VolumeHeatmap({
                     }`}
                   >
                     <div className="font-semibold">{(val * 100).toFixed(0)}%</div>
-                    <div className={`text-[9px] opacity-70 ${obs < 15 ? "text-amber-300" : ""}`}>
+                    <div className={`text-[9px] opacity-70 ${obs < 10 ? "text-amber-300" : ""}`}>
                       n={obs}
                     </div>
                   </td>
@@ -69,7 +69,7 @@ export function VolumeHeatmap({
         </tbody>
       </table>
       <p className="text-zinc-600 text-[10px] mt-1.5">
-        Cell = P(next day bullish) from that (return, volume) state. n = observations.
+        Cell = P(next day bullish) from that return state. n = observations.
       </p>
     </div>
   );

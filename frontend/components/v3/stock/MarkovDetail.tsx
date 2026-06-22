@@ -6,7 +6,7 @@ import { DetailPanel } from "@/components/DetailPanel";
 // Plain-English translation of the Markov matrix, shown above the raw grids.
 export function MarkovDetail({ data }: { data: SignalData }) {
   const n = data.n_obs_current_state;
-  const lowConfidence = n < 15 || !data.high_confidence;
+  const lowConfidence = n < 10 || !data.high_confidence;
   // When the read is low-confidence, the colored matrix/heatmap/stationary grids
   // are misleading, so collapse them behind an explicit opt-in.
   const [showDetails, setShowDetails] = useState(false);

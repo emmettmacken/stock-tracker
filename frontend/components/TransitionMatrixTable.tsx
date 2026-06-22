@@ -51,7 +51,7 @@ export function TransitionMatrixTable({
                   </td>
                 ))}
                 {rowObs && (
-                  <td className={`px-1.5 py-1 text-center ${rowObs[i] >= 15 ? "text-zinc-500" : "text-amber-500"}`}>
+                  <td className={`px-1.5 py-1 text-center ${rowObs[i] >= 10 ? "text-zinc-500" : "text-amber-500"}`}>
                     {rowObs[i]}
                   </td>
                 )}

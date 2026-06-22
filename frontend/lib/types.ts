@@ -24,8 +24,8 @@ export interface SignalData extends QuoteData {
   regime: Regime;
   high_confidence: boolean;
   transition_matrix_5x5: number[][];
-  bullish_heatmap: number[][];   // [5][3]
-  row_observations: number[][];  // [5][3]
+  bullish_heatmap: number[][];   // [5][1] — vol dimension collapsed
+  row_observations: number[][];  // [5][1] — vol dimension collapsed
   stationary_distribution: number[];
   return_labels: string[];
   vol_labels: string[];

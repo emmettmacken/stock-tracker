@@ -151,13 +151,17 @@ def _shutdown() -> None:
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 RETURN_LABELS = ["Strong Down", "Down", "Flat", "Up", "Strong Up"]
-VOL_LABELS    = ["Low Vol", "Mid Vol", "High Vol"]
+# Volatility dimension collapsed (N_VOL=1): the discrete Markov chain is keyed on the
+# 5 return buckets only. With 5 states a 252-day window yields ~50 obs/state (vs ~17 at
+# the old 15-state 5×3 layout), enough for reliable transition-row estimates instead of
+# the chronic sub-MIN_OBS rows that pinned confidence at the 0.3 floor and forced HOLD.
+VOL_LABELS    = ["All Vol"]
 N_RET    = 5
-N_VOL    = 3
-N_ST     = N_RET * N_VOL   # 15
+N_VOL    = 1
+N_ST     = N_RET * N_VOL   # 5
 
 RET_THRESHOLDS = (-0.015, -0.003, 0.003, 0.015)
-MIN_OBS        = 15
+MIN_OBS        = 10
 ROLLING_WINDOW = 252
 _SENTIMENT_CACHE: dict[str, tuple[dict, float]] = {}  # ticker → (result, timestamp)
 _SENTIMENT_TTL = 900  # 15 minutes
@@ -316,6 +320,8 @@ def ret_bucket(r: float) -> int:
     return 4
 
 def vol_bucket(ratio: float, lo: float, hi: float) -> int:
+    if N_VOL == 1:           # vol dimension collapsed — single bucket
+        return 0
     if ratio < lo: return 0
     if ratio > hi: return 2
     return 1
