@@ -253,9 +253,12 @@ export function PriceChart({
         <LineChart
           data={rows}
           margin={{ top: 6, right: 8, bottom: 0, left: -8 }}
-          onMouseMove={(s: { activeTooltipIndex?: number }) =>
-            setActiveIndex(typeof s?.activeTooltipIndex === "number" ? s.activeTooltipIndex : null)
-          }
+          onMouseMove={(s: { activeTooltipIndex?: number }) => {
+            // Only commit when the nearest bar changes — Recharts fires this on every pixel,
+            // and re-rendering within the same bar replayed the Line draw animation (flicker).
+            const next = typeof s?.activeTooltipIndex === "number" ? s.activeTooltipIndex : null;
+            setActiveIndex((prev) => (prev === next ? prev : next));
+          }}
           onMouseLeave={() => setActiveIndex(null)}
         >
           <XAxis
@@ -293,10 +296,10 @@ export function PriceChart({
             />
           )}
           <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4 }} iconType="line" />
-          <Line type="monotone" dataKey="close" name="Close" stroke="#10b981" strokeWidth={1.6} dot={false} />
-          {showMA.ma20 && <Line type="monotone" dataKey="ma20" name="MA20" stroke="#38bdf8" strokeWidth={1.2} dot={false} connectNulls />}
-          {showMA.ma50 && <Line type="monotone" dataKey="ma50" name="MA50" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />}
-          {showMA.ma200 && <Line type="monotone" dataKey="ma200" name="MA200" stroke="#f59e0b" strokeWidth={1.2} dot={false} connectNulls />}
+          <Line type="monotone" dataKey="close" name="Close" stroke="#10b981" strokeWidth={1.6} dot={false} isAnimationActive={false} />
+          {showMA.ma20 && <Line type="monotone" dataKey="ma20" name="MA20" stroke="#38bdf8" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
+          {showMA.ma50 && <Line type="monotone" dataKey="ma50" name="MA50" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
+          {showMA.ma200 && <Line type="monotone" dataKey="ma200" name="MA200" stroke="#f59e0b" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
           {markers.map((m, i) => (
             <ReferenceDot
               key={`${m.kind}-${m.date}-${i}`}

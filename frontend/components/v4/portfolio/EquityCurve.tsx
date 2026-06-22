@@ -101,8 +101,8 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
 
   // Live tip (1D only): poll just the current equity value every 10s during market hours and
   // mutate only the last point — replacing today's tip in place, or appending the first bar
-  // of a new session. The functional update touches just the tail, so Recharts animates the
-  // line extending rather than re-rendering the whole series. Longer ranges are historical and
+  // of a new session. The functional update touches just the tail (Area animation is off, so
+  // the new point appears without replaying the draw). Longer ranges are historical and
   // never poll. The fetch always runs and always reports the value upward; only the setPoints
   // (which would flicker the crosshair) is deferred while the cursor is over the chart.
   useEffect(() => {
@@ -229,9 +229,13 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
           <AreaChart
             data={rows}
             margin={{ top: 6, right: 8, bottom: 0, left: -8 }}
-            onMouseMove={(s: { activeTooltipIndex?: number }) =>
-              setActiveIndex(typeof s?.activeTooltipIndex === "number" ? s.activeTooltipIndex : null)
-            }
+            onMouseMove={(s: { activeTooltipIndex?: number }) => {
+              // Only commit a state change when the nearest bar actually changes — Recharts
+              // fires onMouseMove on every pixel, and re-rendering within the same bar was
+              // replaying the Area draw animation (chart flicker on enter).
+              const next = typeof s?.activeTooltipIndex === "number" ? s.activeTooltipIndex : null;
+              setActiveIndex((prev) => (prev === next ? prev : next));
+            }}
             onMouseLeave={() => setActiveIndex(null)}
           >
             <defs>
@@ -283,7 +287,7 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
               strokeWidth={1.6}
               fill="url(#equityFill)"
               dot={false}
-              isAnimationActive={true}
+              isAnimationActive={false}
             />
           </AreaChart>
         </ResponsiveContainer>
