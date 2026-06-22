@@ -1,2 +1,11 @@
 .idea/
 .DS_Store
+SYSTEM_REVIEW.md
+
+# Installed agent skill packages (tooling, not project code)
+.agents/
+
+# Stray SQLite DB created when run from repo root (real DB lives in backend/)
+stock_tracker.db
+stock_tracker.db-shm
+stock_tracker.db-wal

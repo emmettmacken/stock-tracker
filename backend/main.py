@@ -67,6 +67,17 @@ del _ak, _sk
 
 import database as db
 
+# Initialize schema + run migrations unconditionally at process startup, at
+# import time — before any endpoint is registered/reachable, before the
+# scheduler starts, and before any DB read/write can occur. This previously
+# ran only inside the @app.on_event("startup") lifespan hook, which is not a
+# guaranteed per-process-launch hook (it only fires when the ASGI lifespan
+# protocol is driven, and not when this module is imported by a script, a
+# background job, or a test), so migrations could silently never apply.
+# database.DB_PATH is already resolved (after load_dotenv above), so this runs
+# against the exact same file every other DB operation uses at runtime.
+db.init_db()
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -102,7 +113,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
-    db.init_db()
+    # Schema init + migrations now run unconditionally at import time (see the
+    # db.init_db() call near the top of this module). The scheduler is started
+    # here, after the DB is guaranteed migrated.
     if SCHEDULER_OK and _scheduler is not None:
         ET = ZoneInfo("America/New_York")
         _scheduler.add_job(
@@ -168,6 +181,15 @@ _COMPANY_LOCK = threading.Lock()
 _PRICE_HISTORY_CACHE: dict[str, tuple[list, float]] = {}  # ticker → (points, timestamp)
 _PRICE_HISTORY_TTL = 3600  # 1 hour
 _PRICE_HISTORY_LOCK = threading.Lock()
+
+# Portfolio equity-curve cache for the /portfolio page. Keyed by frontend period
+# ({1W,1M,3M,6M,1Y,all}); 5-min TTL since the curve doesn't need to be real-time.
+_PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # period → (result, timestamp)
+_PORTFOLIO_HISTORY_TTL = 300  # 5 minutes
+
+# Frontend period → Alpaca portfolio-history period (unit: D/W/M/A). "all" handled
+# specially via the account's creation date (see api_portfolio_history).
+_ALPACA_HISTORY_PERIOD = {"1W": "1W", "1M": "1M", "3M": "3M", "6M": "6M", "1Y": "1A"}
 
 # Change 5: one lock per cache dict to prevent TOCTOU races during parallel factor computation
 _FACTORS_LOCK = threading.Lock()
@@ -3462,6 +3484,79 @@ def api_paper_equity_history(days: int = 30):
     if not points:
         return {"available": False, "error": "no equity history"}
     return {"available": True, "source": "reconstructed", "approximate": True, "points": points}
+
+
+@app.get("/api/portfolio/history")
+def api_portfolio_history(period: str = "all"):
+    """Account equity curve from Alpaca's own portfolio history. Read-only, cached 5 min.
+
+    `period` ∈ {1W,1M,3M,6M,1Y,all} → Alpaca's period units (D/W/M/A). "all" uses the
+    account's creation date as the start so the full paper-trading history is returned.
+    Returns {available, period, points: [{timestamp: ISO string, equity: number}]}.
+    """
+    if period not in _ALPACA_HISTORY_PERIOD and period != "all":
+        period = "all"
+
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err, "period": period}
+
+    cached, ts = _PORTFOLIO_HISTORY_CACHE.get(period, (None, 0.0))
+    if cached is not None and (time.time() - ts) < _PORTFOLIO_HISTORY_TTL:
+        return cached
+
+    try:
+        if period == "all":
+            start = None
+            try:
+                start = _alpaca_client.get_account().created_at
+            except Exception:
+                pass
+            req = (GetPortfolioHistoryRequest(start=start, timeframe="1D") if start is not None
+                   else GetPortfolioHistoryRequest(period="5A", timeframe="1D"))
+        else:
+            req = GetPortfolioHistoryRequest(period=_ALPACA_HISTORY_PERIOD[period], timeframe="1D")
+
+        hist = _alpaca_client.get_portfolio_history(req)
+        tstamps  = getattr(hist, "timestamp", None) or []
+        equities = getattr(hist, "equity", None) or []
+        points = [
+            {"timestamp": datetime.utcfromtimestamp(int(t)).isoformat() + "Z",
+             "equity": round(float(e), 2)}
+            for t, e in zip(tstamps, equities) if e is not None
+        ]
+        result = {"available": True, "period": period, "points": points}
+        _PORTFOLIO_HISTORY_CACHE[period] = (result, time.time())
+        return result
+    except Exception as e:
+        return {"available": False, "error": str(e), "period": period}
+
+
+@app.get("/api/portfolio/positions/entry-signals")
+def api_portfolio_entry_signals():
+    """Entry data for currently-open positions: {ticker: {entry_score, entry_date, entry_price}}.
+
+    For each open Alpaca position, looks up the most recent BUY/ordered row in signal_log —
+    the entry that opened the still-open position (no subsequent SELL, since the position is
+    still held). Read-only. Returns {available, entries}.
+    """
+    if _alpaca_client is None:
+        return {"available": False, "error": _alpaca_err}
+    try:
+        positions = _alpaca_client.get_all_positions()
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+    entries: dict[str, dict] = {}
+    for pos in positions:
+        buy = db.get_last_buy_signal(pos.symbol)
+        if not buy:
+            continue
+        entries[pos.symbol] = {
+            "entry_score": buy.get("composite_score"),
+            "entry_date":  buy.get("timestamp"),
+            "entry_price": buy.get("price_at_signal"),
+        }
+    return {"available": True, "entries": entries}
 
 
 @app.get("/api/paper/history")

@@ -115,11 +115,22 @@ def _run_migrations() -> None:
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN equity_at_entry REAL"),
     ]
     with _conn() as conn:
+        before_cols = {r[1] for r in conn.execute("PRAGMA table_info(signal_log)")}
+        print(
+            f"[migrations] migrating DB at {os.path.abspath(DB_PATH)} — "
+            f"signal_log has {len(before_cols)} columns before migration"
+        )
         for _, sql in new_columns:
             try:
                 conn.execute(sql)
             except Exception:
                 pass  # column already exists
+        after_cols = {r[1] for r in conn.execute("PRAGMA table_info(signal_log)")}
+        added = sorted(after_cols - before_cols)
+        print(
+            f"[migrations] signal_log has {len(after_cols)} columns after migration — "
+            f"{'added ' + ', '.join(added) if added else 'no schema changes'}"
+        )
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
