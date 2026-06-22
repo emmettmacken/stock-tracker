@@ -1,15 +1,13 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
-import { PaperAccount, PaperPosition, SignalLogEntry, TradeOutcome, Briefing } from "@/lib/types";
-import { AccountSummary } from "@/components/v4/AccountSummary";
+import { PaperPosition, SignalLogEntry, TradeOutcome, Briefing } from "@/lib/types";
 import { PositionsTable } from "@/components/v4/PositionsTable";
 import { SignalLogFeed } from "@/components/v4/SignalLogFeed";
 import { ClosedTradesPanel } from "@/components/v4/ClosedTradesPanel";
 import { AnalyticsTab } from "@/components/v4/AnalyticsTab";
 import {
-  triggerSignalJob,
-  fetchPaperAccount, fetchPaperPositions,
+  triggerSignalJob, fetchPaperPositions,
   fetchSignalLog, fetchTradeHistory, fetchBriefing,
 } from "@/lib/api";
 
@@ -93,7 +91,6 @@ export default function AutomationPage() {
   const [runMsg, setRunMsg] = useState<string | null>(null);
 
   // ── Shared data state (single 60s polling interval) ──────────────────────────
-  const [account, setAccount] = useState<PaperAccount | null>(null);
   const [positionsData, setPositionsData] = useState<{
     available: boolean; positions?: PaperPosition[]; error?: string;
   } | null>(null);
@@ -111,7 +108,6 @@ export default function AutomationPage() {
 
   // ── Fetch helpers ─────────────────────────────────────────────────────────────
   const loadOverview = useCallback(() => {
-    fetchPaperAccount().then(setAccount).catch(() => {});
     fetchBriefing().then(setBriefing).catch(() => {});
     setPositionsLoading(true);
     fetchPaperPositions()
@@ -196,10 +192,6 @@ export default function AutomationPage() {
 
         {activeTab === "Overview" && (
           <div className="space-y-8">
-            <section>
-              <AccountSummary data={account} lastUpdated={overviewUpdated} />
-            </section>
-
             {briefing?.available && (
               <section className="space-y-3">
                 <p className="text-sm text-zinc-300 leading-relaxed">

@@ -21,8 +21,9 @@ export function Nav() {
         </span>
         <div className="flex gap-1 flex-1">
           {([
-            ["/", "Watchlist"],
+            ["/portfolio", "Portfolio"],
             ["/strategy-lab", "Strategy Lab"],
+            ["/", "Watchlist"],
             ["/automation", "Automation"],
           ] as const).map(([href, label]) => {
             const active = path === href;

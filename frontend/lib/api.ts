@@ -4,7 +4,7 @@ import {
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
   AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
-  EquityHistory, CompanyInfo,
+  EquityHistory, CompanyInfo, PortfolioHistory, EntrySignals,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -167,6 +167,22 @@ export async function fetchPaperPositions(): Promise<{ available: boolean; posit
 export async function fetchEquityHistory(days = 30): Promise<EquityHistory> {
   const res = await fetch(`${BASE}/api/paper/equity-history?days=${days}`);
   if (!res.ok) throw new Error("Failed to fetch equity history");
+  return res.json();
+}
+
+// Equity curve for the /portfolio page. `period` ∈ {1W,1M,3M,6M,1Y,all} — YTD is
+// handled client-side by requesting 1Y and slicing to the calendar year.
+export async function fetchPortfolioHistory(period: string): Promise<PortfolioHistory> {
+  const res = await fetch(`${BASE}/api/portfolio/history?period=${period}`);
+  if (!res.ok) throw new Error("Failed to fetch portfolio history");
+  return res.json();
+}
+
+// Entry data ({ticker: {entry_score, entry_date, entry_price}}) for open positions,
+// joined from signal_log's most recent BUY per still-open ticker.
+export async function fetchEntrySignals(): Promise<EntrySignals> {
+  const res = await fetch(`${BASE}/api/portfolio/positions/entry-signals`);
+  if (!res.ok) throw new Error("Failed to fetch entry signals");
   return res.json();
 }
 

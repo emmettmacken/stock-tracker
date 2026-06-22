@@ -165,6 +165,32 @@ export interface EquityHistory {
   error?: string;
 }
 
+// ── Portfolio page (/portfolio) ─────────────────────────────────────────────────
+
+export interface PortfolioHistoryPoint {
+  timestamp: string; // ISO string
+  equity: number;
+}
+
+export interface PortfolioHistory {
+  available: boolean;
+  period?: string;
+  points?: PortfolioHistoryPoint[];
+  error?: string;
+}
+
+export interface EntrySignal {
+  entry_score: number | null;
+  entry_date: string | null;
+  entry_price: number | null;
+}
+
+export interface EntrySignals {
+  available: boolean;
+  entries?: Record<string, EntrySignal>;
+  error?: string;
+}
+
 export interface SectorBucket {
   sector: string;
   count: number;
