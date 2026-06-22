@@ -13,7 +13,10 @@ import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 // Fixed paper-trading starting balance — Total Return is measured against this.
 const STARTING_BALANCE = 100_000;
 
-function AccountSummaryBar() {
+// liveEquity (when present) comes from the equity curve's 10s live-tip poll and overrides
+// the account endpoint's equity for the Account Value / Total Return cards. Cash stays on
+// the account endpoint's own poll — it only changes when a trade fires.
+function AccountSummaryBar({ liveEquity }: { liveEquity: number | null }) {
   const [account, setAccount] = useState<PaperAccount | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -47,7 +50,7 @@ function AccountSummaryBar() {
     );
   }
 
-  const equity = account.equity ?? 0;
+  const equity = liveEquity ?? account.equity ?? 0;
   const totalReturn = equity - STARTING_BALANCE;
   const totalReturnPct = (totalReturn / STARTING_BALANCE) * 100;
   const returnPos = totalReturn >= 0;
@@ -66,6 +69,11 @@ function AccountSummaryBar() {
 }
 
 export default function PortfolioPage() {
+  // Lifted from EquityCurve's 10s live-tip poll so the stat cards and the curve share one
+  // fetch cycle. null until the first tip arrives (off-hours it stays null → cards fall back
+  // to the account endpoint's equity).
+  const [liveEquity, setLiveEquity] = useState<number | null>(null);
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-5xl mx-auto px-4 py-8 sm:py-10 space-y-8">
@@ -77,11 +85,11 @@ export default function PortfolioPage() {
         </header>
 
         <section>
-          <AccountSummaryBar />
+          <AccountSummaryBar liveEquity={liveEquity} />
         </section>
 
         <section>
-          <EquityCurve />
+          <EquityCurve onLiveEquity={setLiveEquity} />
         </section>
 
         <section>

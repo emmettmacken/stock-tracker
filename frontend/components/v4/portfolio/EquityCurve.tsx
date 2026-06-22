@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
@@ -46,13 +46,40 @@ interface Row {
   equity: number;
 }
 
-export function EquityCurve() {
+// Merge a freshly-polled tip into the series tail: replace today's last point in place,
+// or append it as the first bar of a new session. Pure so it can run both from the live
+// poll and from the deferred flush when the cursor leaves the chart.
+function mergeTip(
+  prev: PortfolioHistoryPoint[] | null,
+  tip: PortfolioHistoryPoint,
+): PortfolioHistoryPoint[] | null {
+  if (!prev || prev.length === 0) return prev;
+  const last = prev[prev.length - 1];
+  const sameDay = last.timestamp.slice(0, 10) === tip.timestamp.slice(0, 10);
+  return sameDay ? [...prev.slice(0, -1), tip] : [...prev, tip];
+}
+
+interface EquityCurveProps {
+  // Called on every successful live-tip fetch (10s, market hours) with the latest equity —
+  // fires even while the user is hovering, so the page's stat cards stay current.
+  onLiveEquity?: (equity: number) => void;
+}
+
+export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
   const [range, setRange] = useState<Range>("1D");
   const [points, setPoints] = useState<PortfolioHistoryPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Index of the data point the cursor is nearest to — drives the vertical crosshair.
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  // While the cursor is over the chart we defer the tip's setPoints (which would re-render
+  // and flicker the crosshair) — the latest deferred tip is parked here and flushed on leave.
+  const isHovering = useRef(false);
+  const pendingTip = useRef<PortfolioHistoryPoint | null>(null);
+  // Keep onLiveEquity in a ref so the polling effect's interval doesn't tear down/recreate
+  // when the parent passes a fresh callback identity.
+  const onLiveEquityRef = useRef(onLiveEquity);
+  onLiveEquityRef.current = onLiveEquity;
 
   // Initial / range-change load — the only time the full dataset is fetched. Shows the
   // spinner and resets the crosshair. Live updates (1D) extend just the tip below.
@@ -76,7 +103,8 @@ export function EquityCurve() {
   // mutate only the last point — replacing today's tip in place, or appending the first bar
   // of a new session. The functional update touches just the tail, so Recharts animates the
   // line extending rather than re-rendering the whole series. Longer ranges are historical and
-  // never poll. No hover guard is needed since the full dataset never reloads.
+  // never poll. The fetch always runs and always reports the value upward; only the setPoints
+  // (which would flicker the crosshair) is deferred while the cursor is over the chart.
   useEffect(() => {
     if (range !== "1D") return;
     const tick = () => {
@@ -85,12 +113,13 @@ export function EquityCurve() {
         .then((d) => {
           if (typeof d?.equity !== "number") return;
           const tip = { timestamp: d.timestamp, equity: d.equity };
-          setPoints((prev) => {
-            if (!prev || prev.length === 0) return prev;
-            const last = prev[prev.length - 1];
-            const sameDay = last.timestamp.slice(0, 10) === tip.timestamp.slice(0, 10);
-            return sameDay ? [...prev.slice(0, -1), tip] : [...prev, tip];
-          });
+          onLiveEquityRef.current?.(d.equity);
+          if (isHovering.current) {
+            // Defer the visual update — park the latest tip; it's flushed on mouse leave.
+            pendingTip.current = tip;
+          } else {
+            setPoints((prev) => mergeTip(prev, tip));
+          }
         })
         .catch(() => { /* transient — keep the last good tip, try again next tick */ });
     };
@@ -184,6 +213,18 @@ export function EquityCurve() {
       ) : rows.length < 2 ? (
         <p className="text-zinc-500 text-xs py-12 text-center">Not enough equity history for this range yet.</p>
       ) : (
+        <div
+          onMouseEnter={() => { isHovering.current = true; }}
+          onMouseLeave={() => {
+            isHovering.current = false;
+            // Catch up instantly if a tip arrived while hovering, then drop it.
+            if (pendingTip.current) {
+              const tip = pendingTip.current;
+              pendingTip.current = null;
+              setPoints((prev) => mergeTip(prev, tip));
+            }
+          }}
+        >
         <ResponsiveContainer width="100%" height={260}>
           <AreaChart
             data={rows}
@@ -246,6 +287,7 @@ export function EquityCurve() {
             />
           </AreaChart>
         </ResponsiveContainer>
+        </div>
       )}
     </div>
   );
