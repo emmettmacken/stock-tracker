@@ -241,11 +241,16 @@ export function PriceChart({
             </span>
           )}
         </div>
-        <div className="flex items-center gap-1">
-          {toggleBtn("ma20", "MA20", "#38bdf8")}
-          {toggleBtn("ma50", "MA50", "#a78bfa")}
-          {toggleBtn("ma200", "MA200", "#f59e0b")}
-        </div>
+        {/* MAs are meaningless at intraday resolution (MA20 = 20 minutes on 1D), so hide the
+            toggles on 1D/1W. State is preserved — only the UI is hidden — so switching back to a
+            daily period restores whatever the user had on. */}
+        {!intraday && (
+          <div className="flex items-center gap-1">
+            {toggleBtn("ma20", "MA20", "#38bdf8")}
+            {toggleBtn("ma50", "MA50", "#a78bfa")}
+            {toggleBtn("ma200", "MA200", "#f59e0b")}
+          </div>
+        )}
       </div>
 
       <div className="relative" onMouseEnter={onChartEnter} onMouseLeave={onChartLeave}>
@@ -297,9 +302,9 @@ export function PriceChart({
           )}
           <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4 }} iconType="line" />
           <Line type="monotone" dataKey="close" name="Close" stroke="#10b981" strokeWidth={1.6} dot={false} isAnimationActive={false} />
-          {showMA.ma20 && <Line type="monotone" dataKey="ma20" name="MA20" stroke="#38bdf8" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
-          {showMA.ma50 && <Line type="monotone" dataKey="ma50" name="MA50" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
-          {showMA.ma200 && <Line type="monotone" dataKey="ma200" name="MA200" stroke="#f59e0b" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
+          {!intraday && showMA.ma20 && <Line type="monotone" dataKey="ma20" name="MA20" stroke="#38bdf8" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
+          {!intraday && showMA.ma50 && <Line type="monotone" dataKey="ma50" name="MA50" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
+          {!intraday && showMA.ma200 && <Line type="monotone" dataKey="ma200" name="MA200" stroke="#f59e0b" strokeWidth={1.2} dot={false} connectNulls isAnimationActive={false} />}
           {markers.map((m, i) => (
             <ReferenceDot
               key={`${m.kind}-${m.date}-${i}`}
