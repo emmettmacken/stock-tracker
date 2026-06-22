@@ -5,7 +5,6 @@ import { fetchFactors, fetchPortfolioSizing } from "@/lib/api";
 import { loadWatchlist } from "@/lib/watchlist";
 import { AllocationTable } from "@/components/v3/portfolio/AllocationTable";
 import { PortfolioBacktestPanel } from "@/components/v3/portfolio/PortfolioBacktestPanel";
-import { SectorExposurePanel } from "@/components/v3/portfolio/SectorExposure";
 import { scoreTextColor } from "@/components/v3/FactorScorePill";
 import { Skeleton } from "@/components/v3/Skeleton";
 
@@ -248,17 +247,6 @@ export default function PortfolioPage() {
                   </p>
                 </>
               )}
-            </section>
-
-            {/* Sector exposure of live positions */}
-            <section className="border-t border-zinc-800 pt-6">
-              <div className="mb-4">
-                <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">Sector Exposure</h2>
-                <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
-                  Current allocation across sectors from your live open positions.
-                </p>
-              </div>
-              <SectorExposurePanel />
             </section>
 
             {/* Backtest section */}

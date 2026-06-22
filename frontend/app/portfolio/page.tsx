@@ -6,6 +6,7 @@ import { StatCard } from "@/components/v4/portfolio/StatCard";
 import { EquityCurve } from "@/components/v4/portfolio/EquityCurve";
 import { PositionsPanel } from "@/components/v4/portfolio/PositionsPanel";
 import { EdgeStats } from "@/components/v4/portfolio/EdgeStats";
+import { SectorExposurePanel } from "@/components/v3/portfolio/SectorExposure";
 import { Skeleton } from "@/components/v3/Skeleton";
 import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 
@@ -54,7 +55,7 @@ function AccountSummaryBar() {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
       <StatCard label="Account Value" value={fmtUSD(equity)} />
-      <StatCard label="Cash" value={fmtUSD(account.cash ?? 0)} />
+      <StatCard label="Uninvested Cash" value={fmtUSD(account.cash ?? 0)} />
       <StatCard
         label="Total Return"
         value={`${fmtUSDSigned(totalReturn)} / ${fmtPctSigned(totalReturnPct)}`}
@@ -85,6 +86,18 @@ export default function PortfolioPage() {
 
         <section>
           <PositionsPanel />
+        </section>
+
+        <section>
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 sm:p-5 space-y-4">
+            <div>
+              <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">Sector Exposure</h2>
+              <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                Current allocation across sectors from your live open positions.
+              </p>
+            </div>
+            <SectorExposurePanel />
+          </div>
         </section>
 
         <section>

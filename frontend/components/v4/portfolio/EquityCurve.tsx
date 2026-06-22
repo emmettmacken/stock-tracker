@@ -1,25 +1,30 @@
 "use client";
 import { useEffect, useMemo, useState } from "react";
 import {
-  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
 import { PortfolioHistoryPoint } from "@/lib/types";
 import { fetchPortfolioHistory } from "@/lib/api";
 import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 
-// Selector labels → backend period param. "YTD" requests a full year then slices to the
-// calendar year client-side (the backend exposes 1W/1M/3M/6M/1Y/all, not YTD).
-const RANGES = ["1W", "1M", "3M", "6M", "YTD", "1Y", "Max"] as const;
+// Selector labels are passed straight through to the backend, which maps each to an
+// Alpaca period + resolution (15-min bars for 1D, hourly for 1W, daily beyond) and
+// handles YTD (from Jan 1) and Max (from account creation) server-side.
+const RANGES = ["1D", "1W", "1M", "3M", "6M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
-
-const BACKEND_PERIOD: Record<Range, string> = {
-  "1W": "1W", "1M": "1M", "3M": "3M", "6M": "6M", YTD: "1Y", "1Y": "1Y", Max: "all",
-};
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 function fmtDate(iso: string): string {
   const d = new Date(iso);
   return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+function fmtTime(iso: string): string {
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+// 1D shows intraday time (HH:MM); every other range shows the date (MMM DD).
+function fmtAxis(iso: string, range: Range): string {
+  return range === "1D" ? fmtTime(iso) : fmtDate(iso);
 }
 
 interface Row {
@@ -29,16 +34,19 @@ interface Row {
 }
 
 export function EquityCurve() {
-  const [range, setRange] = useState<Range>("Max");
+  const [range, setRange] = useState<Range>("1D");
   const [points, setPoints] = useState<PortfolioHistoryPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Index of the data point the cursor is nearest to — drives the vertical crosshair.
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchPortfolioHistory(BACKEND_PERIOD[range])
+    setActiveIndex(null);
+    fetchPortfolioHistory(range)
       .then((d) => {
         if (cancelled) return;
         if (!d.available) { setError(d.error ?? "Equity history unavailable"); setPoints(null); }
@@ -49,17 +57,11 @@ export function EquityCurve() {
     return () => { cancelled = true; };
   }, [range]);
 
-  // Slice to the calendar year for YTD (backend returned a full year).
   const rows = useMemo<Row[]>(() => {
     if (!points) return [];
-    let src = points;
-    if (range === "YTD") {
-      const yearStart = `${new Date().getUTCFullYear()}-01-01`;
-      src = points.filter((p) => p.timestamp.slice(0, 10) >= yearStart);
-    }
-    return src
+    return points
       .filter((p) => p.equity != null)
-      .map((p) => ({ ts: p.timestamp, label: fmtDate(p.timestamp), equity: p.equity }));
+      .map((p) => ({ ts: p.timestamp, label: fmtAxis(p.timestamp, range), equity: p.equity }));
   }, [points, range]);
 
   // Total return $ and % across the visible window (first → last equity).
@@ -142,7 +144,14 @@ export function EquityCurve() {
         <p className="text-zinc-500 text-xs py-12 text-center">Not enough equity history for this range yet.</p>
       ) : (
         <ResponsiveContainer width="100%" height={260}>
-          <AreaChart data={rows} margin={{ top: 6, right: 8, bottom: 0, left: -8 }}>
+          <AreaChart
+            data={rows}
+            margin={{ top: 6, right: 8, bottom: 0, left: -8 }}
+            onMouseMove={(s: { activeTooltipIndex?: number }) =>
+              setActiveIndex(typeof s?.activeTooltipIndex === "number" ? s.activeTooltipIndex : null)
+            }
+            onMouseLeave={() => setActiveIndex(null)}
+          >
             <defs>
               <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor={stroke} stopOpacity={0.28} />
@@ -165,15 +174,26 @@ export function EquityCurve() {
               tickFormatter={(v: number) => fmtUSD(v, { decimals: 0 })}
             />
             <Tooltip
+              cursor={false}
               contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6 }}
               labelStyle={{ color: "#e4e4e7", fontSize: 11 }}
               itemStyle={{ fontSize: 11 }}
               formatter={(v: number) => [fmtUSD(v), "Equity"]}
               labelFormatter={(_l, payload) => {
                 const ts = payload?.[0]?.payload?.ts as string | undefined;
-                return ts ? fmtDate(ts) : "";
+                return ts ? fmtAxis(ts, range) : "";
               }}
             />
+            {/* Vertical crosshair that follows the cursor to the nearest point. With the
+                denser intraday data (15-min for 1D, hourly for 1W) this tracks fluidly. */}
+            {activeIndex != null && rows[activeIndex] && (
+              <ReferenceLine
+                x={rows[activeIndex].label}
+                stroke="#52525b"
+                strokeWidth={1}
+                strokeDasharray="3 3"
+              />
+            )}
             <Area
               type="monotone"
               dataKey="equity"

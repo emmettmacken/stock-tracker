@@ -182,14 +182,34 @@ _PRICE_HISTORY_CACHE: dict[str, tuple[list, float]] = {}  # ticker → (points, 
 _PRICE_HISTORY_TTL = 3600  # 1 hour
 _PRICE_HISTORY_LOCK = threading.Lock()
 
-# Portfolio equity-curve cache for the /portfolio page. Keyed by frontend period
-# ({1W,1M,3M,6M,1Y,all}); 5-min TTL since the curve doesn't need to be real-time.
-_PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # period → (result, timestamp)
-_PORTFOLIO_HISTORY_TTL = 300  # 5 minutes
+# Portfolio equity-curve cache for the /portfolio page. Keyed by "period:timeframe"
+# so different resolutions don't collide. TTL varies by period (see _history_ttl):
+# 1D refreshes every minute (live intraday), 1W every 5 min, longer ranges every 10 min.
+_PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # "period:timeframe" → (result, timestamp)
 
-# Frontend period → Alpaca portfolio-history period (unit: D/W/M/A). "all" handled
-# specially via the account's creation date (see api_portfolio_history).
-_ALPACA_HISTORY_PERIOD = {"1W": "1W", "1M": "1M", "3M": "3M", "6M": "6M", "1Y": "1A"}
+# Frontend period → Alpaca portfolio-history request spec (Alpaca period unit D/W/M/A
+# and timeframe resolution: 15Min/1H/1D). "YTD" starts at Jan 1 of the current year and
+# "Max" at the account's creation date — both computed in api_portfolio_history.
+_HISTORY_SPEC = {
+    "1D":  {"period": "1D", "timeframe": "15Min"},
+    "1W":  {"period": "1W", "timeframe": "1H"},
+    "1M":  {"period": "1M", "timeframe": "1D"},
+    "3M":  {"period": "3M", "timeframe": "1D"},
+    "6M":  {"period": "6M", "timeframe": "1D"},
+    "YTD": {"timeframe": "1D"},
+    "1Y":  {"period": "1A", "timeframe": "1D"},
+    "Max": {"timeframe": "1D"},
+}
+
+
+def _history_ttl(period: str) -> int:
+    """Cache TTL (seconds) for an equity-curve period: 1 min for the live 1D view,
+    5 min for 1W, 10 min for everything longer."""
+    if period == "1D":
+        return 60
+    if period == "1W":
+        return 300
+    return 600
 
 # Aggregate-expectancy cache for the /portfolio Edge Statistics section. Read-only
 # aggregation over closed trades; 10-min TTL since it changes only when a trade exits.
@@ -3492,34 +3512,43 @@ def api_paper_equity_history(days: int = 30):
 
 
 @app.get("/api/portfolio/history")
-def api_portfolio_history(period: str = "all"):
-    """Account equity curve from Alpaca's own portfolio history. Read-only, cached 5 min.
+def api_portfolio_history(period: str = "1D"):
+    """Account equity curve from Alpaca's own portfolio history. Read-only, cached.
 
-    `period` ∈ {1W,1M,3M,6M,1Y,all} → Alpaca's period units (D/W/M/A). "all" uses the
-    account's creation date as the start so the full paper-trading history is returned.
+    `period` ∈ {1D,1W,1M,3M,6M,YTD,1Y,Max} → Alpaca period units (D/W/M/A) and a
+    resolution that gets finer for short ranges (15Min for 1D, 1H for 1W, else 1D).
+    YTD starts at Jan 1 of the current year; Max at the account's creation date.
     Returns {available, period, points: [{timestamp: ISO string, equity: number}]}.
     """
-    if period not in _ALPACA_HISTORY_PERIOD and period != "all":
-        period = "all"
+    if period == "all":  # legacy alias from older frontends
+        period = "Max"
+    if period not in _HISTORY_SPEC:
+        period = "1D"
 
     if _alpaca_client is None:
         return {"available": False, "error": _alpaca_err, "period": period}
 
-    cached, ts = _PORTFOLIO_HISTORY_CACHE.get(period, (None, 0.0))
-    if cached is not None and (time.time() - ts) < _PORTFOLIO_HISTORY_TTL:
+    spec = _HISTORY_SPEC[period]
+    timeframe = spec["timeframe"]
+    cache_key = f"{period}:{timeframe}"
+    cached, ts = _PORTFOLIO_HISTORY_CACHE.get(cache_key, (None, 0.0))
+    if cached is not None and (time.time() - ts) < _history_ttl(period):
         return cached
 
     try:
-        if period == "all":
+        if period == "Max":
             start = None
             try:
                 start = _alpaca_client.get_account().created_at
             except Exception:
                 pass
-            req = (GetPortfolioHistoryRequest(start=start, timeframe="1D") if start is not None
-                   else GetPortfolioHistoryRequest(period="5A", timeframe="1D"))
+            req = (GetPortfolioHistoryRequest(start=start, timeframe=timeframe) if start is not None
+                   else GetPortfolioHistoryRequest(period="5A", timeframe=timeframe))
+        elif period == "YTD":
+            year_start = datetime(datetime.utcnow().year, 1, 1)
+            req = GetPortfolioHistoryRequest(start=year_start, timeframe=timeframe)
         else:
-            req = GetPortfolioHistoryRequest(period=_ALPACA_HISTORY_PERIOD[period], timeframe="1D")
+            req = GetPortfolioHistoryRequest(period=spec["period"], timeframe=timeframe)
 
         hist = _alpaca_client.get_portfolio_history(req)
         tstamps  = getattr(hist, "timestamp", None) or []
@@ -3530,23 +3559,25 @@ def api_portfolio_history(period: str = "all"):
             for t, e in zip(tstamps, equities) if e is not None
         ]
 
-        # Alpaca's history points are close-of-day snapshots and miss today's live
+        # Alpaca's daily history points are close-of-day snapshots and miss today's live
         # unrealised gains. Append the live account equity as a final point (timestamp =
-        # now) so the curve always ends at the real current value — unless today's date
-        # is already represented in the returned points.
-        try:
-            today = datetime.utcnow().strftime("%Y-%m-%d")
-            if not any(p["timestamp"][:10] == today for p in points):
-                live_equity = round(float(_alpaca_client.get_account().equity), 2)
-                points.append({
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                    "equity": live_equity,
-                })
-        except Exception:
-            pass
+        # now) so the curve always ends at the real current value — unless today's date is
+        # already represented. Skipped for 1D, whose intraday points already cover today's
+        # session right up to the latest 15-minute bar.
+        if period != "1D":
+            try:
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                if not any(p["timestamp"][:10] == today for p in points):
+                    live_equity = round(float(_alpaca_client.get_account().equity), 2)
+                    points.append({
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "equity": live_equity,
+                    })
+            except Exception:
+                pass
 
         result = {"available": True, "period": period, "points": points}
-        _PORTFOLIO_HISTORY_CACHE[period] = (result, time.time())
+        _PORTFOLIO_HISTORY_CACHE[cache_key] = (result, time.time())
         return result
     except Exception as e:
         return {"available": False, "error": str(e), "period": period}
