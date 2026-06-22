@@ -31,8 +31,8 @@ export const VERDICT_BANDS: VerdictBand[] = [
   },
   {
     label: "Buy zone",
-    rangeLabel: "70–84",
-    min: 70,
+    rangeLabel: "63–84",
+    min: 63,
     max: 84,
     explanation:
       "Most factors lean positive, with a few that are neutral or weak.",
@@ -43,9 +43,9 @@ export const VERDICT_BANDS: VerdictBand[] = [
   },
   {
     label: "Mixed signal",
-    rangeLabel: "50–69",
-    min: 50,
-    max: 69,
+    rangeLabel: "45–62",
+    min: 45,
+    max: 62,
     explanation:
       "Factors disagree — some bullish, some bearish — so there's no clear edge.",
     text: "text-amber-400",
@@ -55,9 +55,9 @@ export const VERDICT_BANDS: VerdictBand[] = [
   },
   {
     label: "Weak signal",
-    rangeLabel: "0–49",
+    rangeLabel: "0–44",
     min: 0,
-    max: 49,
+    max: 44,
     explanation:
       "Factors are mostly contradicting or negative — little statistical support for buying.",
     text: "text-red-400",

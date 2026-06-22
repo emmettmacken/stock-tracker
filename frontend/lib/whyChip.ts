@@ -12,8 +12,8 @@ const FACTOR_PHRASES: Record<string, string> = {
   sentiment: "Positive sentiment",
 };
 
-// Buy-zone bar mirrors the verdict bands (70 = start of "Buy zone").
-export const BUY_ZONE_THRESHOLD = 70;
+// Buy-zone bar mirrors the verdict bands (63 = start of "Buy zone").
+export const BUY_ZONE_THRESHOLD = 63;
 
 export type ChipTone = "pos" | "neg" | "neutral";
 

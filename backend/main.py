@@ -2960,7 +2960,7 @@ def _run_signal_job() -> None:
 
     spy_above, vix = _macro_regime()
     high_vix = vix > 30
-    bull_threshold = float(db.get_config("bull_threshold", "70"))
+    bull_threshold = float(db.get_config("bull_threshold", "63"))
     bear_threshold = float(db.get_config("bear_threshold", "80"))
     buy_threshold  = bear_threshold if not spy_above else bull_threshold
     oe_thresh        = float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
@@ -3391,12 +3391,12 @@ def _run_adaptive_thresholds_job() -> None:
     """
     logger.info("▶ Adaptive thresholds job starting")
 
-    BULL_MIN, BULL_MAX = 65.0, 80.0
+    BULL_MIN, BULL_MAX = 63.0, 80.0
     BEAR_MIN, BEAR_MAX = 75.0, 85.0
     EWA_ALPHA = 0.15  # new = old * 0.85 + target * 0.15
     MIN_TRADES = 5
 
-    bull_old = float(db.get_config("bull_threshold", "70"))
+    bull_old = float(db.get_config("bull_threshold", "63"))
     bear_old = float(db.get_config("bear_threshold", "80"))
 
     def _target_threshold(win_rate: float, t_min: float, t_max: float) -> float:
@@ -3459,7 +3459,7 @@ def _run_adaptive_thresholds_job() -> None:
 @app.get("/api/analytics")
 def get_analytics():
     stats = db.get_analytics_data()
-    bull_threshold = float(db.get_config("bull_threshold", "70"))
+    bull_threshold = float(db.get_config("bull_threshold", "63"))
     bear_threshold = float(db.get_config("bear_threshold", "80"))
     thresholds_updated = db.get_config("thresholds_last_updated", "") or None
     last_signal_job    = db.get_config("last_signal_job_at", "") or None
@@ -4059,7 +4059,7 @@ def _build_decision_trail(ticker: str) -> dict:
     }
     try:
         # Display context only: the thresholds the gate uses (read from config, not recomputed).
-        bull_thr = float(db.get_config("bull_threshold", "70"))
+        bull_thr = float(db.get_config("bull_threshold", "63"))
         bear_thr = float(db.get_config("bear_threshold", "80"))
         # Without re-running the macro check we can't know which applied; show the lower
         # (bull) threshold as the optimistic bar a passing score cleared.
