@@ -186,6 +186,23 @@ export async function fetchEntrySignals(): Promise<EntrySignals> {
   return res.json();
 }
 
+// Close (all or part of) an open position via a market sell order. `qty` is in shares.
+export async function closePosition(
+  ticker: string,
+  qty: number,
+): Promise<{ success: boolean; order_id?: string; error?: string }> {
+  const res = await fetch(`${BASE}/api/portfolio/positions/close`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticker, qty }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to close position for ${ticker}`);
+  }
+  return res.json();
+}
+
 export async function fetchSectorExposure(): Promise<SectorExposure> {
   const res = await fetch(`${BASE}/api/paper/sector-exposure`);
   if (!res.ok) throw new Error("Failed to fetch sector exposure");

@@ -9,11 +9,11 @@ import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 
 // Selector labels → backend period param. "YTD" requests a full year then slices to the
 // calendar year client-side (the backend exposes 1W/1M/3M/6M/1Y/all, not YTD).
-const RANGES = ["1W", "1M", "3M", "6M", "YTD", "1Y", "All"] as const;
+const RANGES = ["1W", "1M", "3M", "6M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
 
 const BACKEND_PERIOD: Record<Range, string> = {
-  "1W": "1W", "1M": "1M", "3M": "3M", "6M": "6M", YTD: "1Y", "1Y": "1Y", All: "all",
+  "1W": "1W", "1M": "1M", "3M": "3M", "6M": "6M", YTD: "1Y", "1Y": "1Y", Max: "all",
 };
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -29,7 +29,7 @@ interface Row {
 }
 
 export function EquityCurve() {
-  const [range, setRange] = useState<Range>("All");
+  const [range, setRange] = useState<Range>("Max");
   const [points, setPoints] = useState<PortfolioHistoryPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

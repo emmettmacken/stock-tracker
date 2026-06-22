@@ -6,6 +6,7 @@ import { fetchPaperPositions, fetchEntrySignals, fetchFactors } from "@/lib/api"
 import { scoreTextColor } from "@/components/v3/FactorScorePill";
 import { Skeleton } from "@/components/v3/Skeleton";
 import { StatCard } from "./StatCard";
+import { ClosePositionModal } from "./ClosePositionModal";
 import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 
 // One enriched position row joining the Alpaca position, its signal_log entry data, and
@@ -61,6 +62,10 @@ export function PositionsPanel() {
 
   const [sortKey, setSortKey] = useState<SortKey>("pnlPct");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  // Position the Close modal is open for (null = closed), plus the success toast.
+  const [closing, setClosing] = useState<Row | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setError(null);
@@ -138,6 +143,22 @@ export function PositionsPanel() {
     });
   }, [rows, sortKey, sortDir]);
 
+  // Auto-dismiss the success toast.
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(id);
+  }, [toast]);
+
+  // After a sell order is placed: toast, close the modal, and refresh positions in 2s
+  // (giving Alpaca time to process the fill before we re-read).
+  function handleCloseSuccess(qtyLabel: string) {
+    const ticker = closing?.ticker ?? "";
+    setToast(`Sell order placed for ${qtyLabel} shares of ${ticker}`);
+    setClosing(null);
+    setTimeout(load, 2000);
+  }
+
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir((d) => (d === "desc" ? "asc" : "desc"));
     else { setSortKey(key); setSortDir(key === "ticker" || key === "entryDate" ? "asc" : "desc"); }
@@ -201,6 +222,7 @@ export function PositionsPanel() {
                       {c.label} {sortKey === c.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
                     </th>
                   ))}
+                  <th className="py-2 text-right text-zinc-500 font-medium select-none" />
                 </tr>
               </thead>
               <tbody>
@@ -222,7 +244,15 @@ export function PositionsPanel() {
                       <td className="py-2.5 pr-4 tabular-nums text-zinc-400 text-right">{r.shares}</td>
                       <td className="py-2.5 pr-4 tabular-nums text-zinc-300 text-right">{fmtUSD(r.value, { decimals: 0 })}</td>
                       <td className="py-2.5 pr-4 text-right"><ScoreCell score={r.entryScore} /></td>
-                      <td className="py-2.5 text-right"><ScoreCell score={r.currentScore} /></td>
+                      <td className="py-2.5 pr-4 text-right"><ScoreCell score={r.currentScore} /></td>
+                      <td className="py-2.5 text-right whitespace-nowrap">
+                        <button
+                          onClick={() => setClosing(r)}
+                          className="rounded-md border border-zinc-700 px-2.5 py-1 text-[11px] font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors duration-150 ease-out-quart"
+                        >
+                          Close
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}
@@ -231,6 +261,22 @@ export function PositionsPanel() {
           </div>
         )}
       </div>
+
+      {closing && (
+        <ClosePositionModal
+          ticker={closing.ticker}
+          currentPrice={closing.currentPrice}
+          shares={closing.shares}
+          onClose={() => setClosing(null)}
+          onSuccess={handleCloseSuccess}
+        />
+      )}
+
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 rounded-lg bg-emerald-500/95 px-4 py-2.5 text-xs font-medium text-white shadow-lg">
+          {toast}
+        </div>
+      )}
     </div>
   );
 }

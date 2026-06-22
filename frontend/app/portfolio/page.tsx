@@ -6,7 +6,10 @@ import { StatCard } from "@/components/v4/portfolio/StatCard";
 import { EquityCurve } from "@/components/v4/portfolio/EquityCurve";
 import { PositionsPanel } from "@/components/v4/portfolio/PositionsPanel";
 import { Skeleton } from "@/components/v3/Skeleton";
-import { fmtUSD } from "@/lib/format";
+import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
+
+// Fixed paper-trading starting balance — Total Return is measured against this.
+const STARTING_BALANCE = 100_000;
 
 function AccountSummaryBar() {
   const [account, setAccount] = useState<PaperAccount | null>(null);
@@ -42,11 +45,20 @@ function AccountSummaryBar() {
     );
   }
 
+  const equity = account.equity ?? 0;
+  const totalReturn = equity - STARTING_BALANCE;
+  const totalReturnPct = (totalReturn / STARTING_BALANCE) * 100;
+  const returnPos = totalReturn >= 0;
+
   return (
     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-      <StatCard label="Total Equity" value={fmtUSD(account.equity ?? 0)} />
+      <StatCard label="Account Value" value={fmtUSD(equity)} />
       <StatCard label="Cash" value={fmtUSD(account.cash ?? 0)} />
-      <StatCard label="Buying Power" value={fmtUSD(account.buying_power ?? 0)} />
+      <StatCard
+        label="Total Return"
+        value={`${fmtUSDSigned(totalReturn)} / ${fmtPctSigned(totalReturnPct)}`}
+        valueClass={returnPos ? "text-emerald-400" : "text-red-400"}
+      />
     </div>
   );
 }

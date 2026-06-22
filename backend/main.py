@@ -3524,6 +3524,22 @@ def api_portfolio_history(period: str = "all"):
              "equity": round(float(e), 2)}
             for t, e in zip(tstamps, equities) if e is not None
         ]
+
+        # Alpaca's history points are close-of-day snapshots and miss today's live
+        # unrealised gains. Append the live account equity as a final point (timestamp =
+        # now) so the curve always ends at the real current value — unless today's date
+        # is already represented in the returned points.
+        try:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            if not any(p["timestamp"][:10] == today for p in points):
+                live_equity = round(float(_alpaca_client.get_account().equity), 2)
+                points.append({
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "equity": live_equity,
+                })
+        except Exception:
+            pass
+
         result = {"available": True, "period": period, "points": points}
         _PORTFOLIO_HISTORY_CACHE[period] = (result, time.time())
         return result
@@ -3557,6 +3573,31 @@ def api_portfolio_entry_signals():
             "entry_price": buy.get("price_at_signal"),
         }
     return {"available": True, "entries": entries}
+
+
+class ClosePositionRequest(BaseModel):
+    ticker: str
+    qty: float
+
+
+@app.post("/api/portfolio/positions/close")
+def api_portfolio_close_position(req: ClosePositionRequest):
+    """Submit a market sell order to close (all or part of) an open position.
+
+    Returns {success, order_id} on success or {success: false, error} on failure.
+    """
+    if _alpaca_client is None:
+        return {"success": False, "error": _alpaca_err}
+    try:
+        order = _alpaca_client.submit_order(MarketOrderRequest(
+            symbol=req.ticker.upper(),
+            qty=round(req.qty, 6),
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        ))
+        return {"success": True, "order_id": str(order.id)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.get("/api/paper/history")
