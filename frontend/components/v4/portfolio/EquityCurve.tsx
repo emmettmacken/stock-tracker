@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
@@ -10,7 +10,7 @@ import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 // Selector labels are passed straight through to the backend, which maps each to an
 // Alpaca period + resolution (15-min bars for 1D, hourly for 1W, daily beyond) and
 // handles YTD (from Jan 1) and Max (from account creation) server-side.
-const RANGES = ["1D", "1W", "1M", "3M", "6M", "YTD", "1Y", "Max"] as const;
+const RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -18,13 +18,16 @@ function fmtDate(iso: string): string {
   const d = new Date(iso);
   return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
 }
-function fmtTime(iso: string): string {
+// DD/MM HH:MM in the viewer's local time — all parts from the same Date object so the
+// day and time can't disagree across the UTC boundary.
+function fmtDateTime(iso: string): string {
   const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
-// 1D shows intraday time (HH:MM); every other range shows the date (MMM DD).
+// 1D shows intraday DD/MM HH:MM; every other range shows the date (MMM DD).
 function fmtAxis(iso: string, range: Range): string {
-  return range === "1D" ? fmtTime(iso) : fmtDate(iso);
+  return range === "1D" ? fmtDateTime(iso) : fmtDate(iso);
 }
 
 interface Row {
@@ -40,7 +43,11 @@ export function EquityCurve() {
   const [error, setError] = useState<string | null>(null);
   // Index of the data point the cursor is nearest to — drives the vertical crosshair.
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  // True while the cursor is over the chart. A ref (not state) so toggling it never
+  // re-renders — that's the whole point: the live 1D poll must not redraw mid-hover.
+  const isHovering = useRef(false);
 
+  // Initial / range-change load — shows the spinner and resets the crosshair.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -56,6 +63,31 @@ export function EquityCurve() {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [range]);
+
+  // Background refetch (no spinner, keeps last good data on error) for the live poll and
+  // the hover-release catch-up. Only the points update, so the chart redraws in place.
+  const refetch = useCallback(() => {
+    fetchPortfolioHistory(range)
+      .then((d) => { if (d.available) setPoints(d.points ?? []); })
+      .catch(() => { /* keep the last good curve on a transient background failure */ });
+  }, [range]);
+
+  // The 1D view is live intraday — poll every 60s (matching the backend's 1D cache TTL),
+  // but skip any tick while the cursor is over the chart so dragging never flickers. Longer
+  // ranges are effectively static, so they don't poll. Positions/edge stats poll elsewhere.
+  useEffect(() => {
+    if (range !== "1D") return;
+    const id = setInterval(() => { if (!isHovering.current) refetch(); }, 60_000);
+    return () => clearInterval(id);
+  }, [range, refetch]);
+
+  const onChartEnter = useCallback(() => { isHovering.current = true; }, []);
+  const onChartLeave = useCallback(() => {
+    isHovering.current = false;
+    setActiveIndex(null);
+    // Catch up on any 1D updates skipped while the user was interacting.
+    if (range === "1D") refetch();
+  }, [range, refetch]);
 
   const rows = useMemo<Row[]>(() => {
     if (!points) return [];
@@ -143,6 +175,7 @@ export function EquityCurve() {
       ) : rows.length < 2 ? (
         <p className="text-zinc-500 text-xs py-12 text-center">Not enough equity history for this range yet.</p>
       ) : (
+        <div onMouseEnter={onChartEnter} onMouseLeave={onChartLeave}>
         <ResponsiveContainer width="100%" height={260}>
           <AreaChart
             data={rows}
@@ -204,6 +237,7 @@ export function EquityCurve() {
             />
           </AreaChart>
         </ResponsiveContainer>
+        </div>
       )}
     </div>
   );

@@ -195,7 +195,6 @@ _HISTORY_SPEC = {
     "1W":  {"period": "1W", "timeframe": "1H"},
     "1M":  {"period": "1M", "timeframe": "1D"},
     "3M":  {"period": "3M", "timeframe": "1D"},
-    "6M":  {"period": "6M", "timeframe": "1D"},
     "YTD": {"timeframe": "1D"},
     "1Y":  {"period": "1A", "timeframe": "1D"},
     "Max": {"timeframe": "1D"},
@@ -590,6 +589,51 @@ def fetch_ohlcv_max(ticker: str, min_bars: int = 2, max_retries: int = 3) -> pd.
     raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
 
 
+def fetch_ohlcv_window(
+    ticker: str,
+    interval: str = "1d",
+    yf_period: Optional[str] = None,
+    start: Optional[datetime] = None,
+    min_bars: int = 2,
+    max_retries: int = 3,
+) -> pd.DataFrame:
+    """Fetch OHLCV at a given interval/window for the stock-chart price-history endpoint.
+
+    Used by the period-scoped /api/price-history path: intraday (1m for 1D, 15m for 1W) and
+    daily (1M/3M/YTD/1Y). yfinance only serves intraday bars for recent windows (1m ≤ 30d,
+    15m ≤ 60d), which is fine since 1D/1W are recent by definition. Separate from fetch_ohlcv
+    (the 760-day signal window) and fetch_ohlcv_max (full daily history) so none constrains
+    the others. Pass either `start` (e.g. YTD's Jan 1) or `yf_period` (e.g. "1mo")."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            kwargs = dict(interval=interval, auto_adjust=True, raise_errors=True)
+            if start is not None:
+                kwargs["start"] = start.strftime("%Y-%m-%d")
+            else:
+                kwargs["period"] = yf_period
+            df = yf.Ticker(ticker).history(**kwargs)
+            if df.empty or len(df) < min_bars:
+                raise HTTPException(status_code=404, detail=f"Insufficient data for '{ticker}'")
+            return df[["High", "Low", "Close", "Volume"]].dropna()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if "Quote not found" in str(exc) or isinstance(exc, YFTickerMissingError):
+                raise HTTPException(status_code=404, detail=f"'{ticker}' not found")
+            if _transient(exc):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if attempt < max_retries - 1:
+                time.sleep(1.0)
+                continue
+            break
+    if isinstance(last_exc, (YFTzMissingError, YFTickerMissingError)):
+        raise HTTPException(status_code=404, detail=f"'{ticker}' not found after {max_retries} attempts")
+    raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
+
+
 def _wilder_atr(tr: np.ndarray, period: int = 21) -> np.ndarray:
     """Wilder's EMA of a true-range series, seeded with the SMA of the first `period`
     TRs. Returns an array the same length as `tr`; indices before the seed are NaN."""
@@ -632,14 +676,18 @@ def get_quote(ticker: str):
 
 # ── /api/price-history ────────────────────────────────────────────────────────
 
-def _project_points(df: pd.DataFrame) -> list:
-    """Project an OHLCV frame to the [{date, close, volume}] shape the chart consumes."""
+def _project_points(df: pd.DataFrame, intraday: bool = False) -> list:
+    """Project an OHLCV frame to the [{date, close, volume}] shape the chart consumes.
+
+    For daily bars `date` is "YYYY-MM-DD"; for intraday bars (1D/1W) it's a full ISO
+    timestamp (tz-aware, e.g. "2026-06-20T09:30:00-04:00") so the chart can render
+    DD/MM HH:MM on the axis and tooltip."""
     idx = df.index
     closes = df["Close"].values
     vols = df["Volume"].values
     return [
         {
-            "date": idx[i].strftime("%Y-%m-%d"),
+            "date": idx[i].isoformat() if intraday else idx[i].strftime("%Y-%m-%d"),
             "close": round(float(closes[i]), 4),
             "volume": int(vols[i]) if not np.isnan(vols[i]) else 0,
         }
@@ -647,31 +695,76 @@ def _project_points(df: pd.DataFrame) -> list:
     ]
 
 
+# Stock-chart intraday periods → yfinance interval + window (1D/1W only).
+_CHART_INTRADAY_SPEC = {
+    "1D": {"interval": "1m",  "yf_period": "1d"},
+    "1W": {"interval": "15m", "yf_period": "5d"},
+}
+# Daily-interval periods → calendar-day lookback for the *visible* window. 1Y uses 366 to
+# cover leap years; YTD is handled separately (visible window starts at Jan 1).
+_CHART_DAILY_DAYS = {"1M": 31, "3M": 92, "1Y": 366}
+# Extra history fetched *before* a daily window's visible start so MA50/MA200 are populated
+# from the very first visible bar. 200 trading days ≈ 290 calendar days (weekends/holidays);
+# this lead-in is returned in `points` but trimmed from the chart via `visible_from`.
+_MA_LEAD_IN_DAYS = 290
+
+
 @app.get("/api/price-history/{ticker}")
 def get_price_history(ticker: str, days: int = 760, period: Optional[str] = None):
     """Historical closing price + volume for charting.
 
     Read-only and independent of the signal path: it makes its own yfinance fetch and does
-    NOT share the 760-day window used by _compute_factors / the signal job. When period="max"
-    the full available history is returned (yfinance period="max", cached 1 h since it's a
-    heavy multi-decade payload); otherwise a `days`-bar window is fetched (default 760, the
-    chart's lead-in for client-side MA200), capped at 1100. No scores, signals or MAs are
-    computed here (moving-average overlays are drawn client-side from these closes).
+    NOT share the 760-day window used by _compute_factors / the signal job. No scores, signals
+    or MAs are computed here (moving-average overlays are drawn client-side from these closes).
+
+    `period` (the stock-chart selector) scopes the fetch server-side:
+      1D  → 1-minute bars, last 1d      1M  → daily bars, last ~1mo
+      1W  → 15-minute bars, last 5d     3M  → daily bars, last ~3mo
+      YTD → daily bars from Jan 1       1Y  → daily bars, last ~1y
+      Max → full daily history (yfinance period="max", cached 1 h since it's heavy)
+    For the daily periods (1M/3M/YTD/1Y) an extra ~200-trading-day lead-in is fetched before
+    the visible window and returned in `points`, with `visible_from` (ISO YYYY-MM-DD) marking
+    where the chart should start drawing — so MA50/MA200 are valid from the first visible bar
+    while the lead-in stays off-axis. Without `period` (e.g. the analytics buy & hold), a
+    `days`-bar daily window is fetched (default 760, capped at 1100).
     """
     ticker = ticker.upper()
-    if period and period.lower() == "max":
-        with _PRICE_HISTORY_LOCK:
-            cached, ts = _PRICE_HISTORY_CACHE.get(ticker, (None, 0.0))
-            if cached is not None and (time.time() - ts) < _PRICE_HISTORY_TTL:
-                return {"ticker": ticker, "period": "max", "points": cached}
-        points = _project_points(fetch_ohlcv_max(ticker, min_bars=2))
-        with _PRICE_HISTORY_LOCK:
-            _PRICE_HISTORY_CACHE[ticker] = (points, time.time())
-        return {"ticker": ticker, "period": "max", "points": points}
+    if period:
+        if period.lower() == "max":
+            with _PRICE_HISTORY_LOCK:
+                cached, ts = _PRICE_HISTORY_CACHE.get(ticker, (None, 0.0))
+                if cached is not None and (time.time() - ts) < _PRICE_HISTORY_TTL:
+                    return {"ticker": ticker, "period": "max", "intraday": False, "points": cached}
+            points = _project_points(fetch_ohlcv_max(ticker, min_bars=2))
+            with _PRICE_HISTORY_LOCK:
+                _PRICE_HISTORY_CACHE[ticker] = (points, time.time())
+            return {"ticker": ticker, "period": "max", "intraday": False, "points": points}
+
+        spec = _CHART_INTRADAY_SPEC.get(period)
+        if spec:
+            df = fetch_ohlcv_window(ticker, interval=spec["interval"],
+                                    yf_period=spec["yf_period"], min_bars=2)
+            return {"ticker": ticker, "period": period, "intraday": True,
+                    "points": _project_points(df, intraday=True)}
+
+        # Daily periods (1M/3M/YTD/1Y): fetch the visible window plus an MA lead-in, then tell
+        # the frontend where the visible window begins so it can trim the lead-in off the axis.
+        visible_start = None
+        if period == "YTD":
+            visible_start = datetime(datetime.now().year, 1, 1)
+        elif period in _CHART_DAILY_DAYS:
+            visible_start = datetime.now() - timedelta(days=_CHART_DAILY_DAYS[period])
+        if visible_start is not None:
+            fetch_start = visible_start - timedelta(days=_MA_LEAD_IN_DAYS)
+            df = fetch_ohlcv_window(ticker, interval="1d", start=fetch_start, min_bars=2)
+            return {"ticker": ticker, "period": period, "intraday": False,
+                    "visible_from": visible_start.strftime("%Y-%m-%d"),
+                    "points": _project_points(df)}
+        # Unknown period → fall through to the legacy days-window path below.
 
     days = max(10, min(int(days), 1100))
     df = fetch_ohlcv(ticker, days=days, min_bars=2)
-    return {"ticker": ticker, "days": days, "points": _project_points(df)}
+    return {"ticker": ticker, "days": days, "intraday": False, "points": _project_points(df)}
 
 # ── /api/signal ───────────────────────────────────────────────────────────────
 
@@ -3515,7 +3608,7 @@ def api_paper_equity_history(days: int = 30):
 def api_portfolio_history(period: str = "1D"):
     """Account equity curve from Alpaca's own portfolio history. Read-only, cached.
 
-    `period` ∈ {1D,1W,1M,3M,6M,YTD,1Y,Max} → Alpaca period units (D/W/M/A) and a
+    `period` ∈ {1D,1W,1M,3M,YTD,1Y,Max} → Alpaca period units (D/W/M/A) and a
     resolution that gets finer for short ranges (15Min for 1D, 1H for 1W, else 1D).
     YTD starts at Jan 1 of the current year; Max at the account's creation date.
     Returns {available, period, points: [{timestamp: ISO string, equity: number}]}.

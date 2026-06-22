@@ -253,14 +253,20 @@ export async function fetchBriefing(): Promise<Briefing> {
   return res.json();
 }
 
-// Pass { max: true } for the chart's "Max" range (full available history); otherwise a
-// `days`-bar window is fetched (760 gives MA200 lead-in for shorter views sliced client-side).
+// Pass `period` (the chart selector: "1D".."Max") to have the backend scope the window and
+// resolution server-side (intraday 1m/15m bars for 1D/1W, daily beyond, full history for Max).
+// Pass { max: true } as a shorthand for the full-history fetch, or `days` for a plain daily
+// window (used by the analytics buy & hold, which needs the full 760-bar daily series).
 export async function fetchPriceHistory(
   ticker: string,
-  opts: { days?: number; max?: boolean } = {},
+  opts: { days?: number; max?: boolean; period?: string } = {},
 ): Promise<PriceHistory> {
-  const { days = 760, max = false } = opts;
-  const query = max ? "period=max" : `days=${days}`;
+  const { days = 760, max = false, period } = opts;
+  const query = max
+    ? "period=max"
+    : period
+    ? `period=${encodeURIComponent(period)}`
+    : `days=${days}`;
   const res = await fetch(`${BASE}/api/price-history/${ticker}?${query}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));

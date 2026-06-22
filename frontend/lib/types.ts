@@ -256,8 +256,11 @@ export interface PricePoint {
 
 export interface PriceHistory {
   ticker: string;
-  days?: number;      // present for windowed fetches
-  period?: string;    // "max" for the full-history fetch
+  days?: number;        // present for windowed fetches
+  period?: string;      // the selector period ("1D"…"Max") for period-scoped fetches
+  intraday?: boolean;   // true for 1D/1W — `date` carries a full ISO timestamp, not YYYY-MM-DD
+  visible_from?: string; // daily periods only: ISO date where the chart should start drawing
+                         // (points before it are MA lead-in and must be trimmed from the axis)
   points: PricePoint[];
 }
 

@@ -1,12 +1,18 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip,
-  ResponsiveContainer, ReferenceDot, Legend,
+  ResponsiveContainer, ReferenceDot, ReferenceLine, Legend,
 } from "recharts";
 import { PricePoint, TradeOutcome } from "@/lib/types";
 import { fetchPriceHistory, fetchTradeHistory } from "@/lib/api";
-import { PERIODS, Period, periodCutoff } from "@/lib/period";
+import { PERIODS, Period } from "@/lib/period";
+
+// 1D/1W are served as intraday bars (1m / 15m) whose `date` is a full ISO timestamp;
+// they render as DD/MM HH:MM. Every longer range is daily and renders as MMM DD.
+function isIntraday(period: Period): boolean {
+  return period === "1D" || period === "1W";
+}
 
 // Simple moving average over the full close series (display-only; not used in scoring).
 function movingAverage(closes: number[], window: number): (number | null)[] {
@@ -44,6 +50,16 @@ function fmtShortDate(iso: string): string {
   const [, mo, d] = iso.split("-").map(Number);
   return `${MONTHS[mo - 1]} ${Number(d)}`;
 }
+// Intraday ISO timestamp → "DD/MM HH:MM" in local time (all parts from one Date object).
+function fmtDateTime(iso: string): string {
+  const dt = new Date(iso);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(dt.getDate())}/${p(dt.getMonth() + 1)} ${p(dt.getHours())}:${p(dt.getMinutes())}`;
+}
+// Axis/tooltip label for a data point: DD/MM HH:MM for intraday ranges, MMM DD otherwise.
+function fmtPointLabel(date: string, intraday: boolean): string {
+  return intraday ? fmtDateTime(date) : fmtShortDate(date);
+}
 
 export function PriceChart({
   ticker,
@@ -55,33 +71,51 @@ export function PriceChart({
   onPeriodChange: (p: Period) => void;
 }) {
   const [points, setPoints] = useState<PricePoint[] | null>(null);
+  // ISO date the chart should start drawing from (daily periods only). Points before it are
+  // MA lead-in: used to compute MA50/MA200 but trimmed off the axis. null = draw everything.
+  const [visibleFrom, setVisibleFrom] = useState<string | null>(null);
   const [trades, setTrades] = useState<TradeOutcome[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showMA, setShowMA] = useState({ ma20: false, ma50: false, ma200: false });
   // Marker the user is hovering/tapping, with its pixel coords from Recharts, for the explainer tooltip.
   const [activeMarker, setActiveMarker] = useState<{ m: Marker; cx: number; cy: number } | null>(null);
+  // Index of the data point nearest the cursor — drives the vertical crosshair.
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  // True while the cursor is over the chart. A ref (not state) so it never re-renders;
+  // there's no background poll here today, but this keeps the pattern ready so any future
+  // refetch can pause during interaction (as the equity curve does).
+  const isHovering = useRef(false);
 
-  // "Max" needs the full available history; every shorter range is served from the 760-bar
-  // window (which carries MA200 lead-in) and sliced client-side. Re-fetch only when crossing
-  // the Max boundary, not on every period switch.
-  const wantMax = period === "Max";
+  const intraday = isIntraday(period);
 
+  // The backend scopes the window + resolution to the selected period (intraday 1m/15m for
+  // 1D/1W, daily for 1M+, full history for Max), so we refetch on every period change.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchPriceHistory(ticker, wantMax ? { max: true } : { days: 760 })
-      .then((d) => { if (!cancelled) setPoints(d.points); })
+    setActiveIndex(null);
+    fetchPriceHistory(ticker, { period })
+      .then((d) => { if (!cancelled) { setPoints(d.points); setVisibleFrom(d.visible_from ?? null); } })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load prices"); })
       .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [ticker, period]);
+
+  // Trades (for entry/exit markers) don't depend on the period window, so fetch them once per ticker.
+  useEffect(() => {
+    let cancelled = false;
     fetchTradeHistory()
       .then((all) => { if (!cancelled) setTrades(all.filter((t) => t.ticker === ticker)); })
       .catch(() => { /* markers are optional */ });
     return () => { cancelled = true; };
-  }, [ticker, wantMax]);
+  }, [ticker]);
 
-  // Full-series rows with MAs computed over all available history.
+  // Rows with MAs computed over the *full* returned series (which includes the daily periods'
+  // MA lead-in). MA windows are bar counts: on intraday ranges they're short-horizon
+  // (e.g. MA20 = 20 minutes on 1D). The backend bounds the visible window, so MAs are valid
+  // from the first visible bar.
   const fullRows: Row[] = useMemo(() => {
     if (!points) return [];
     const closes = points.map((p) => p.close);
@@ -94,13 +128,15 @@ export function PriceChart({
     }));
   }, [points]);
 
-  // Slice to the selected period (MAs stay correct since they were computed on full history).
-  const rows = useMemo(() => {
-    if (!fullRows.length) return [];
-    const cutoffStr = periodCutoff(period, fullRows[fullRows.length - 1].date);
-    if (!cutoffStr) return fullRows;
-    return fullRows.filter((r) => r.date >= cutoffStr);
-  }, [fullRows, period]);
+  // Trim the MA lead-in off the axis: daily periods send `visible_from`; everything else
+  // (intraday, Max) draws the full series. MAs stay correct since they're computed above.
+  const rows: Row[] = useMemo(
+    () => (visibleFrom ? fullRows.filter((r) => r.date >= visibleFrom) : fullRows),
+    [fullRows, visibleFrom],
+  );
+
+  const onChartEnter = useCallback(() => { isHovering.current = true; }, []);
+  const onChartLeave = useCallback(() => { isHovering.current = false; setActiveIndex(null); }, []);
 
   // +/- price change across the visible window, shown next to the period selector.
   const periodChange = useMemo<number | null>(() => {
@@ -117,16 +153,18 @@ export function PriceChart({
     const dates = rows.map((r) => r.date);
     // Reuse the already-loaded price-history closes (no extra fetch) to explain the marker-vs-line gap.
     const closeByDate = new Map(rows.map((r) => [r.date, r.close]));
-    const first = dates[0];
-    const lastD = dates[dates.length - 1];
+    // Compare on the date prefix so intraday timestamps ("...T09:30:00-04:00") snap by day too.
+    const first = dates[0].slice(0, 10);
+    const lastD = dates[dates.length - 1].slice(0, 10);
     const snap = (iso: string | null): string | null => {
       if (!iso) return null;
       const d = iso.slice(0, 10);
       if (d < first || d > lastD) return null;
-      // nearest existing date <= d, else the first >= d
+      // nearest existing bar on/before d, else the first bar after it. `best` is the full
+      // `date` value (timestamp on intraday ranges) so the ReferenceDot lands on a real point.
       let best: string | null = null;
       for (const dd of dates) {
-        if (dd <= d) best = dd;
+        if (dd.slice(0, 10) <= d) best = dd;
         else { if (best === null) best = dd; break; }
       }
       return best;
@@ -210,16 +248,23 @@ export function PriceChart({
         </div>
       </div>
 
-      <div className="relative">
+      <div className="relative" onMouseEnter={onChartEnter} onMouseLeave={onChartLeave}>
       <ResponsiveContainer width="100%" height={260}>
-        <LineChart data={rows} margin={{ top: 6, right: 8, bottom: 0, left: -8 }}>
+        <LineChart
+          data={rows}
+          margin={{ top: 6, right: 8, bottom: 0, left: -8 }}
+          onMouseMove={(s: { activeTooltipIndex?: number }) =>
+            setActiveIndex(typeof s?.activeTooltipIndex === "number" ? s.activeTooltipIndex : null)
+          }
+          onMouseLeave={() => setActiveIndex(null)}
+        >
           <XAxis
             dataKey="date"
             tick={{ fill: "#71717a", fontSize: 10 }}
             axisLine={false}
             tickLine={false}
             minTickGap={48}
-            tickFormatter={(v: string) => v.slice(5)}
+            tickFormatter={(v: string) => fmtPointLabel(v, intraday)}
           />
           <YAxis
             domain={yDomain ?? ["auto", "auto"]}
@@ -230,11 +275,23 @@ export function PriceChart({
             tickFormatter={(v: number) => `$${v.toFixed(0)}`}
           />
           <Tooltip
+            cursor={false}
             contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6 }}
             labelStyle={{ color: "#e4e4e7", fontSize: 11 }}
             itemStyle={{ fontSize: 11 }}
             formatter={(v: number, name: string) => [`$${v.toFixed(2)}`, name]}
+            labelFormatter={(label: string) => fmtPointLabel(label, intraday)}
           />
+          {/* Vertical crosshair following the cursor to the nearest bar (Recharts' own
+              cursor is disabled above so this is the single, smooth indicator). */}
+          {activeIndex != null && rows[activeIndex] && (
+            <ReferenceLine
+              x={rows[activeIndex].date}
+              stroke="#52525b"
+              strokeWidth={1}
+              strokeDasharray="3 3"
+            />
+          )}
           <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4 }} iconType="line" />
           <Line type="monotone" dataKey="close" name="Close" stroke="#10b981" strokeWidth={1.6} dot={false} />
           {showMA.ma20 && <Line type="monotone" dataKey="ma20" name="MA20" stroke="#38bdf8" strokeWidth={1.2} dot={false} connectNulls />}
@@ -283,7 +340,7 @@ export function PriceChart({
         >
           <div className="font-semibold text-zinc-100">
             {activeMarker.m.kind === "entry" ? "Entry" : "Exit"}
-            <span className="text-zinc-500"> · {fmtShortDate(activeMarker.m.date)}</span>
+            <span className="text-zinc-500"> · {fmtPointLabel(activeMarker.m.date, intraday)}</span>
           </div>
           <div className="mt-0.5 whitespace-nowrap text-zinc-300 tabular-nums">
             Filled ${activeMarker.m.price.toFixed(2)}
