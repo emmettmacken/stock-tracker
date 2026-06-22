@@ -231,6 +231,14 @@ _FACTORS_TTL = 60  # seconds
 # Change 3: CIKs are permanent; cache indefinitely to avoid repeated EDGAR lookups
 _CIK_CACHE: dict[str, str] = {}  # ticker → 10-digit zero-padded CIK string
 
+# _fetch_insider result cache. _fetch_insider is hit at least twice per ticker per
+# signal cycle (once from /api/insider, once from factor computation); a 1-hour TTL
+# collapses those into a single EDGAR round-trip. Failures are not cached (see
+# _fetch_insider) so they retry on the next call. Lock guards parallel factor workers.
+_INSIDER_CACHE: dict[str, tuple[datetime, Any]] = {}  # ticker → (utc_timestamp, result)
+_INSIDER_TTL = timedelta(hours=1)
+_INSIDER_LOCK = threading.Lock()
+
 # ── Factor weight configuration ───────────────────────────────────────────────
 
 # Change 2: sentiment added at 12%; earnings reduced 25→18%, insider 10→5% to keep total=100%
@@ -1313,6 +1321,14 @@ def _fetch_insider(ticker: str) -> dict:
       direction          — "buying" / "selling" / "neutral" (from net_weighted).
       transactions       — per-transaction line items for the detail view.
     """
+    # 1-hour cache: return a fresh prior result without re-hitting EDGAR. Failures
+    # are never stored, so a cache miss here always means a real (re)fetch is needed.
+    with _INSIDER_LOCK:
+        cached = _INSIDER_CACHE.get(ticker)
+        if cached is not None and (datetime.utcnow() - cached[0]) < _INSIDER_TTL:
+            logger.info("EDGAR cache hit: %s", ticker)
+            return cached[1]
+
     ROLE_WEIGHTS = {"isOfficer": 1.0, "isDirector": 0.7, "isTenPercentOwner": 0.5}
     ROLE_LABELS  = {"isOfficer": "Officer", "isDirector": "Director", "isTenPercentOwner": "10% owner"}
     headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
@@ -1321,6 +1337,14 @@ def _fetch_insider(ticker: str) -> dict:
         "transaction_count": 0, "filings_processed": 0, "direction": "neutral",
         "transactions": [],
     }
+
+    def _store(result: dict) -> dict:
+        """Cache an EDGAR-reachable result (ok=True) with a fresh UTC timestamp and
+        return it. Failures (ok=False / exceptions) bypass this and stay uncached."""
+        with _INSIDER_LOCK:
+            _INSIDER_CACHE[ticker] = (datetime.utcnow(), result)
+        return result
+
     try:
         cik = _get_cik(ticker)
         if not cik:
@@ -1361,7 +1385,7 @@ def _fetch_insider(ticker: str) -> dict:
         if not recent_form4s:
             # No Form 4s = no data, not a neutral signal. score stays None so the factor
             # is excluded from the composite and the remaining weights renormalise.
-            return {**blank, "ok": True}
+            return _store({**blank, "ok": True})
 
         cik_int = int(cik)
         net_weighted = 0.0
@@ -1439,16 +1463,16 @@ def _fetch_insider(ticker: str) -> dict:
 
         if filings_processed == 0:
             # Form 4s exist but all failed to parse → score None (drop weight, don't guess)
-            return {**blank, "ok": True}
+            return _store({**blank, "ok": True})
 
         score = 70.0 if net_weighted > 0 else (30.0 if net_weighted < 0 else 50.0)
         direction = "buying" if net_weighted > 0 else ("selling" if net_weighted < 0 else "neutral")
-        return {
+        return _store({
             "ok": True, "score": score, "net_weighted": net_weighted,
             "net_shares": int(net_shares), "transaction_count": transaction_count,
             "filings_processed": filings_processed, "direction": direction,
             "transactions": transactions,
-        }
+        })
     except Exception as e:
         logger.warning("Insider fetch failed for %s: %s", ticker, e)
         return dict(blank)
@@ -2187,6 +2211,53 @@ def _kelly_fraction(composite_score: float, rvol: float) -> float:
     return min(kelly * 0.5, 0.25)  # half-Kelly, cap at 25%
 
 
+def _correlation_penalty(
+    candidate_ticker: str,
+    held_tickers: list[str],
+    prices: dict[str, np.ndarray],
+) -> tuple[float, float, Optional[str]]:
+    """Position-size penalty for a candidate that moves with already-sized tickers.
+
+    Computes the Pearson correlation of 60-day daily returns between `candidate_ticker`
+    and each ticker in `held_tickers`, then applies the system-wide penalty curve: for
+    the strongest correlation c > 0.7, penalty = 1 - (c - 0.7) / 0.3 * 0.5 (so c=0.70 → 1.0,
+    c=1.0 → 0.5); a correlation at or below 0.7 incurs no penalty (1.0).
+
+    `prices` maps each ticker to its close-price array; a ticker missing from `prices`,
+    with fewer than 61 closes, or with fewer than 10 overlapping return days is skipped.
+    Shared by /api/portfolio/sizing and the live trader's _position_dollars so the two
+    paths apply an identical penalty for the same inputs — keeping live and backtest in sync.
+
+    Returns (penalty, max_corr, correlated_ticker), where correlated_ticker is the held
+    name driving the penalty (None when none qualifies).
+    """
+    cand_c = prices.get(candidate_ticker)
+    if cand_c is None or len(cand_c) < 61:
+        return 1.0, 0.0, None
+    cand_r = pd.Series(np.diff(cand_c[-61:]) / cand_c[-61:-1])
+
+    max_corr = 0.0
+    correlated_ticker: Optional[str] = None
+    for held in held_tickers:
+        if held == candidate_ticker:
+            continue
+        held_c = prices.get(held)
+        if held_c is None or len(held_c) < 61:
+            continue
+        held_r = pd.Series(np.diff(held_c[-61:]) / held_c[-61:-1])
+        pair = pd.DataFrame({"a": cand_r, "b": held_r}).dropna()
+        if len(pair) < 10:
+            continue
+        c_val = float(pair["a"].corr(pair["b"]))
+        if not np.isnan(c_val) and c_val > max_corr:
+            max_corr = c_val
+            correlated_ticker = held
+
+    if max_corr > 0.7:
+        return 1.0 - (max_corr - 0.7) / 0.3 * 0.5, max_corr, correlated_ticker
+    return 1.0, max_corr, correlated_ticker
+
+
 @app.post("/api/portfolio/sizing")
 def portfolio_sizing(req: SizingRequest):
     try:
@@ -2205,35 +2276,18 @@ def portfolio_sizing(req: SizingRequest):
                 vols_map[t] = 0.25
                 closes_map[t] = np.array([])
 
-        # Correlation matrix from 90-day returns
-        ret_series: dict[str, pd.Series] = {}
-        for t in tickers:
-            c = closes_map.get(t, np.array([]))
-            if len(c) >= 91:
-                r = pd.Series(np.diff(c[-91:]) / c[-91:-1])
-                ret_series[t] = r
-        corr_matrix: dict[tuple, float] = {}
-        if len(ret_series) >= 2:
-            df_rets = pd.DataFrame(ret_series).dropna()
-            if len(df_rets) >= 10:
-                corr = df_rets.corr()
-                for i, t1 in enumerate(tickers):
-                    for j, t2 in enumerate(tickers):
-                        if t1 in corr.index and t2 in corr.columns:
-                            corr_matrix[(t1, t2)] = float(corr.loc[t1, t2])
-
         # Scores
         scores = {t: signals[t].composite_score if t in signals else 50.0 for t in tickers}
         sorted_tickers = sorted(tickers, key=lambda t: -scores[t])
 
-        # Correlation penalty: reduce weight of correlated lower-scored tickers
-        corr_penalties: dict[str, float] = {t: 1.0 for t in tickers}
+        # Correlation penalty: shrink a ticker's weight when it moves with an
+        # already higher-scored ticker in this batch. Computed via the shared
+        # _correlation_penalty helper so the live trader (_position_dollars) and this
+        # endpoint apply an identical penalty for the same inputs.
+        corr_penalties: dict[str, float] = {}
         for i, t1 in enumerate(sorted_tickers):
-            for t2 in sorted_tickers[:i]:  # t2 is higher-scored
-                c_val = corr_matrix.get((t1, t2), corr_matrix.get((t2, t1), 0.0))
-                if c_val > 0.7:
-                    penalty = 1.0 - (c_val - 0.7) / 0.3 * 0.5
-                    corr_penalties[t1] = min(corr_penalties[t1], penalty)
+            penalty, _, _ = _correlation_penalty(t1, sorted_tickers[:i], closes_map)
+            corr_penalties[t1] = penalty
 
         # Kelly allocations
         kelly_fracs: dict[str, float] = {}
@@ -2673,6 +2727,44 @@ def _position_dollars(
 
     vol_base = vol_weight * equity * multiplier * perf_multiplier
 
+    # ── Correlation penalty vs currently-held positions ─────────────────────────
+    # Mirror /api/portfolio/sizing via the shared _correlation_penalty helper: shrink
+    # the size when the candidate moves with an already-open position, so simultaneous
+    # BUYs on correlated names don't stack risk the backtest never sized for. Best-effort:
+    # any failure (no Alpaca client, network error, insufficient history) logs a warning
+    # and proceeds with no penalty — a correlation fetch must never block a trade.
+    penalty, max_corr, corr_tkr = 1.0, 0.0, None
+    try:
+        if _alpaca_client is not None:
+            held = [p.symbol for p in _alpaca_client.get_all_positions()
+                    if p.symbol.upper() != ticker.upper()]
+            if held:
+                prices: dict[str, np.ndarray] = {}
+                for t in [ticker, *held]:
+                    try:
+                        prices[t] = fetch_ohlcv(t, days=120, min_bars=61)["Close"].values.astype(float)
+                    except Exception:
+                        pass  # missing history → helper skips this ticker
+                penalty, max_corr, corr_tkr = _correlation_penalty(ticker, held, prices)
+    except Exception as e:
+        logger.warning(
+            "Correlation penalty fetch failed for %s: %s — proceeding without penalty",
+            ticker, e,
+        )
+        penalty, max_corr, corr_tkr = 1.0, 0.0, None
+
+    def _penalize(raw: float) -> float:
+        """Apply the correlation penalty to a raw dollar size, logging when it bites."""
+        if penalty >= 1.0:
+            return raw
+        adjusted = raw * penalty
+        logger.info(
+            "Correlation penalty applied to %s: raw_size=%.0f → adjusted=%.0f "
+            "(max_corr=%.2f with %s)",
+            ticker, raw, adjusted, max_corr, corr_tkr,
+        )
+        return adjusted
+
     # ── Kelly sizing ──────────────────────────────────────────────────────────
     ticker_trades = db.get_trades_for_kelly(ticker)
     all_trades    = db.get_all_trades_for_kelly()
@@ -2703,12 +2795,13 @@ def _position_dollars(
                 ticker, kelly_dollars, cap_3x,
             )
             kelly_dollars = cap_3x
-        # Hard cap 10%, floor POSITION_FLOOR_PCT
+        # Correlation penalty, then hard cap 10%, floor POSITION_FLOOR_PCT
+        kelly_dollars = _penalize(kelly_dollars)
         kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * POSITION_FLOOR_PCT)
         return kelly_dollars, round(kelly_frac, 6), sizing_method
 
     # Vol-targeting fallback
-    raw_dollars = max(min(vol_base, equity * 0.10), equity * POSITION_FLOOR_PCT)
+    raw_dollars = max(min(_penalize(vol_base), equity * 0.10), equity * POSITION_FLOOR_PCT)
     return raw_dollars, 0.0, "vol_target_fallback"
 
 
