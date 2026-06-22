@@ -246,12 +246,14 @@ _INSIDER_LOCK = threading.Lock()
 # ── Factor weight configuration ───────────────────────────────────────────────
 
 # Change 2: sentiment added at 12%; earnings reduced 25→18%, insider 10→5% to keep total=100%
+# Rebalance Jun 2026: weight-only shift toward momentum/trend, away from Markov. The non-sentiment
+# share (0.88) is split 35/28/22/8/7 (mom/vol_trend/earn/hmm/insider); sentiment held at 12%.
 DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
-    "hmm":       0.20,
-    "momentum":  0.25,
-    "vol_trend": 0.20,
-    "earnings":  0.18,
-    "insider":   0.05,
+    "hmm":       0.0704,
+    "momentum":  0.308,
+    "vol_trend": 0.2464,
+    "earnings":  0.1936,
+    "insider":   0.0616,
     "sentiment": 0.12,
 }
 
