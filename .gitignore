@@ -4,6 +4,8 @@ SYSTEM_REVIEW.md
 
 # Installed agent skill packages (tooling, not project code)
 .agents/
+.claude/skills
+skills-lock.json
 
 # Stray SQLite DB created when run from repo root (real DB lives in backend/)
 stock_tracker.db
