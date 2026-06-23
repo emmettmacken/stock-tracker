@@ -615,6 +615,8 @@ def get_price_history(ticker: str, days: int = 760, period: Optional[str] = None
 
 # ── /api/signal ───────────────────────────────────────────────────────────────
 
+# NOTE: This endpoint has no frontend caller — it is kept for manual debugging /
+# inspection of a ticker's regime label only. Do not remove.
 @app.get("/api/signal/{ticker}")
 def get_signal(ticker: str):
     """Price quote + the Gaussian-HMM bull/bear regime label for a ticker.
@@ -1535,7 +1537,7 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         "earnings":  {"score": round(earn_score, 2)      if earn_score     is not None else None, "weight": weights["earnings"],  "null": earn_score     is None},
         "insider":   {"score": round(insider_score, 2)   if insider_score  is not None else None, "weight": weights["insider"],   "null": insider_score  is None},
         # Change 2: sentiment factor; null when API unavailable — weight renormalises automatically
-        "sentiment": {"score": round(sentiment_score, 2) if sentiment_score is not None else None, "weight": weights.get("sentiment", 0.12), "null": sentiment_score is None},
+        "sentiment": {"score": round(sentiment_score, 2) if sentiment_score is not None else None, "weight": weights.get("sentiment", DEFAULT_FACTOR_WEIGHTS.get("sentiment", 0.12909)), "null": sentiment_score is None},
     }
 
     available = {k: v for k, v in factors.items() if not v["null"]}
@@ -2260,6 +2262,49 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             spy_aligned = dfs["SPY"]["Close"].reindex(dates_idx).ffill()
             spy_closes = spy_aligned.values
 
+        # Entry gates added to narrow the divergence from the live trader and the
+        # single-ticker backtest, which both refuse new entries under these conditions.
+        # These are computed POINT-IN-TIME (one value per historical date), mirroring the
+        # single-ticker backtest — not from the live _macro_regime() snapshot, which only
+        # describes today and would be wrong applied across historical rebalance points.
+        #
+        # Macro gate: SPY below its 200-day MA → no new entries this rebalance (go to cash).
+        spy_above_ma: Optional[np.ndarray] = None
+        if "SPY" in dfs:
+            try:
+                spy_arr = dfs["SPY"]["Close"].reindex(dates_idx).ffill().bfill().values.astype(float)
+                spy_ma200_arr = pd.Series(spy_arr).rolling(200, min_periods=1).mean().values
+                spy_above_ma = spy_arr > spy_ma200_arr  # length n_days
+            except Exception:
+                spy_above_ma = None  # fail open: don't block on SPY data issues
+
+        # VIX gate: VIX > 30 → no new entries this rebalance. Align by calendar date: the
+        # ^VIX feed is tz-aware in a different zone (CT) than dates_idx (ET), so a direct
+        # timestamp reindex would miss on every row. Any date still missing (or a failed
+        # fetch) leaves NaN and is treated as fail-open by the gate test below.
+        vix_series_pb: Optional[np.ndarray] = None
+        try:
+            vix_df_pb = yf.Ticker("^VIX").history(period="2y")
+            if not vix_df_pb.empty:
+                vix_by_date = {ts.date(): float(v) for ts, v in vix_df_pb["Close"].items()}
+                vix_series_pb = pd.Series(
+                    [vix_by_date.get(d.date(), np.nan) for d in dates_idx]
+                ).ffill().bfill().values.astype(float)  # length n_days
+        except Exception:
+            vix_series_pb = None  # fail open: skip VIX gate if data unavailable
+
+        # Re-entry cooldown: a ticker exited mid-window on score deterioration may not be
+        # re-bought until 2 trading days have passed (mirrors the live trader / single-ticker
+        # backtest). Only mid-window deterioration exits set this — the routine window-boundary
+        # rebalance is not a "non-signal exit" and must not trigger a cooldown (every ticker
+        # would otherwise sit 1 day from its prior window and never re-enter).
+        last_exit_idx: dict[str, int] = {t: -100 for t in valid}
+
+        # Remaining divergence (intentional, not fixed here): the live trader and single-ticker
+        # backtest also apply overextension and 3m/12m momentum-disagreement gates. Those need
+        # intra-window per-bar price context this rebalancing model doesn't evaluate per ticker,
+        # so they are NOT replicated. The portfolio backtest is therefore now CLOSER TO but
+        # still NOT IDENTICAL to live behaviour.
         test_start = TRAIN
         while test_start + TEST <= n_days - 1:
             ts = test_start - TRAIN
@@ -2280,12 +2325,28 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     continue
                 rvols[t] = tr_rets[-21:].std() * np.sqrt(252)
                 composite = _backtest_composite(c[: te + 1])
-                signals_window[t] = "BUY" if (composite is not None and composite >= buy_threshold) else "HOLD"
+                is_buy = composite is not None and composite >= buy_threshold
+                # Re-entry cooldown: block a BUY within 2 trading days of a mid-window exit.
+                if is_buy and (test_start - last_exit_idx[t]) < 2:
+                    is_buy = False
+                signals_window[t] = "BUY" if is_buy else "HOLD"
+
+            # Market-wide entry gates evaluated at this rebalance date. When either blocks,
+            # no new entries are taken and the portfolio holds cash for the window (we do NOT
+            # fall back to equal weight, which would defeat the gate).
+            macro_ok = (spy_above_ma is None) or bool(spy_above_ma[test_start])
+            # Fail open: only a real reading above 30 blocks (NaN > 30 is False), matching
+            # the single-ticker backtest so a VIX data gap never silently kills the run.
+            vix_ok = (vix_series_pb is None) or not (vix_series_pb[test_start] > 30.0)
+            entries_allowed = macro_ok and vix_ok
+            if not entries_allowed:
+                for t in valid:
+                    signals_window[t] = "HOLD"
 
             # Vol-targeted weights (only allocate to BUY signals)
             buy_tickers = [t for t in valid if signals_window[t] == "BUY"]
-            if not buy_tickers:
-                buy_tickers = valid  # fallback: equal weight
+            if not buy_tickers and entries_allowed:
+                buy_tickers = valid  # fallback: equal weight (only when entries are allowed)
             inv_vol = {t: 1.0 / max(rvols.get(t, 0.25), 0.01) for t in buy_tickers}
             total_inv = sum(inv_vol.values())
             weights = {t: inv_vol[t] / total_inv for t in buy_tickers}
@@ -2324,6 +2385,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         portfolio_val *= (1.0 - TC_PER_SIDE_PB * live_weights[t])
                         live_weights[t] = 0.0
                         mid_window_exits += 1
+                        last_exit_idx[t] = idx  # arm the re-entry cooldown
 
                 contrib_sum = 0.0
                 for i, t in enumerate(valid):
@@ -3726,7 +3788,6 @@ _DECISION_GATES: list[tuple[str, str]] = [
     ("earnings_within_2d",      "Not within 2 days of earnings"),
     ("data_unavailable",        "Price & factor data available"),
     ("bull_prob_below_threshold",  "HMM regime supports buying"),
-    ("hmm_regime_uncertain",    "Smoothed regime confidence sufficient"),
     ("score_below_threshold",   "Composite score meets threshold"),
     ("sentiment_too_low",       "Sentiment not strongly negative"),
     ("vix_too_high",            "Market volatility (VIX) acceptable"),
@@ -3764,11 +3825,6 @@ def _decision_trail_detail(key: str, status: str, anchor: dict, ctx: dict) -> st
         if status == "failed":
             return f"Regime {regime_txt} — Gaussian HMM bull probability {_pct(bull_prob)} below the 70% bar"
         return f"Regime {regime_txt}, Gaussian HMM bull probability {_pct(bull_prob)} ≥ 70%"
-    if key == "hmm_regime_uncertain":
-        if status == "failed" and ":" in reason:
-            val = reason.split(":", 1)[1]
-            return f"Smoothed bull probability {val} below the 0.55 floor"
-        return f"Smoothed bull probability {_pct(bull_prob)} (need > 55%)"
     if key == "score_below_threshold":
         if status == "failed" and ":" in reason:
             return f"Composite {reason.split(':', 1)[1]} (below threshold)"
@@ -3922,7 +3978,8 @@ _SKIP_LABELS: dict[str, str] = {
     "earnings_within_2d":     "Earnings within 2 days",
     "data_unavailable":       "Data unavailable",
     "bull_prob_below_threshold": "HMM regime not bullish",
-    "hmm_regime_uncertain":   "Regime confidence too low",
+    # Retained for historical rows logged before the rename; no new rows carry it.
+    "hmm_not_buy_transition": "HMM regime not bullish (historical)",
     "score_below_threshold":  "Score below threshold",
     "sentiment_too_low":      "Sentiment too negative",
     "vix_too_high":           "VIX too high",

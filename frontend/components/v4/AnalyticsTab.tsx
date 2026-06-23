@@ -279,8 +279,9 @@ export function AnalyticsTab() {
               } />
             </div>
             <p className="text-[10px] text-zinc-600">
-              Adjusted weekly: −5 when recent win rate &gt; 60%, +5 when &lt; 40%.
-              Range: bull 70–85 · bear 80–90.
+              Adjusted weekly via exponential weighted average (α = 0.15):
+              tightens when recent win rate &lt; 40%, loosens when &gt; 60%.
+              Range: bull 63–80 · bear 75–85.
             </p>
           </>
         ) : null}

@@ -18,27 +18,33 @@ function ActionPill({ action }: { action: string }) {
 }
 
 const SKIP_LABELS: Record<string, string> = {
-  hold_or_below_threshold:    "Hold / below threshold",
   already_in_position:        "Already in position",
   earnings_within_2d:         "Earnings within 2 days",
   data_unavailable:           "Data unavailable",
-  friday_no_entry:            "No entries on Fridays",
-  low_volume:                 "Volume < 1.2× 20-day avg",
-  overextended:               "Price >15% above MA20",
-  sector_concentration:       "Sector limit (max 2)",
-  sell_signal:                "Sell signal triggered",
+  bull_prob_below_threshold:  "Bull probability too low",
+  score_below_threshold:      "Score below threshold",
+  sentiment_too_low:          "Sentiment too low",
+  volume_below_average:       "Volume below average",
+  overextended:               "Price >25% above MA20",
+  sector_concentration:       "Sector limit (max 3)",
   score_deterioration:        "Score fell below 40",
   momentum_disagreement:      "3m/12m momentum disagree",
   reentry_cooldown:           "Re-entry cooldown (2d)",
   macro_drawdown_protection:  "Macro drawdown protection",
   min_factor_floor:           "Factor floor (score capped)",
+  // Retained for historical rows logged before the gate was renamed to
+  // bull_prob_below_threshold; no new rows carry this reason.
+  hmm_not_buy_transition:     "Bull probability too low (historical)",
 };
 
 function formatSkipReason(reason: string): string {
   if (reason.startsWith("vix_too_high:")) return `VIX too high (${reason.split(":")[1]})`;
   if (reason.startsWith("order_failed:")) return "Order failed";
   if (reason.startsWith("close_failed:")) return "Close failed";
-  return SKIP_LABELS[reason] ?? reason.replace(/_/g, " ");
+  // Several reasons are logged with a ":value" suffix (e.g. "score_below_threshold:62<63");
+  // look up the label by the key part before the colon.
+  const key = reason.split(":")[0];
+  return SKIP_LABELS[key] ?? reason.replace(/_/g, " ");
 }
 
 function relTime(ts: string) {
