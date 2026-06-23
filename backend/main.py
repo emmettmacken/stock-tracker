@@ -9,7 +9,7 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
@@ -181,6 +181,8 @@ _PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # "period:timefram
 # and timeframe resolution: 15Min/1H/1D). "YTD" starts at Jan 1 of the current year and
 # "Max" at the account's creation date — both computed in api_portfolio_history.
 _HISTORY_SPEC = {
+    # 1D is a rolling 24h window (start/end set per-request below), not Alpaca's
+    # "today's session" period. The period key is unused for 1D.
     "1D":  {"period": "1D", "timeframe": "15Min"},
     "1W":  {"period": "1W", "timeframe": "1H"},
     "1M":  {"period": "1M", "timeframe": "1D"},
@@ -3667,7 +3669,18 @@ def api_portfolio_history(period: str = "1D"):
         return cached
 
     try:
-        if period == "Max":
+        if period == "1D":
+            # Rolling 24h window ending now, at 15-minute resolution with extended
+            # hours. Alpaca's "1D" period means "today's session", which is empty
+            # overnight and pre-open; explicit start/end gives a true last-24h view.
+            now = datetime.now(timezone.utc)
+            req = GetPortfolioHistoryRequest(
+                start=now - timedelta(hours=24),
+                end=now,
+                timeframe=timeframe,
+                extended_hours=True,
+            )
+        elif period == "Max":
             start = None
             try:
                 start = _alpaca_client.get_account().created_at
