@@ -15,7 +15,7 @@ import {
 const SHORT_SKIP: Record<string, string> = {
   score_below_threshold: "score",
   hmm_regime_uncertain: "regime",
-  hmm_not_buy_transition: "regime",
+  bull_prob_below_threshold: "regime",
   sentiment_too_low: "sentiment",
   vix_too_high: "VIX",
   volume_below_average: "volume",

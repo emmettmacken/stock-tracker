@@ -289,7 +289,7 @@ _EARNINGS_CACHE: dict[str, tuple[bool, float]] = {}
 _EARNINGS_TTL = 86400  # 24 hours
 
 # Macro regime cache (5-min TTL — SPY/VIX checked once per signal job, not per ticker)
-_MACRO_CACHE: Optional[tuple] = None  # ((spy_above, vix), timestamp)
+_MACRO_CACHE: Optional[tuple] = None  # (detail_dict, timestamp); see _macro_regime_detail()
 _MACRO_TTL = 300  # seconds
 
 # ── Feature preparation ───────────────────────────────────────────────────────
@@ -1733,6 +1733,21 @@ def get_factor_correlations():
     return _sanitize_json(out)
 
 
+@app.get("/api/macro-regime")
+def get_macro_regime():
+    """Current SPY/200d-MA regime with provenance, so the active buy threshold can be
+    inspected without grepping backend logs. `source` is "live" when SPY data was
+    fetched this cycle, "fallback" when it failed and spy_above defaulted to True."""
+    d = _macro_regime_detail()
+    return {
+        "spy_above":       d["spy_above"],
+        "spy_price":       d["spy_price"],
+        "spy_ma200":       d["spy_ma200"],
+        "source":          d["source"],
+        "fallback_reason": d["fallback_reason"],
+    }
+
+
 @app.get("/api/gate-stats")
 def get_gate_stats():
     try:
@@ -2398,28 +2413,63 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 # AUTOMATION HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _macro_regime() -> tuple[bool, float]:
-    """Returns (spy_above_200d_ma, vix_level)."""
+def _macro_regime_detail() -> dict:
+    """Full macro-regime snapshot with provenance. Cached for _MACRO_TTL seconds.
+
+    Returns a dict: spy_above, spy_price, spy_ma200, vix, source ("live"|"fallback"),
+    fallback_reason (str|None). `_macro_regime()` is a thin (spy_above, vix) wrapper.
+    """
     global _MACRO_CACHE
     # Change 5: lock prevents two threads from both finding the cache stale and double-fetching
     with _MACRO_LOCK:
         if _MACRO_CACHE is not None and (time.time() - _MACRO_CACHE[1]) < _MACRO_TTL:
             return _MACRO_CACHE[0]
-    # Fix 4-A: fail CLOSED. If SPY/VIX data is unavailable we must not assume a
-    # benign regime — treat SPY as below its 200d MA (bear → stricter threshold)
-    # and VIX as elevated (blocks new buys) until the data comes back.
+
+    # SPY vs its 200d MA. Retry transient yfinance failures (timeout / rate limit /
+    # empty response) up to 3× with 2s delays before falling back. Every attempt is
+    # logged with the exact exception so production failures are diagnosable.
     spy_above = True
-    spy_ok = False
-    try:
-        h = yf.Ticker("SPY").history(period="1y")
-        if len(h) >= 200:
-            spy_above = float(h["Close"].iloc[-1]) > float(h["Close"].iloc[-200:].mean())
-            spy_ok = True
-    except Exception as e:
-        logger.warning("Macro: SPY fetch failed (%s)", e)
-    if not spy_ok:
-        spy_above = False  # fail closed → bear-level threshold
-        logger.warning("Macro: SPY 200d MA unavailable — failing closed to bearish regime")
+    spy_price: Optional[float] = None
+    spy_ma200: Optional[float] = None
+    spy_source = "fallback"
+    fallback_reason: Optional[str] = None
+    last_failure: Optional[str] = None
+    for attempt in range(1, 4):
+        try:
+            h = yf.Ticker("SPY").history(period="1y")
+            if len(h) >= 200:
+                spy_price = float(h["Close"].iloc[-1])
+                spy_ma200 = float(h["Close"].iloc[-200:].mean())
+                spy_above = spy_price > spy_ma200
+                spy_source = "live"
+                fallback_reason = None
+                logger.info(
+                    "Macro: SPY live (attempt %d) — price=%.2f ma200=%.2f above_200d=%s",
+                    attempt, spy_price, spy_ma200, spy_above,
+                )
+                break
+            # Data parsing issue: not enough history to compute a 200d MA.
+            last_failure = f"insufficient history: {len(h)} rows (<200) from yf.Ticker('SPY').history(period='1y')"
+            logger.warning("Macro: SPY fetch attempt %d/3 unusable — %s", attempt, last_failure)
+        except Exception as e:
+            last_failure = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "Macro: SPY fetch attempt %d/3 failed — url=yf.Ticker('SPY').history(period='1y'): %s",
+                attempt, last_failure,
+            )
+        if attempt < 3:
+            time.sleep(2)
+    if spy_source == "fallback":
+        # Fail OPEN to a bull regime. The market sits above its 200d MA the large
+        # majority of the time; failing closed to the stricter bear threshold (80)
+        # would silently block almost every trade whenever the data feed hiccups.
+        spy_above = True
+        fallback_reason = last_failure or "unknown"
+        logger.warning(
+            "Macro: SPY 200d MA unavailable after 3 attempts (%s) — "
+            "falling back to spy_above=True (bull-regime default)",
+            fallback_reason,
+        )
 
     vix = 20.0
     vix_ok = False
@@ -2434,10 +2484,23 @@ def _macro_regime() -> tuple[bool, float]:
         vix = 999.0  # fail closed → high_vix gate blocks new buys
         logger.warning("Macro: VIX unavailable — failing closed to elevated VIX (new buys blocked)")
 
-    result = (spy_above, vix)
+    detail = {
+        "spy_above":       spy_above,
+        "spy_price":       spy_price,
+        "spy_ma200":       spy_ma200,
+        "vix":             vix,
+        "source":          spy_source,
+        "fallback_reason": fallback_reason,
+    }
     with _MACRO_LOCK:
-        _MACRO_CACHE = (result, time.time())
-    return result
+        _MACRO_CACHE = (detail, time.time())
+    return detail
+
+
+def _macro_regime() -> tuple[bool, float]:
+    """Returns (spy_above_200d_ma, vix_level). Thin wrapper over _macro_regime_detail()."""
+    d = _macro_regime_detail()
+    return d["spy_above"], d["vix"]
 
 
 def _earnings_within_days(ticker: str, days: int = 2) -> bool:
@@ -2672,7 +2735,7 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
 def _write_gate_stats() -> None:
     cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
     gate_names = [
-        "hmm_not_buy_transition", "hmm_regime_uncertain", "score_below_threshold",
+        "bull_prob_below_threshold", "hmm_regime_uncertain", "score_below_threshold",
         "sentiment_too_low",
         "earnings_within_2d", "vix_too_high", "already_in_position",
         "volume_below_average",
@@ -2832,17 +2895,8 @@ def _run_signal_job() -> None:
 
             # Gaussian-HMM regime gate: require ≥70% confidence in a bull regime to enter.
             if smoothed_bull_prob < 0.70:
-                db.log_signal(ticker, composite, signal_label, "skipped", "hmm_not_buy_transition", price, atr,
+                db.log_signal(ticker, composite, signal_label, "skipped", "bull_prob_below_threshold", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
-                              smoothed_bull_prob=smoothed_bull_prob, hmm_fit_failed=hmm_fit_failed)
-                continue
-
-            # Kalman-smoothed regime gate: lowered to 0.55 since the gate above now
-            # already requires ≥0.70 to pass on the Gaussian path (avoids 0.65–0.70 ambiguity).
-            if smoothed_bull_prob <= 0.55:
-                db.log_signal(ticker, composite, "BUY", "skipped",
-                              f"hmm_regime_uncertain:{smoothed_bull_prob:.3f}",
-                              price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob, hmm_fit_failed=hmm_fit_failed)
                 continue
 
@@ -3671,7 +3725,7 @@ def api_signal_log(limit: int = 50):
 _DECISION_GATES: list[tuple[str, str]] = [
     ("earnings_within_2d",      "Not within 2 days of earnings"),
     ("data_unavailable",        "Price & factor data available"),
-    ("hmm_not_buy_transition",  "HMM regime supports buying"),
+    ("bull_prob_below_threshold",  "HMM regime supports buying"),
     ("hmm_regime_uncertain",    "Smoothed regime confidence sufficient"),
     ("score_below_threshold",   "Composite score meets threshold"),
     ("sentiment_too_low",       "Sentiment not strongly negative"),
@@ -3705,7 +3759,7 @@ def _decision_trail_detail(key: str, status: str, anchor: dict, ctx: dict) -> st
     if key == "data_unavailable":
         return ("Insufficient price/factor data to evaluate"
                 if status == "failed" else "Sufficient price history and factors computed")
-    if key == "hmm_not_buy_transition":
+    if key == "bull_prob_below_threshold":
         regime_txt = regime or "unknown"
         if status == "failed":
             return f"Regime {regime_txt} — Gaussian HMM bull probability {_pct(bull_prob)} below the 70% bar"
@@ -3867,7 +3921,7 @@ def _build_decision_trail(ticker: str) -> dict:
 _SKIP_LABELS: dict[str, str] = {
     "earnings_within_2d":     "Earnings within 2 days",
     "data_unavailable":       "Data unavailable",
-    "hmm_not_buy_transition": "HMM regime not bullish",
+    "bull_prob_below_threshold": "HMM regime not bullish",
     "hmm_regime_uncertain":   "Regime confidence too low",
     "score_below_threshold":  "Score below threshold",
     "sentiment_too_low":      "Sentiment too negative",
