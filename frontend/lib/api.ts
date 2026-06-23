@@ -202,6 +202,45 @@ export async function closePosition(
   return res.json();
 }
 
+// Locked positions are exempt from automated exits (stop loss, 21-day hold, macro
+// protection, score deterioration). The Close button still works manually.
+export async function fetchLockedPositions(): Promise<string[]> {
+  const res = await fetch(`${BASE}/api/portfolio/positions/locked`);
+  if (!res.ok) throw new Error("Failed to fetch locked positions");
+  const data: { locked: string[] } = await res.json();
+  return data.locked ?? [];
+}
+
+export async function lockPosition(
+  ticker: string,
+): Promise<{ success: boolean; ticker: string; locked_at: string }> {
+  const res = await fetch(`${BASE}/api/portfolio/positions/lock`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticker }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to lock ${ticker}`);
+  }
+  return res.json();
+}
+
+export async function unlockPosition(
+  ticker: string,
+): Promise<{ success: boolean; ticker: string }> {
+  const res = await fetch(`${BASE}/api/portfolio/positions/unlock`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticker }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `Failed to unlock ${ticker}`);
+  }
+  return res.json();
+}
+
 // Aggregate expectancy across all closed trades, for the Portfolio Edge Statistics
 // section and the Strategy Lab sample-size caveat (uses the `n` field).
 export async function fetchEdgeStats(): Promise<EdgeStats> {
@@ -270,6 +309,35 @@ export async function fetchPriceHistory(
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? `Failed to fetch price history for ${ticker}`);
+  }
+  return res.json();
+}
+
+// ── Automated trading settings ──────────────────────────────────────────────────
+export type TradingMode = "all" | "entries_only";
+export interface TradingSettings {
+  automated_trading_enabled: boolean;
+  automated_trading_mode: TradingMode;
+}
+
+export async function fetchTradingSettings(): Promise<TradingSettings> {
+  const res = await fetch(`${BASE}/api/settings/trading`);
+  if (!res.ok) throw new Error("Failed to fetch trading settings");
+  return res.json();
+}
+
+// Update whichever fields are provided; returns the full updated settings object.
+export async function updateTradingSettings(
+  patch: Partial<TradingSettings>,
+): Promise<TradingSettings> {
+  const res = await fetch(`${BASE}/api/settings/trading`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to update trading settings");
   }
   return res.json();
 }

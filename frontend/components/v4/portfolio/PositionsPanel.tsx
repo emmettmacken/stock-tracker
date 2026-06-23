@@ -2,11 +2,16 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import Link from "next/link";
 import { PaperPosition, EntrySignal } from "@/lib/types";
-import { fetchPaperPositions, fetchEntrySignals, fetchFactors } from "@/lib/api";
+import {
+  fetchPaperPositions, fetchEntrySignals, fetchFactors,
+  fetchLockedPositions, lockPosition, unlockPosition,
+} from "@/lib/api";
 import { scoreTextColor } from "@/components/v3/FactorScorePill";
 import { Skeleton } from "@/components/v3/Skeleton";
 import { StatCard } from "./StatCard";
 import { ClosePositionModal } from "./ClosePositionModal";
+import { LockPositionModal } from "./LockPositionModal";
+import { LockToggle } from "./LockToggle";
 import { fmtUSD, fmtUSDSigned, fmtPctSigned } from "@/lib/format";
 
 // One enriched position row joining the Alpaca position, its signal_log entry data, and
@@ -63,18 +68,30 @@ export function PositionsPanel() {
   const [sortKey, setSortKey] = useState<SortKey>("pnlPct");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
-  // Position the Close modal is open for (null = closed), plus the success toast.
+  // Position the Close modal is open for (null = closed), plus the success/error toast.
   const [closing, setClosing] = useState<Row | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ text: string; error?: boolean } | null>(null);
+
+  // Locked tickers (exempt from automated exits). `lockConfirm` holds the ticker awaiting
+  // the lock confirmation modal; unlocking needs no confirmation.
+  const [lockedSet, setLockedSet] = useState<Set<string>>(new Set());
+  const [lockConfirm, setLockConfirm] = useState<string | null>(null);
+  const [lockSubmitting, setLockSubmitting] = useState(false);
+  const [lockError, setLockError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setError(null);
     // Positions (with entry data) — the table can't render without these.
-    Promise.all([fetchPaperPositions(), fetchEntrySignals().catch(() => ({ available: false }))])
-      .then(([pos, ent]) => {
+    Promise.all([
+      fetchPaperPositions(),
+      fetchEntrySignals().catch(() => ({ available: false })),
+      fetchLockedPositions().catch(() => [] as string[]),
+    ])
+      .then(([pos, ent, locked]) => {
         if (!pos.available) { setError(pos.error ?? "Positions unavailable"); setPositions([]); return; }
         setPositions(pos.positions ?? []);
         setEntries(("entries" in ent && ent.entries) ? ent.entries : {});
+        setLockedSet(new Set(locked));
       })
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load positions"))
       .finally(() => setLoading(false));
@@ -154,9 +171,41 @@ export function PositionsPanel() {
   // (giving Alpaca time to process the fill before we re-read).
   function handleCloseSuccess(qtyLabel: string) {
     const ticker = closing?.ticker ?? "";
-    setToast(`Sell order placed for ${qtyLabel} shares of ${ticker}`);
+    setToast({ text: `Sell order placed for ${qtyLabel} shares of ${ticker}` });
     setClosing(null);
     setTimeout(load, 2000);
+  }
+
+  // Unlocked → locked goes through the confirmation modal; locked → unlocked happens
+  // immediately (optimistic, reverting on error).
+  function handleToggleLock(ticker: string) {
+    if (lockedSet.has(ticker)) {
+      setLockedSet((prev) => { const n = new Set(prev); n.delete(ticker); return n; });
+      unlockPosition(ticker).catch((e) => {
+        setLockedSet((prev) => new Set(prev).add(ticker)); // revert
+        setToast({ text: e instanceof Error ? e.message : `Failed to unlock ${ticker}`, error: true });
+      });
+    } else {
+      setLockError(null);
+      setLockConfirm(ticker);
+    }
+  }
+
+  async function confirmLock() {
+    if (!lockConfirm) return;
+    const ticker = lockConfirm;
+    setLockSubmitting(true);
+    setLockError(null);
+    try {
+      await lockPosition(ticker);
+      setLockedSet((prev) => new Set(prev).add(ticker));
+      setLockConfirm(null);
+      setToast({ text: `${ticker} locked — automated exits disabled` });
+    } catch (e) {
+      setLockError(e instanceof Error ? e.message : `Failed to lock ${ticker}`);
+    } finally {
+      setLockSubmitting(false);
+    }
   }
 
   function handleSort(key: SortKey) {
@@ -222,6 +271,7 @@ export function PositionsPanel() {
                       {c.label} {sortKey === c.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
                     </th>
                   ))}
+                  <th className="py-2 px-2 text-center text-zinc-500 font-medium select-none whitespace-nowrap">Lock</th>
                   <th className="py-2 text-right text-zinc-500 font-medium select-none" />
                 </tr>
               </thead>
@@ -229,8 +279,14 @@ export function PositionsPanel() {
                 {sorted.map((r) => {
                   const pnlPos = r.pnlAbs >= 0;
                   const pnlClass = pnlPos ? "text-emerald-400" : "text-red-400";
+                  const isLocked = lockedSet.has(r.ticker);
                   return (
-                    <tr key={r.ticker} className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors duration-150 ease-out-quart">
+                    <tr
+                      key={r.ticker}
+                      className={`border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors duration-150 ease-out-quart ${
+                        isLocked ? "border-l-2 border-l-red-500/70" : ""
+                      }`}
+                    >
                       <td className="py-2.5 pr-4 font-bold">
                         <Link href={`/stock/${r.ticker}`} className="text-zinc-200 hover:text-white hover:underline">
                           {r.ticker}
@@ -245,6 +301,12 @@ export function PositionsPanel() {
                       <td className="py-2.5 pr-4 tabular-nums text-zinc-300 text-right">{fmtUSD(r.value, { decimals: 0 })}</td>
                       <td className="py-2.5 pr-4 text-right"><ScoreCell score={r.entryScore} /></td>
                       <td className="py-2.5 pr-4 text-right"><ScoreCell score={r.currentScore} /></td>
+                      <td className="py-2.5 px-2 text-center">
+                        <LockToggle
+                          locked={isLocked}
+                          onToggle={() => handleToggleLock(r.ticker)}
+                        />
+                      </td>
                       <td className="py-2.5 text-right whitespace-nowrap">
                         <button
                           onClick={() => setClosing(r)}
@@ -272,9 +334,23 @@ export function PositionsPanel() {
         />
       )}
 
+      {lockConfirm && (
+        <LockPositionModal
+          ticker={lockConfirm}
+          submitting={lockSubmitting}
+          error={lockError}
+          onConfirm={confirmLock}
+          onCancel={() => { if (!lockSubmitting) setLockConfirm(null); }}
+        />
+      )}
+
       {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 rounded-lg bg-emerald-500/95 px-4 py-2.5 text-xs font-medium text-white shadow-lg">
-          {toast}
+        <div
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 rounded-lg px-4 py-2.5 text-xs font-medium text-white shadow-lg ${
+            toast.error ? "bg-red-500/95" : "bg-emerald-500/95"
+          }`}
+        >
+          {toast.text}
         </div>
       )}
     </div>

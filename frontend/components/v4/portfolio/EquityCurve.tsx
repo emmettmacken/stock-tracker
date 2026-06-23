@@ -56,9 +56,12 @@ interface EquityCurveProps {
   // Called on every successful live-tip fetch (10s, market hours) with the latest equity —
   // fires even while the user is hovering, so the page's stat cards stay current.
   onLiveEquity?: (equity: number) => void;
+  // Frontend-only preference: draw a dotted horizontal line at the starting balance.
+  showNetDeposits?: boolean;
+  netDepositsLevel?: number;
 }
 
-export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
+export function EquityCurve({ onLiveEquity, showNetDeposits = false, netDepositsLevel = 100_000 }: EquityCurveProps = {}) {
   const [range, setRange] = useState<Range>("1D");
   const [points, setPoints] = useState<PortfolioHistoryPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -150,10 +153,12 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
   const yDomain = useMemo<[number, number] | undefined>(() => {
     if (!rows.length) return undefined;
     const vals = rows.map((r) => r.equity);
+    // Expand the domain to keep the net-deposits reference line in view when enabled.
+    if (showNetDeposits) vals.push(netDepositsLevel);
     const lo = Math.min(...vals), hi = Math.max(...vals);
     const pad = (hi - lo) * 0.08 || hi * 0.02;
     return [lo - pad, hi + pad];
-  }, [rows]);
+  }, [rows, showNetDeposits, netDepositsLevel]);
 
   const up = (change?.abs ?? 0) >= 0;
   const stroke = up ? "#10b981" : "#ef4444";
@@ -263,6 +268,21 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
                 return ts ? fmtLabel(ts, range) : "";
               }}
             />
+            {/* Net-deposits reference line at the starting balance (opt-in setting). */}
+            {showNetDeposits && (
+              <ReferenceLine
+                y={netDepositsLevel}
+                stroke="#a1a1aa"
+                strokeWidth={1}
+                strokeDasharray="4 4"
+                label={{
+                  value: `Net deposits ${fmtUSD(netDepositsLevel, { decimals: 0 })}`,
+                  position: "insideTopLeft",
+                  fill: "#a1a1aa",
+                  fontSize: 10,
+                }}
+              />
+            )}
             {/* Vertical crosshair that follows the cursor to the nearest point. Tracks
                 fluidly on dense 1D snapshot data and step-wise on daily bars alike. */}
             {activeIndex != null && rows[activeIndex] && (

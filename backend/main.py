@@ -2826,6 +2826,24 @@ def _trading_days_between(start: datetime, end: datetime) -> int:
         return max(0, int((end - start).days * 5 / 7))
 
 
+def _skip_if_locked(
+    ticker: str,
+    *,
+    composite: Optional[float] = None,
+    signal: Optional[str] = None,
+    price: Optional[float] = None,
+    atr: Optional[float] = None,
+) -> bool:
+    """If the position is user-locked, log a 'position_locked' skip and return True so
+    the caller can bypass the automated close. Manual closes (the UI Close button →
+    /api/portfolio/positions/close) call Alpaca directly and never hit this check."""
+    if db.is_position_locked(ticker):
+        db.log_signal(ticker, composite, signal, "skipped", "position_locked", price, atr)
+        logger.warning("%s: automated close skipped — position locked by user", ticker)
+        return True
+    return False
+
+
 def _close_and_record(api, ticker: str, current_price: float, entry_price: float,
                       exit_reason: str, entry_log: Optional[dict],
                       score: Optional[float] = None) -> None:
@@ -2918,6 +2936,21 @@ def _run_signal_job() -> None:
     logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f",
                 spy_above, vix, buy_threshold)
 
+    # Automated-trading toggle. We always compute and log signals so the user can see what
+    # the system would have done; the toggle only gates actual order placement.
+    #   "all"          → pause everything: no new entries, no automatic exits
+    #   "entries_only" → pause new entries only; exits still run
+    trading_enabled = db.get_automated_trading_enabled()
+    trading_mode    = db.get_automated_trading_mode()
+    entries_paused  = not trading_enabled
+    exits_paused    = (not trading_enabled) and trading_mode == "all"
+    if entries_paused and trading_mode == "all":
+        logger.info("Automated trading is paused (all). Signals still computed; "
+                    "no entries or exits will be placed.")
+    elif entries_paused:
+        logger.info("Automated trading is paused (entries only). New entries skipped, "
+                    "exits still active.")
+
     # Sector counts of currently open positions
     open_sector_counts: dict[str, int] = {}
     for sym in positions:
@@ -3009,6 +3042,16 @@ def _run_signal_job() -> None:
 
             # Score deterioration exit — skip for transition regime (smoothed_bull_prob in [0.35, 0.65])
             if in_pos and composite < 40.0 and hmm_regime != "transition":
+                if _skip_if_locked(ticker, composite=composite, signal=signal_label,
+                                   price=price, atr=atr):
+                    continue
+                # In "all" pause mode, automatic exits are suspended too (entries_only keeps them).
+                if exits_paused:
+                    db.log_signal(ticker, composite, signal_label, "skipped",
+                                  "trading_paused_all", price, atr,
+                                  hmm_regime=hmm_regime, sentiment_score=sentiment,
+                                  smoothed_bull_prob=smoothed_bull_prob)
+                    continue
                 pos = positions[ticker]
                 entry_log = db.get_last_buy_signal(ticker)
                 try:
@@ -3174,6 +3217,17 @@ def _run_signal_job() -> None:
 
     for c in buy_candidates:
         ticker, dollars, price, atr = c["ticker"], c["dollars"], c["price"], c["atr"]
+        # Automated-trading toggle: skip new entries when paused (both "all" and
+        # "entries_only"), but still log them so the feed shows what would have happened.
+        if entries_paused:
+            reason = "trading_paused_all" if trading_mode == "all" else "trading_paused_entries"
+            db.log_signal(
+                ticker, c["effective_composite"], "BUY", "skipped", reason, price, atr,
+                hmm_regime=c["hmm_regime"], sentiment_score=c["sentiment"],
+                smoothed_bull_prob=c["smoothed_bull_prob"],
+            )
+            logger.info("%s: BUY skipped — automated trading paused (%s)", ticker, trading_mode)
+            continue
         try:
             try:
                 api.submit_order(MarketOrderRequest(
@@ -3244,6 +3298,14 @@ def _run_equity_prune_job() -> None:
 def _run_stoploss_job() -> None:
     logger.info("▶ Stop-loss job starting")
     db.set_config("last_stoploss_job_at", datetime.utcnow().isoformat())
+
+    # Automated-trading toggle: the stop-loss job handles automatic exits (ATR stop,
+    # 21-day hold, macro protection). These are paused only in "all" mode; "entries_only"
+    # keeps exits running. (New entries are gated separately in _run_signal_job.)
+    if not db.get_automated_trading_enabled() and db.get_automated_trading_mode() == "all":
+        logger.info("Automated trading is paused (all). Stop-loss job skipped.")
+        return
+
     api, err = _alpaca_client, _alpaca_err
     if api is None:
         logger.warning("Stop-loss job aborted: %s", err)
@@ -3264,6 +3326,8 @@ def _run_stoploss_job() -> None:
                 logger.warning("SPY 5-day return %.2f%% — macro_drawdown_protection, closing all", spy_5d_ret)
                 for pos in positions:
                     try:
+                        if _skip_if_locked(pos.symbol, price=float(pos.current_price)):
+                            continue
                         _close_and_record(
                             api, pos.symbol,
                             float(pos.current_price), float(pos.avg_entry_price),
@@ -3313,6 +3377,13 @@ def _run_stoploss_job() -> None:
             elif hold_days > 21:
                 exit_reason = "max_hold_exit"
             if exit_reason:
+                if _skip_if_locked(
+                    ticker,
+                    composite=entry_log.get("composite_score"),
+                    price=price,
+                    atr=atr_entry,
+                ):
+                    continue
                 try:
                     _close_and_record(api, ticker, price, entry_price, exit_reason, entry_log)
                 except Exception as e:
@@ -3847,6 +3918,70 @@ def api_portfolio_close_position(req: ClosePositionRequest):
         return {"success": True, "order_id": str(order.id)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+class LockPositionRequest(BaseModel):
+    ticker: str
+
+
+@app.post("/api/portfolio/positions/lock")
+def api_portfolio_lock_position(req: LockPositionRequest):
+    """Lock a position so automated exits (stop loss, 21-day hold, macro protection,
+    score deterioration) skip it. The Close button still works manually."""
+    ticker = req.ticker.upper()
+    locked_at = db.lock_position(ticker)
+    logger.info("%s: position locked by user", ticker)
+    return {"success": True, "ticker": ticker, "locked_at": locked_at}
+
+
+@app.post("/api/portfolio/positions/unlock")
+def api_portfolio_unlock_position(req: LockPositionRequest):
+    """Unlock a position, restoring automated exit handling."""
+    ticker = req.ticker.upper()
+    db.unlock_position(ticker)
+    logger.info("%s: position unlocked by user", ticker)
+    return {"success": True, "ticker": ticker}
+
+
+@app.get("/api/portfolio/positions/locked")
+def api_portfolio_locked_positions():
+    """List of currently user-locked tickers."""
+    return {"locked": db.get_locked_positions()}
+
+
+class TradingSettingsRequest(BaseModel):
+    automated_trading_enabled: Optional[bool] = None
+    automated_trading_mode: Optional[str] = None
+
+
+def _trading_settings_payload() -> dict:
+    return {
+        "automated_trading_enabled": db.get_automated_trading_enabled(),
+        "automated_trading_mode":    db.get_automated_trading_mode(),
+    }
+
+
+@app.get("/api/settings/trading")
+def api_get_trading_settings():
+    """Current automated-trading toggle state (persisted in system_config)."""
+    return _trading_settings_payload()
+
+
+@app.post("/api/settings/trading")
+def api_set_trading_settings(req: TradingSettingsRequest):
+    """Update whichever toggle fields are provided; returns the full updated settings."""
+    if req.automated_trading_enabled is not None:
+        db.set_automated_trading_enabled(req.automated_trading_enabled)
+    if req.automated_trading_mode is not None:
+        if req.automated_trading_mode not in db.TRADING_MODES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"automated_trading_mode must be one of {db.TRADING_MODES}",
+            )
+        db.set_automated_trading_mode(req.automated_trading_mode)
+    settings = _trading_settings_payload()
+    logger.info("Trading settings updated: %s", settings)
+    return settings
 
 
 @app.get("/api/portfolio/edge-stats")

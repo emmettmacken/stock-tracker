@@ -4,6 +4,7 @@ import Link from "next/link";
 import { PaperPosition, SignalLogEntry, TradeOutcome, Briefing } from "@/lib/types";
 import { PositionsTable } from "@/components/v4/PositionsTable";
 import { SignalLogFeed } from "@/components/v4/SignalLogFeed";
+import { TradingStatusBanner } from "@/components/v4/TradingStatusBanner";
 import { ClosedTradesPanel } from "@/components/v4/ClosedTradesPanel";
 import { AnalyticsTab } from "@/components/v4/AnalyticsTab";
 import {
@@ -187,6 +188,8 @@ export default function AutomationPage() {
             )}
           </div>
         </header>
+
+        <TradingStatusBanner />
 
         <TabBar active={activeTab} onChange={setActiveTab} />
 

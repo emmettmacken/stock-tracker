@@ -98,6 +98,15 @@ def init_db() -> None:
                 equity REAL    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_equity_snapshots_ts ON equity_snapshots(ts);
+
+            -- User-locked positions. A locked ticker is exempt from all automated
+            -- exits (ATR stop, 21-day hold, macro protection, score deterioration);
+            -- the user can still close it manually via the Close button.
+            CREATE TABLE IF NOT EXISTS locked_positions (
+                ticker    TEXT PRIMARY KEY,
+                locked_at TEXT NOT NULL,  -- ISO UTC timestamp
+                locked_by TEXT DEFAULT 'user'
+            );
         """)
     _run_migrations()
 
@@ -167,6 +176,42 @@ def remove_ticker(ticker: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker.upper(),))
         conn.execute("DELETE FROM latest_snapshot WHERE ticker = ?", (ticker.upper(),))
+
+
+# ── Locked positions ───────────────────────────────────────────────────────────
+
+def lock_position(ticker: str, locked_by: str = "user") -> str:
+    """Lock a position so automated exits skip it. Returns the locked_at timestamp."""
+    locked_at = datetime.utcnow().isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO locked_positions (ticker, locked_at, locked_by)
+               VALUES (?, ?, ?)""",
+            (ticker.upper(), locked_at, locked_by),
+        )
+    return locked_at
+
+
+def unlock_position(ticker: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM locked_positions WHERE ticker = ?", (ticker.upper(),))
+
+
+def is_position_locked(ticker: str) -> bool:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM locked_positions WHERE ticker = ?", (ticker.upper(),)
+        ).fetchone()
+    return row is not None
+
+
+def get_locked_positions() -> list[str]:
+    """Return the list of currently-locked tickers."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT ticker FROM locked_positions ORDER BY ticker"
+        ).fetchall()
+    return [r["ticker"] for r in rows]
 
 
 # ── Display snapshots ──────────────────────────────────────────────────────────
@@ -533,6 +578,32 @@ def set_config(key: str, value: str) -> None:
                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
             (key, value, datetime.utcnow().isoformat()),
         )
+
+
+# ── Automated trading toggle ───────────────────────────────────────────────────
+# Persisted in system_config so the toggle survives restarts. "all" pauses everything
+# (no entries, no automatic exits); "entries_only" pauses new entries but keeps stop
+# loss / 21-day hold / macro protection running.
+TRADING_MODES = ("all", "entries_only")
+
+
+def get_automated_trading_enabled() -> bool:
+    return get_config("automated_trading_enabled", "true").lower() == "true"
+
+
+def set_automated_trading_enabled(enabled: bool) -> None:
+    set_config("automated_trading_enabled", "true" if enabled else "false")
+
+
+def get_automated_trading_mode() -> str:
+    mode = get_config("automated_trading_mode", "all")
+    return mode if mode in TRADING_MODES else "all"
+
+
+def set_automated_trading_mode(mode: str) -> None:
+    if mode not in TRADING_MODES:
+        raise ValueError(f"invalid trading mode: {mode!r} (expected one of {TRADING_MODES})")
+    set_config("automated_trading_mode", mode)
 
 
 # ── Gate stats queries ───────────────────────────────────────────────────────

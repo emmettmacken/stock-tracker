@@ -32,6 +32,9 @@ const SKIP_LABELS: Record<string, string> = {
   reentry_cooldown:           "Re-entry cooldown (2d)",
   macro_drawdown_protection:  "Macro drawdown protection",
   min_factor_floor:           "Factor floor (score capped)",
+  position_locked:            "Position locked — manual close required",
+  trading_paused_all:         "Trading paused — no automated trades",
+  trading_paused_entries:     "Trading paused — entries only",
   // Retained for historical rows logged before the gate was renamed to
   // bull_prob_below_threshold; no new rows carry this reason.
   hmm_not_buy_transition:     "Bull probability too low (historical)",
