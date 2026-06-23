@@ -720,12 +720,19 @@ def get_backtest(ticker: str):
     tr_bt = np.maximum(h_bt - l_bt, np.maximum(np.abs(h_bt - pc_bt), np.abs(l_bt - pc_bt)))
     atr_series = _wilder_atr(tr_bt, 21)
 
-    # Change 1: precompute VIX history aligned to ticker dates for the VIX>30 gate
+    # Change 1: precompute VIX history aligned to ticker dates for the VIX>30 gate.
+    # Align by calendar date: the ^VIX feed is tz-aware in a different zone (CT) than
+    # df.index (ET), so a direct timestamp reindex misses on every row and leaves the
+    # whole series NaN. Any date still missing (or a failed fetch) is treated as
+    # fail-open by the gate test in the loop below.
     vix_series_bt: Optional[np.ndarray] = None
     try:
         vix_df_bt = yf.Ticker("^VIX").history(period="2y")
         if not vix_df_bt.empty:
-            vix_aligned = vix_df_bt["Close"].reindex(df.index).ffill().bfill()
+            vix_by_date = {ts.date(): float(v) for ts, v in vix_df_bt["Close"].items()}
+            vix_aligned = pd.Series(
+                [vix_by_date.get(d.date(), np.nan) for d in df.index]
+            ).ffill().bfill()
             vix_series_bt = vix_aligned.values.astype(float)[1:]  # length n, aligned with returns
     except Exception:
         vix_series_bt = None  # fail open: skip VIX gate if data unavailable
