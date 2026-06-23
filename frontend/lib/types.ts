@@ -152,7 +152,6 @@ export interface EquityHistory {
 export interface PortfolioHistoryPoint {
   timestamp: string; // ISO string
   equity: number;
-  synthetic?: boolean; // backend gap-fill point (flat carry-forward across closed sessions)
 }
 
 export interface PortfolioHistory {

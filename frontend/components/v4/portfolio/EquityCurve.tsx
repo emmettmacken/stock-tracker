@@ -17,23 +17,20 @@ function isMarketLikelyOpen(now: Date = new Date()): boolean {
   return hhmm >= 1430 && hhmm < 2100;
 }
 
-// Selector labels are passed straight through to the backend, which maps each to an
-// Alpaca period + resolution (15-min bars for 1D, hourly for 1W, daily beyond) and
-// handles YTD (from Jan 1) and Max (from account creation) server-side.
+// Selector labels are passed straight through to the backend, which serves 1D from our
+// own equity snapshots and every other period from Alpaca (1D bars): 1W/1M/3M by period,
+// YTD from Jan 1, and 1Y/Max from account creation.
 const RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
 
-// DD/MM HH:MM in the viewer's local time — all parts from the same Date object so the
-// day and time can't disagree across the UTC boundary.
-function fmtDateTime(iso: string): string {
+// 1D bars are all from today/yesterday, so the time is what matters — show HH:MM. Every
+// other period is daily bars where the date matters — show DD/MM/YY. All parts come from
+// the same Date object so the day and time can't disagree across the UTC boundary.
+function fmtLabel(iso: string, range: Range): string {
   const d = new Date(iso);
   const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-// Every range shows DD/MM HH:MM (axis ticks and tooltip alike) — minTickGap thins the
-// axis labels so the time component stays readable even on the longer periods.
-function fmtAxis(iso: string): string {
-  return fmtDateTime(iso);
+  if (range === "1D") return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${p(d.getFullYear() % 100)}`;
 }
 
 interface Row {
@@ -127,7 +124,7 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
     if (!points) return [];
     return points
       .filter((p) => p.equity != null)
-      .map((p) => ({ ts: p.timestamp, label: fmtAxis(p.timestamp), equity: p.equity }));
+      .map((p) => ({ ts: p.timestamp, label: fmtLabel(p.timestamp, range), equity: p.equity }));
   }, [points, range]);
 
   // Total return $ and % across the visible window (first → last equity).
@@ -263,11 +260,11 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
               formatter={(v: number) => [fmtUSD(v), "Equity"]}
               labelFormatter={(_l, payload) => {
                 const ts = payload?.[0]?.payload?.ts as string | undefined;
-                return ts ? fmtAxis(ts) : "";
+                return ts ? fmtLabel(ts, range) : "";
               }}
             />
-            {/* Vertical crosshair that follows the cursor to the nearest point. With the
-                denser intraday data (15-min for 1D, hourly for 1W) this tracks fluidly. */}
+            {/* Vertical crosshair that follows the cursor to the nearest point. Tracks
+                fluidly on dense 1D snapshot data and step-wise on daily bars alike. */}
             {activeIndex != null && rows[activeIndex] && (
               <ReferenceLine
                 x={rows[activeIndex].label}
