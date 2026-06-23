@@ -18,26 +18,40 @@ function isMarketLikelyOpen(now: Date = new Date()): boolean {
 }
 
 // Selector labels are passed straight through to the backend, which maps each to an
-// Alpaca period + resolution (15-min bars for 1D, hourly for 1W, daily beyond) and
+// Alpaca period + resolution (5-min bars for 1D, hourly for 1W, daily beyond) and
 // handles YTD (from Jan 1) and Max (from account creation) server-side.
 const RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
+// Intraday ranges use finer-than-daily bars (5-min for 1D, hourly for 1W) and show a time
+// component on the axis; daily ranges (1M and beyond) show date only.
+function isIntraday(range: Range): boolean {
+  return range === "1D" || range === "1W";
 }
-// DD/MM HH:MM in the viewer's local time — all parts from the same Date object so the
-// day and time can't disagree across the UTC boundary.
+
+// All formatters work in the viewer's local time and read every part from one Date object
+// so the day and time can't disagree across the UTC boundary.
+const p2 = (n: number) => String(n).padStart(2, "0");
+// HH:MM — 1D, where the date is always today and would be noise.
+function fmtTime(iso: string): string {
+  const d = new Date(iso);
+  return `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+// DD/MM HH:MM — 1W, hourly points spanning several days.
 function fmtDateTime(iso: string): string {
   const d = new Date(iso);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return `${p2(d.getDate())}/${p2(d.getMonth() + 1)} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
 }
-// 1D shows intraday DD/MM HH:MM; every other range shows the date (MMM DD).
+// DD/MM — daily ranges (1M, 3M, YTD, 1Y, Max).
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  return `${p2(d.getDate())}/${p2(d.getMonth() + 1)}`;
+}
+// Daily ranges → DD/MM; intraday ranges → time-bearing: 1D drops the (always-today) date
+// to HH:MM, 1W keeps it as DD/MM HH:MM.
 function fmtAxis(iso: string, range: Range): string {
-  return range === "1D" ? fmtDateTime(iso) : fmtDate(iso);
+  if (!isIntraday(range)) return fmtDate(iso);
+  return range === "1D" ? fmtTime(iso) : fmtDateTime(iso);
 }
 
 interface Row {
@@ -271,7 +285,7 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
               }}
             />
             {/* Vertical crosshair that follows the cursor to the nearest point. With the
-                denser intraday data (15-min for 1D, hourly for 1W) this tracks fluidly. */}
+                denser intraday data (5-min for 1D, hourly for 1W) this tracks fluidly. */}
             {activeIndex != null && rows[activeIndex] && (
               <ReferenceLine
                 x={rows[activeIndex].label}
