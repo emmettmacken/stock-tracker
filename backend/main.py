@@ -1005,9 +1005,52 @@ def _momentum_score(closes: np.ndarray) -> float | None:
     return (z + 3) / 6 * 100
 
 
-def _vol_trend_score(closes: np.ndarray) -> tuple[float | None, dict | None]:
+def _volume_divergence_modifier(
+    closes: np.ndarray, volumes: np.ndarray | None, ticker: str | None = None
+) -> int:
+    """Modifier (points) applied to the vol-adjusted trend score, capturing whether a
+    price move is confirmed or contradicted by volume.
+
+    Penalise price rising on declining volume (weak conviction) or falling on rising
+    volume (confirmed selling); small bonus for price rising on rising volume (confirmed)
+    or falling on declining volume (sellers exhausting). Fail-safe: any insufficient or
+    missing volume data returns 0 so a volume failure can never affect the composite."""
+    if volumes is None or len(volumes) < 20 or len(closes) < 20:
+        return 0
+    vol_ma20 = float(np.mean(volumes[-20:]))
+    if vol_ma20 <= 0:
+        return 0
+    vol_recent = float(np.mean(volumes[-5:]))  # 5-day average smooths noise
+    vol_ratio = vol_recent / vol_ma20
+    price_trend = (float(closes[-1]) - float(closes[-20])) / float(closes[-20])
+
+    if price_trend > 0.02 and vol_ratio < 0.8:
+        modifier = -8   # price up, volume down — weak conviction
+    elif price_trend > 0.02 and vol_ratio > 1.2:
+        modifier = 5    # price up, volume up — confirmed move
+    elif price_trend < -0.02 and vol_ratio > 1.2:
+        modifier = -8   # price down, volume up — confirmed selling
+    elif price_trend < -0.02 and vol_ratio < 0.8:
+        modifier = 5    # price down, volume down — sellers exhausting
+    else:
+        modifier = 0
+
+    logger.debug(
+        "Volume divergence [%s]: price_trend=%.1f%% vol_ratio=%.2f modifier=%+d",
+        ticker or "?", price_trend * 100.0, vol_ratio, modifier,
+    )
+    return modifier
+
+
+def _vol_trend_score(
+    closes: np.ndarray, volumes: np.ndarray | None = None, ticker: str | None = None
+) -> tuple[float | None, dict | None]:
     """Return (0–100 score, display detail). Detail is the raw price/MA levels so the
-    UI can show which moving averages the price is above/below — display only."""
+    UI can show which moving averages the price is above/below — display only.
+
+    When ``volumes`` is supplied, a volume-divergence modifier nudges the score at the
+    margin (see _volume_divergence_modifier). Omitting volumes (e.g. the price-only
+    backtest path) leaves the base MA-alignment score unchanged."""
     if len(closes) < 201:
         return None, None
     ma20  = closes[-20:].mean()
@@ -1022,7 +1065,10 @@ def _vol_trend_score(closes: np.ndarray) -> tuple[float | None, dict | None]:
     inv_vol_weight = 1.0 / (rvol + 0.05)  # cap weight for very low vol
     # Rescale: already 0-1, apply vol weight as a squeeze toward 50 for high-vol
     vol_factor = min(inv_vol_weight / 5.0, 1.0)  # normalise so typical ~0.5 maps to 1
-    score = 50.0 + (raw - 0.5) * 100.0 * vol_factor
+    base_score = 50.0 + (raw - 0.5) * 100.0 * vol_factor
+    # Volume divergence modifier (fail-safe: 0 when volume data is missing/insufficient)
+    modifier = _volume_divergence_modifier(closes, volumes, ticker)
+    score = max(0.0, min(100.0, base_score + modifier))
     detail = {
         "price": float(price),
         "ma20":  float(ma20),
@@ -1562,7 +1608,7 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         regime_label = "transition"
 
     mom_score      = _momentum_score(closes)
-    vt_score, vt_detail     = _vol_trend_score(closes)
+    vt_score, vt_detail     = _vol_trend_score(closes, volumes=vol, ticker=ticker)
     earn_score, earn_detail = _earnings_score(yf.Ticker(ticker))
     insider_score  = _get_insider_score(ticker)
     # Change 2: sentiment included as a factor; null → weight dropped and renormalised
