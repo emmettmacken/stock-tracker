@@ -3706,6 +3706,8 @@ def api_portfolio_history(period: str = "1D"):
     spec = _HISTORY_SPEC[period]
     timeframe = spec["timeframe"]
     cache_key = f"{period}:{timeframe}"
+    logger.info("portfolio/history called: period=%s cache_key=%s time=%s",
+                period, cache_key, datetime.now(timezone.utc).isoformat())
     cached, ts = _PORTFOLIO_HISTORY_CACHE.get(cache_key, (None, 0.0))
     if cached is not None and (time.time() - ts) < _history_ttl(period):
         return cached
@@ -3716,8 +3718,10 @@ def api_portfolio_history(period: str = "1D"):
             # hours. Alpaca's "1D" period means "today's session", which is empty
             # overnight and pre-open; explicit start/end gives a true last-24h view.
             now = datetime.now(timezone.utc)
+            start = now - timedelta(hours=24)
+            logger.info("1D branch: start=%s end=%s extended_hours=True", start, now)
             req = GetPortfolioHistoryRequest(
-                start=now - timedelta(hours=24),
+                start=start,
                 end=now,
                 timeframe=timeframe,
                 extended_hours=True,
@@ -3744,6 +3748,10 @@ def api_portfolio_history(period: str = "1D"):
              "equity": round(float(e), 2)}
             for t, e in zip(tstamps, equities) if e is not None
         ]
+
+        logger.info("Alpaca returned %d points: first=%s last=%s", len(points),
+                    points[0]["timestamp"] if points else None,
+                    points[-1]["timestamp"] if points else None)
 
         # Alpaca's daily history points are close-of-day snapshots and miss today's live
         # unrealised gains. Append the live account equity as a final point (timestamp =
