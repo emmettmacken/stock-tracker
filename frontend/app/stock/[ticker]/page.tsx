@@ -106,7 +106,7 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-4xl mx-auto px-4 py-8 space-y-6">
         <Link
-          href="/"
+          href="/watchlist"
           className="group inline-flex items-center gap-1.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors duration-150 ease-out-quart"
         >
           <span className="transition-transform duration-150 ease-out-quart group-hover:-translate-x-0.5">←</span>
@@ -121,7 +121,7 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
         ) : error || !snapshot ? (
           <div className="py-24 text-center">
             <p className="text-red-400 text-sm mb-3">{error ?? `No data for ${ticker}.`}</p>
-            <Link href="/" className="text-zinc-400 hover:text-white text-sm underline underline-offset-2">
+            <Link href="/watchlist" className="text-zinc-400 hover:text-white text-sm underline underline-offset-2">
               Return to watchlist
             </Link>
           </div>

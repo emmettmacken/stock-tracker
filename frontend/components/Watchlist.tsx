@@ -33,6 +33,7 @@ export function Watchlist() {
   const [held, setHeld] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<FilterMode>("all");
   const [sectorFilter, setSectorFilter] = useState<string>("all");
+  const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortMode>("score");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -127,13 +128,20 @@ export function Watchlist() {
     if (filter === "buy") list = list.filter((s) => (s.composite_score ?? -1) >= BUY_ZONE_THRESHOLD);
     else if (filter === "held") list = list.filter((s) => held.has(s.ticker));
     if (sectorFilter !== "all") list = list.filter((s) => s.factors?.sector === sectorFilter);
+    const q = query.trim().toLowerCase();
+    if (q) {
+      list = list.filter((s) =>
+        s.ticker.toLowerCase().includes(q) ||
+        (s.factors?.company_name?.toLowerCase().includes(q) ?? false)
+      );
+    }
     list = [...list].sort((a, b) =>
       sort === "score"
         ? (b.composite_score ?? -1) - (a.composite_score ?? -1)
         : a.ticker.localeCompare(b.ticker)
     );
     return list;
-  }, [order, snapshots, filter, sectorFilter, sort, held]);
+  }, [order, snapshots, filter, sectorFilter, sort, held, query]);
 
   function addTicker(ticker: string) {
     const updated = [...order, ticker];
@@ -212,6 +220,18 @@ export function Watchlist() {
       )}
 
       {order.length > 0 && (
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search tickers..."
+          aria-label="Search tickers"
+          className="w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 py-2 text-sm text-zinc-200
+            placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600 transition-colors duration-150 ease-out-quart"
+        />
+      )}
+
+      {order.length > 0 && (
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="inline-flex rounded-lg bg-zinc-800/50 p-0.5 text-xs">
             {([
@@ -264,7 +284,11 @@ export function Watchlist() {
       )}
 
       {order.length > 0 && view.length === 0 && (
-        <p className="text-sm text-zinc-500 py-8 text-center">No tickers match this filter.</p>
+        <p className="text-sm text-zinc-500 py-8 text-center">
+          {query.trim()
+            ? `No results for "${query.trim()}"`
+            : "No tickers match this filter."}
+        </p>
       )}
 
       <div className="grid gap-3 sm:grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
