@@ -740,7 +740,7 @@ def get_backtest(ticker: str):
     equity_curve: list[dict] = []
     trade_results: list[bool] = []
     trade_entry_val = 0.0
-    last_exit_idx = -100  # Change 1: tracks re-entry cooldown (5 trading days)
+    last_exit_idx = -100  # Change 1: tracks re-entry cooldown (2 trading days)
 
     # Change 1: gate rejection counters for comparison output
     gate_rejections: dict[str, int] = {
@@ -857,11 +857,11 @@ def get_backtest(ticker: str):
                                                f"3m={r3:+.1%}, 12m={r12:+.1%}")
                                 continue
 
-                        # Change 1: re-entry cooldown (5 trading days after last exit)
-                        if idx - last_exit_idx < 5:
+                        # Change 1: re-entry cooldown (2 trading days after last exit)
+                        if idx - last_exit_idx < 2:
                             gate_rejections["reentry_cooldown"] += 1
                             _log_rejection(idx, "reentry_cooldown", buy_score,
-                                           f"{idx - last_exit_idx} days since last exit, cooldown=5")
+                                           f"{idx - last_exit_idx} days since last exit, cooldown=2")
                             continue
 
                         in_pos = True
@@ -2897,13 +2897,13 @@ def _run_signal_job() -> None:
                                   hmm_regime=hmm_regime, sentiment_score=sentiment,
                                   smoothed_bull_prob=smoothed_bull_prob)
                     continue
-            # Re-entry cooldown: block re-entry for 5 trading days after non-signal exits
+            # Re-entry cooldown: block re-entry for 2 trading days after non-signal exits
             perf = db.get_ticker_performance(ticker)
             if perf and perf.get("last_exit_at"):
                 try:
                     last_exit = datetime.fromisoformat(perf["last_exit_at"])
                     days_since = _trading_days_between(last_exit, datetime.utcnow())
-                    if days_since < 5:
+                    if days_since < 2:
                         db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                       "reentry_cooldown", price, atr,
                                       hmm_regime=hmm_regime, sentiment_score=sentiment,
@@ -3743,7 +3743,7 @@ def _decision_trail_detail(key: str, status: str, anchor: dict, ctx: dict) -> st
         return ("3-month and 12-month momentum disagree or are negative"
                 if status == "failed" else "3-month and 12-month momentum agree")
     if key == "reentry_cooldown":
-        return ("Within the 5-day cooldown after a recent non-signal exit"
+        return ("Within the 2-day cooldown after a recent non-signal exit"
                 if status == "failed" else "Outside the re-entry cooldown window")
     if key == "sector_concentration":
         return ("Sector already at the open-position cap"

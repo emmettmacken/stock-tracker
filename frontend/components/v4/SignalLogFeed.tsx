@@ -29,7 +29,7 @@ const SKIP_LABELS: Record<string, string> = {
   sell_signal:                "Sell signal triggered",
   score_deterioration:        "Score fell below 40",
   momentum_disagreement:      "3m/12m momentum disagree",
-  reentry_cooldown:           "Re-entry cooldown (5d)",
+  reentry_cooldown:           "Re-entry cooldown (2d)",
   macro_drawdown_protection:  "Macro drawdown protection",
   min_factor_floor:           "Factor floor (score capped)",
 };
