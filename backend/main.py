@@ -132,8 +132,22 @@ def _startup() -> None:
             CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=ET),
             id="adaptive_thresholds_job", replace_existing=True,
         )
+        UTC = ZoneInfo("UTC")
+        # Sample account equity every 5 min during (extended) market hours so the 1D curve
+        # is populated even with no browser open. 13:30–21:00 UTC ≈ the US regular session.
+        _scheduler.add_job(
+            _run_equity_sampler_job,
+            CronTrigger(day_of_week="mon-fri", hour="13-20", minute="*/5", timezone=UTC),
+            id="equity_sampler_job", replace_existing=True,
+        )
+        _scheduler.add_job(
+            _run_equity_prune_job,
+            CronTrigger(hour=0, minute=0, timezone=UTC),
+            id="equity_prune_job", replace_existing=True,
+        )
         _scheduler.start()
-        logger.info("Scheduler started (signal@15:30 ET, stop-loss@09:35 ET, thresholds@Sun18:00 ET)")
+        logger.info("Scheduler started (signal@15:30 ET, stop-loss@09:35 ET, thresholds@Sun18:00 ET, "
+                    "equity-sampler@*/5min 13-20 UTC, equity-prune@00:00 UTC)")
     else:
         logger.warning("APScheduler not available — scheduled jobs disabled")
 
@@ -212,21 +226,22 @@ def _timeframe_minutes(timeframe: str) -> int:
     return 24 * 60
 
 
-def _fill_intraday_gaps(points: list[dict], step_min: int) -> list[dict]:
+def _fill_intraday_gaps(points: list[dict], step_min: float,
+                        threshold_min: Optional[float] = None) -> list[dict]:
     """Bridge session gaps in an intraday equity curve with a flat, carry-forward line.
 
-    Alpaca's intraday history has no bars overnight / over the weekend, so the raw series
-    jumps straight from the last evening bar to the next morning's. To match Alpaca's own
-    dashboard we insert synthetic points (carrying the prior equity forward) at `step_min`
-    intervals across any gap wider than 1.5× the bar interval — Recharts then draws a flat
-    line through the closed period. The threshold scales with the bar resolution so normal
-    consecutive bars (15Min for 1D, 1H for 1W) are never filled, only true session gaps.
-    Only meaningful for intraday periods; daily curves expect multi-day weekend gaps.
+    Intraday equity series have no points overnight / over the weekend, so the raw data
+    jumps straight from the last evening point to the next morning's. We insert synthetic
+    points (carrying the prior equity forward) at `step_min` intervals across any gap wider
+    than `threshold_min` — Recharts then draws a flat line through the closed period. The
+    threshold defaults to 1.5× the step (so evenly-spaced bars are never filled, only true
+    session gaps); callers with irregular sampling (e.g. our 1D snapshots) pass it
+    explicitly. Only meaningful for intraday data; daily curves expect weekend gaps.
     """
     if len(points) < 2:
         return points
     step = timedelta(minutes=step_min)
-    threshold = step * 1.5
+    threshold = timedelta(minutes=threshold_min if threshold_min is not None else step_min * 1.5)
     filled: list[dict] = [points[0]]
     for i in range(1, len(points)):
         prev, cur = points[i - 1], points[i]
@@ -3232,6 +3247,28 @@ def _run_signal_job() -> None:
         logger.warning("Failed to write gate stats / timing: %s", e)
 
 
+def _run_equity_sampler_job() -> None:
+    """Sample account equity into equity_snapshots so the 1D curve has data even when no
+    browser is polling /live-equity. Runs every 5 min during market hours; cheap and quiet."""
+    api = _alpaca_client
+    if api is None:
+        return
+    try:
+        equity = round(float(api.get_account().equity), 2)
+        db.insert_equity_snapshot(equity)
+    except Exception as e:
+        logger.warning("Equity sampler failed: %s", e)
+
+
+def _run_equity_prune_job() -> None:
+    """Daily: drop equity_snapshots older than 30 days to keep the table bounded."""
+    try:
+        removed = db.prune_equity_snapshots()
+        logger.info("Equity-snapshot prune removed %d old rows", removed)
+    except Exception as e:
+        logger.warning("Equity-snapshot prune failed: %s", e)
+
+
 def _run_stoploss_job() -> None:
     logger.info("▶ Stop-loss job starting")
     db.set_config("last_stoploss_job_at", datetime.utcnow().isoformat())
@@ -3706,22 +3743,37 @@ def api_portfolio_history(period: str = "1D"):
     spec = _HISTORY_SPEC[period]
     timeframe = spec["timeframe"]
     cache_key = f"{period}:{timeframe}"
-    logger.info("portfolio/history called: period=%s cache_key=%s time=%s",
-                period, cache_key, datetime.now(timezone.utc).isoformat())
     cached, ts = _PORTFOLIO_HISTORY_CACHE.get(cache_key, (None, 0.0))
     if cached is not None and (time.time() - ts) < _history_ttl(period):
         return cached
 
     try:
+        # 1D is a true rolling-24h curve built from our own equity_snapshots — Alpaca's
+        # portfolio-history API clamps intraday requests to the current session and won't
+        # return overnight/prior-session points (confirmed via diagnostics). The snapshots
+        # are flat-filled across the closed overnight window so the line bridges sessions.
+        # If we don't yet have enough samples (first run) we fall through to Alpaca's
+        # session-only intraday fetch below so the chart isn't blank.
         if period == "1D":
-            # Rolling 24h window ending now, at 15-minute resolution with extended
-            # hours. Alpaca's "1D" period means "today's session", which is empty
-            # overnight and pre-open; explicit start/end gives a true last-24h view.
+            since_ts = int(time.time() - 24 * 3600)
+            snaps = db.get_equity_snapshots(since_ts)
+            if len(snaps) >= 2:
+                points = [
+                    {"timestamp": datetime.utcfromtimestamp(int(s["ts"])).isoformat() + "Z",
+                     "equity": round(float(s["equity"]), 2)}
+                    for s in snaps
+                ]
+                points = _fill_intraday_gaps(points, step_min=5, threshold_min=20)
+                result = {"available": True, "period": period, "points": points}
+                _PORTFOLIO_HISTORY_CACHE[cache_key] = (result, time.time())
+                return result
+
+        if period == "1D":
+            # Fallback only (no snapshots yet): Alpaca's intraday history clamps to the
+            # current session, so this shows today's session until snapshots accumulate.
             now = datetime.now(timezone.utc)
-            start = now - timedelta(hours=24)
-            logger.info("1D branch: start=%s end=%s extended_hours=True", start, now)
             req = GetPortfolioHistoryRequest(
-                start=start,
+                start=now - timedelta(hours=24),
                 end=now,
                 timeframe=timeframe,
                 extended_hours=True,
@@ -3748,10 +3800,6 @@ def api_portfolio_history(period: str = "1D"):
              "equity": round(float(e), 2)}
             for t, e in zip(tstamps, equities) if e is not None
         ]
-
-        logger.info("Alpaca returned %d points: first=%s last=%s", len(points),
-                    points[0]["timestamp"] if points else None,
-                    points[-1]["timestamp"] if points else None)
 
         # Alpaca's daily history points are close-of-day snapshots and miss today's live
         # unrealised gains. Append the live account equity as a final point (timestamp =
@@ -3796,6 +3844,13 @@ def api_portfolio_live_equity():
         return {"available": False, "error": _alpaca_err}
     try:
         equity = round(float(_alpaca_client.get_account().equity), 2)
+        # Persist the sample so the 1D curve can be rebuilt as a true rolling-24h window
+        # (Alpaca's intraday history only covers the current session). Best-effort: a DB
+        # write failure must not break the live tip the chart depends on.
+        try:
+            db.insert_equity_snapshot(equity)
+        except Exception:
+            pass
         return {"equity": equity, "timestamp": datetime.utcnow().isoformat() + "Z"}
     except Exception as e:
         return {"available": False, "error": str(e)}

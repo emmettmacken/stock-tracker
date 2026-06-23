@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -86,6 +87,17 @@ def init_db() -> None:
                 factors_json     TEXT,
                 computed_at      TIMESTAMP NOT NULL
             );
+
+            -- Rolling account-equity samples for the /portfolio 1D curve. Alpaca's
+            -- portfolio-history API clamps intraday requests to the current session,
+            -- so we persist our own snapshots (live-equity poll + 5-min sampler) and
+            -- build the true rolling-24h curve from these. Pruned to 30 days.
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts     INTEGER NOT NULL,  -- Unix timestamp (seconds, UTC)
+                equity REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_equity_snapshots_ts ON equity_snapshots(ts);
         """)
     _run_migrations()
 
@@ -298,6 +310,35 @@ def get_signal_log(limit: int = 50) -> list[dict]:
             "SELECT * FROM signal_log ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def insert_equity_snapshot(equity: float) -> None:
+    """Record one account-equity sample at the current UTC time. Cheap append-only
+    write; called from the live-equity poll and the 5-min sampler job."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO equity_snapshots (ts, equity) VALUES (?, ?)",
+            (int(time.time()), float(equity)),
+        )
+
+
+def get_equity_snapshots(since_ts: int) -> list[dict]:
+    """All equity samples with ts >= since_ts, oldest first, as {ts, equity} dicts."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT ts, equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC",
+            (int(since_ts),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def prune_equity_snapshots(max_age_days: int = 30) -> int:
+    """Delete equity samples older than max_age_days. Returns rows removed.
+    Keeps the table bounded (~43k rows at 1/min over 30 days)."""
+    cutoff = int(time.time()) - max_age_days * 86_400
+    with _conn() as conn:
+        cur = conn.execute("DELETE FROM equity_snapshots WHERE ts < ?", (cutoff,))
+        return cur.rowcount
 
 
 def update_trailing_stop(signal_id: int, new_stop: float) -> None:
