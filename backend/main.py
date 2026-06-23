@@ -191,6 +191,9 @@ _PRICE_HISTORY_LOCK = threading.Lock()
 # 1D refreshes every minute (live intraday), 1W every 5 min, longer ranges every 10 min.
 _PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # "period:timeframe" → (result, timestamp)
 
+# Account creation date (Max period start), fetched once per process — it never changes.
+_ACCOUNT_CREATED_AT: Optional[datetime] = None
+
 # Frontend period → Alpaca portfolio-history request spec (Alpaca period unit D/W/M/A
 # and timeframe resolution: 15Min/1H/1D). "YTD" starts at Jan 1 of the current year and
 # "Max" at the account's creation date — both computed in api_portfolio_history.
@@ -3779,11 +3782,13 @@ def api_portfolio_history(period: str = "1D"):
                 extended_hours=True,
             )
         elif period == "Max":
-            start = None
-            try:
-                start = _alpaca_client.get_account().created_at
-            except Exception:
-                pass
+            global _ACCOUNT_CREATED_AT
+            if _ACCOUNT_CREATED_AT is None:
+                try:
+                    _ACCOUNT_CREATED_AT = _alpaca_client.get_account().created_at
+                except Exception:
+                    pass
+            start = _ACCOUNT_CREATED_AT
             req = (GetPortfolioHistoryRequest(start=start, timeframe=timeframe) if start is not None
                    else GetPortfolioHistoryRequest(period="5A", timeframe=timeframe))
         elif period == "YTD":
@@ -3795,10 +3800,13 @@ def api_portfolio_history(period: str = "1D"):
         hist = _alpaca_client.get_portfolio_history(req)
         tstamps  = getattr(hist, "timestamp", None) or []
         equities = getattr(hist, "equity", None) or []
+        # Drop pre-account placeholder points: for periods predating the account, Alpaca
+        # backfills near-zero equity values that wreck the y-axis scale. Real equity is
+        # ~$100k, so anything under $10k is placeholder noise, not a real balance.
         points = [
             {"timestamp": datetime.utcfromtimestamp(int(t)).isoformat() + "Z",
              "equity": round(float(e), 2)}
-            for t, e in zip(tstamps, equities) if e is not None
+            for t, e in zip(tstamps, equities) if e is not None and float(e) >= 10000
         ]
 
         # Alpaca's daily history points are close-of-day snapshots and miss today's live
