@@ -1343,21 +1343,51 @@ def _get_insider_score(ticker: str) -> float | None:
     return _fetch_insider(ticker)["score"]
 
 
+def _fetch_sector(ticker: str, attempts: int = 3, delay: float = 2.0) -> Optional[str]:
+    """Fetch a ticker's sector from yfinance, retrying transient failures.
+
+    Returns the sector string on success, or None if every attempt fails (so the caller
+    can avoid caching a failure). The signal job calls .info for the whole watchlist
+    concurrently (ThreadPoolExecutor, 8 workers), and Yahoo rate-limits that burst by
+    returning a *partial/empty .info dict with no exception raised* — the silent path
+    that previously produced "Unknown". We treat a missing sector the same as an error,
+    retry it, and log every failure so it's visible in the logs rather than swallowed."""
+    for attempt in range(1, attempts + 1):
+        try:
+            info = yf.Ticker(ticker).info or {}
+            sector = info.get("sector")
+            if sector:
+                return sector
+            logger.warning("Sector lookup for %s returned no sector field "
+                           "(attempt %d/%d, .info keys=%d — likely rate-limited)",
+                           ticker, attempt, attempts, len(info))
+        except Exception as e:
+            logger.warning("Sector lookup failed for %s (attempt %d/%d): %s",
+                           ticker, attempt, attempts, e)
+        if attempt < attempts:
+            time.sleep(delay)
+    logger.error("Sector lookup gave up for %s after %d attempts", ticker, attempts)
+    return None
+
+
 def _get_sector(ticker: str) -> str:
-    """Return the sector string for a ticker, cached for 24 h."""
+    """Return the sector string for a ticker, cached for 24 h.
+
+    Only *successful* lookups are cached. A transient failure returns "Unknown" without
+    writing to the cache, so the next call retries instead of serving a stale "Unknown"
+    for the full 24h TTL — the bug that previously froze the sector-exposure panel on
+    "Unknown" for every position after one rate-limited burst."""
     # Change 5: lock prevents TOCTOU race during parallel signal job
     with _SECTOR_LOCK:
         cached_sector, ts = _SECTOR_CACHE.get(ticker, ("", 0.0))
         if cached_sector and (time.time() - ts) < _SECTOR_TTL:
             return cached_sector
-    try:
-        sector = yf.Ticker(ticker).info.get("sector", "Unknown") or "Unknown"
-    except Exception as e:
-        logger.warning("Sector lookup failed for %s: %s", ticker, e)
-        sector = "Unknown"
-    with _SECTOR_LOCK:
-        _SECTOR_CACHE[ticker] = (sector, time.time())
-    return sector
+    sector = _fetch_sector(ticker)
+    if sector:
+        with _SECTOR_LOCK:
+            _SECTOR_CACHE[ticker] = (sector, time.time())
+        return sector
+    return "Unknown"
 
 
 def _get_company_info(ticker: str) -> dict:
@@ -1379,10 +1409,13 @@ def _get_company_info(ticker: str) -> dict:
     try:
         tk = yf.Ticker(ticker)
         raw = tk.info or {}
-        sector = raw.get("sector", "Unknown") or "Unknown"
-        # Seed the sector cache from this same fetch so _get_sector won't re-fetch .info.
-        with _SECTOR_LOCK:
-            _SECTOR_CACHE[ticker] = (sector, time.time())
+        sector = raw.get("sector") or "Unknown"
+        # Seed the sector cache from this same fetch so _get_sector won't re-fetch .info —
+        # but only on a real hit. Never poison the cache with "Unknown" from a partial /
+        # rate-limited .info response, which would freeze the sector panel for the 24h TTL.
+        if sector != "Unknown":
+            with _SECTOR_LOCK:
+                _SECTOR_CACHE[ticker] = (sector, time.time())
         info = {
             "ticker":             ticker,
             "name":               raw.get("longName") or raw.get("shortName") or None,
