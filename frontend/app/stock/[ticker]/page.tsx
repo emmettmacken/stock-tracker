@@ -1,12 +1,11 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { SnapshotData, SignalData, DecisionTrail } from "@/lib/types";
-import { fetchWatchlistSnapshot, refreshTicker, fetchSignal, fetchDecisionTrail } from "@/lib/api";
+import { SnapshotData, DecisionTrail } from "@/lib/types";
+import { fetchWatchlistSnapshot, refreshTicker, fetchDecisionTrail } from "@/lib/api";
 import { StockHeader } from "@/components/v3/stock/StockHeader";
 import { VerdictBands } from "@/components/v3/stock/VerdictBands";
 import { FactorBreakdown } from "@/components/v3/stock/FactorBreakdown";
-import { MarkovDetail } from "@/components/v3/stock/MarkovDetail";
 import { AltDataTab } from "@/components/v3/AltDataTab";
 import { BacktestPanel } from "@/components/BacktestPanel";
 import { EligibilityBanner, DecisionTrailList } from "@/components/v3/stock/DecisionTrail";
@@ -45,23 +44,10 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  const [signalData, setSignalData] = useState<SignalData | null>(null);
-  const [signalLoading, setSignalLoading] = useState(true);
-  const [signalError, setSignalError] = useState<string | null>(null);
-
   const [trail, setTrail] = useState<DecisionTrail | null>(null);
 
   // Selected time window — drives the price chart AND the per-ticker analytics below.
   const [period, setPeriod] = useState<Period>(DEFAULT_PERIOD);
-
-  const loadSignal = useCallback(() => {
-    setSignalLoading(true);
-    setSignalError(null);
-    fetchSignal(ticker)
-      .then(setSignalData)
-      .catch((e) => setSignalError(e instanceof Error ? e.message : "Failed to load"))
-      .finally(() => setSignalLoading(false));
-  }, [ticker]);
 
   // Fast load from the cached watchlist snapshot; fall back to a live compute
   // if this ticker isn't in the snapshot yet (e.g. just added).
@@ -95,10 +81,6 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
     };
   }, [ticker]);
 
-  useEffect(() => {
-    loadSignal();
-  }, [loadSignal]);
-
   // Read-only decision trail (most recent gate-by-gate evaluation from signal_log).
   useEffect(() => {
     let cancelled = false;
@@ -113,7 +95,6 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
     try {
       const fresh = await refreshTicker(ticker);
       setSnapshot(fresh);
-      loadSignal();
     } catch {
       /* keep the stale snapshot in place */
     } finally {
@@ -191,27 +172,6 @@ export default function StockDetailPage({ params }: { params: { ticker: string }
               sub="The factors that combine into the composite score above, with each factor's weight and the raw numbers behind it. A factor marked 'excluded' had no data, and the remaining weights were renormalized to produce the score."
             >
               <FactorBreakdown data={snapshot.factors} />
-            </Section>
-
-            <Section
-              title="Markov chain detail"
-              sub="How this stock has historically behaved from its current price/volume state."
-            >
-              {signalLoading ? (
-                <div className="flex items-center gap-2 py-8 justify-center text-zinc-500 text-xs">
-                  <span className="inline-block w-4 h-4 border-2 border-zinc-600 border-t-zinc-300 rounded-full animate-spin" />
-                  Loading signal analysis…
-                </div>
-              ) : signalError ? (
-                <div className="py-4 text-center">
-                  <p className="text-red-400 text-xs mb-2">{signalError}</p>
-                  <button onClick={loadSignal} className="text-zinc-400 hover:text-white text-xs underline">
-                    Retry
-                  </button>
-                </div>
-              ) : signalData ? (
-                <MarkovDetail data={signalData} />
-              ) : null}
             </Section>
 
             <Section

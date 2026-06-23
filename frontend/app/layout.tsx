@@ -7,7 +7,7 @@ const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
   title: "Stock Signal Tracker",
-  description: "Markov chain buy/sell/hold signals for your watchlist",
+  description: "Multi-factor buy/sell/hold signals for your watchlist",
 };
 
 export default function RootLayout({

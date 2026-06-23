@@ -1,4 +1,4 @@
-"""Stock Signal Tracker v2 — 2D Markov chain, HMM regimes, CI signals, walk-forward backtest."""
+"""Stock Signal Tracker v2 — HMM regimes, multi-factor composite, walk-forward backtest."""
 from __future__ import annotations
 import json
 import math
@@ -22,7 +22,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import yfinance as yf
 from yfinance.exceptions import YFTzMissingError, YFRateLimitError, YFTickerMissingError
-from statsmodels.stats.proportion import proportion_confint
 from hmmlearn import hmm
 import httpx
 from bs4 import BeautifulSoup
@@ -150,19 +149,6 @@ def _shutdown() -> None:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-RETURN_LABELS = ["Strong Down", "Down", "Flat", "Up", "Strong Up"]
-# Volatility dimension collapsed (N_VOL=1): the discrete Markov chain is keyed on the
-# 5 return buckets only. With 5 states a 252-day window yields ~50 obs/state (vs ~17 at
-# the old 15-state 5×3 layout), enough for reliable transition-row estimates instead of
-# the chronic sub-MIN_OBS rows that pinned confidence at the 0.3 floor and forced HOLD.
-VOL_LABELS    = ["All Vol"]
-N_RET    = 5
-N_VOL    = 1
-N_ST     = N_RET * N_VOL   # 5
-
-RET_THRESHOLDS = (-0.015, -0.003, 0.003, 0.015)
-MIN_OBS        = 10
-ROLLING_WINDOW = 252
 _SENTIMENT_CACHE: dict[str, tuple[dict, float]] = {}  # ticker → (result, timestamp)
 _SENTIMENT_TTL = 900  # 15 minutes
 _SENTIMENT_LOCK = threading.Lock()
@@ -246,15 +232,15 @@ _INSIDER_LOCK = threading.Lock()
 # ── Factor weight configuration ───────────────────────────────────────────────
 
 # Change 2: sentiment added at 12%; earnings reduced 25→18%, insider 10→5% to keep total=100%
-# Rebalance Jun 2026: weight-only shift toward momentum/trend, away from Markov. The non-sentiment
-# share (0.88) is split 35/28/22/8/7 (mom/vol_trend/earn/hmm/insider); sentiment held at 12%.
+# Jun 2026: discrete-Markov factor removed. The five surviving factors kept their relative
+# proportions and were renormalised (each divided by the pre-removal non-Markov sum 0.9296)
+# so the weights again sum to exactly 1.0 with the same momentum/trend tilt as before.
 DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
-    "hmm":       0.0704,
-    "momentum":  0.308,
-    "vol_trend": 0.2464,
-    "earnings":  0.1936,
-    "insider":   0.0616,
-    "sentiment": 0.12,
+    "momentum":  0.33132530,
+    "vol_trend": 0.26506024,
+    "earnings":  0.20826162,
+    "insider":   0.06626506,
+    "sentiment": 0.12908778,
 }
 
 _WEIGHT_OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "factor_weight_overrides.json")
@@ -306,31 +292,6 @@ _EARNINGS_TTL = 86400  # 24 hours
 _MACRO_CACHE: Optional[tuple] = None  # ((spy_above, vix), timestamp)
 _MACRO_TTL = 300  # seconds
 
-# ── State helpers ─────────────────────────────────────────────────────────────
-
-def si(ret: int, vol: int) -> int:
-    return ret * N_VOL + vol
-
-def decode(s: int) -> tuple[int, int]:
-    return s // N_VOL, s % N_VOL
-
-def ret_bucket(r: float) -> int:
-    if r < RET_THRESHOLDS[0]: return 0
-    if r < RET_THRESHOLDS[1]: return 1
-    if r < RET_THRESHOLDS[2]: return 2
-    if r < RET_THRESHOLDS[3]: return 3
-    return 4
-
-def vol_bucket(ratio: float, lo: float, hi: float) -> int:
-    if N_VOL == 1:           # vol dimension collapsed — single bucket
-        return 0
-    if ratio < lo: return 0
-    if ratio > hi: return 2
-    return 1
-
-BULL_STATES = [s for s in range(N_ST) if decode(s)[0] in (3, 4)]
-BEAR_STATES = [s for s in range(N_ST) if decode(s)[0] in (0, 1)]
-
 # ── Feature preparation ───────────────────────────────────────────────────────
 
 def extract_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -341,51 +302,6 @@ def extract_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarr
     vol_20d = pd.Series(volumes).rolling(20, min_periods=1).mean().values
     # returns[i] corresponds to close[i+1]; align volume/20d to that day
     return closes, returns, volumes[1:], vol_20d[1:]
-
-def make_state_seq(
-    returns: np.ndarray,
-    vol: np.ndarray,
-    vol_20d: np.ndarray,
-) -> tuple[list[int], float, float]:
-    """Build 2D state list + vol percentile thresholds for this window."""
-    ratios = vol / np.maximum(vol_20d, 1.0)
-    lo_t = float(np.percentile(ratios, 33))
-    hi_t = float(np.percentile(ratios, 67))
-    states = [si(ret_bucket(r), vol_bucket(vr, lo_t, hi_t)) for r, vr in zip(returns, ratios)]
-    return states, lo_t, hi_t
-
-# ── Transition matrix ─────────────────────────────────────────────────────────
-
-def build_matrix(
-    states: list[int],
-    fallback: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns (normalized_matrix, row_obs_counts, raw_counts).
-    Rows < MIN_OBS fall back to `fallback` (uniform if not given).
-    """
-    counts = np.zeros((N_ST, N_ST), dtype=float)
-    if len(states) > 1:
-        states_arr = np.array(states, dtype=int)
-        np.add.at(counts, (states_arr[:-1], states_arr[1:]), 1)
-    row_obs = counts.sum(axis=1)
-    fb = fallback if fallback is not None else np.full(N_ST, 1.0 / N_ST)
-    mat = np.zeros((N_ST, N_ST), dtype=float)
-    for i in range(N_ST):
-        if row_obs[i] >= MIN_OBS:
-            mat[i] = counts[i] / row_obs[i]
-        else:
-            mat[i] = fb
-    return mat, row_obs, counts
-
-def stationary(mat: np.ndarray, iters: int = 1000) -> np.ndarray:
-    pi = np.full(mat.shape[0], 1.0 / mat.shape[0])
-    for _ in range(iters):
-        new_pi = pi @ mat
-        if np.max(np.abs(new_pi - pi)) < 1e-10:
-            return new_pi
-        pi = new_pi
-    return pi
 
 # ── HMM regime detection ──────────────────────────────────────────────────────
 
@@ -445,91 +361,6 @@ def _normalize_returns_for_hmm(returns: np.ndarray, window: int = 63) -> np.ndar
         normed[i] = (returns[i] - mu) / sigma if sigma > 1e-8 else 0.0
     return normed
 
-
-# ── Signal with CI ────────────────────────────────────────────────────────────
-
-def compute_signal(
-    counts_row: np.ndarray,
-    trans_row: np.ndarray,
-    stat: np.ndarray,
-) -> dict:
-    n_total = int(counts_row.sum())
-    n_bull  = int(counts_row[BULL_STATES].sum())
-    n_bear  = int(counts_row[BEAR_STATES].sum())
-    s_bull  = float(stat[BULL_STATES].sum())
-    s_bear  = float(stat[BEAR_STATES].sum())
-
-    if n_total < MIN_OBS:
-        return {
-            "signal":            "HOLD",
-            "confidence":        0.3,
-            "bullish_edge":      0.0,
-            "bearish_edge":      0.0,
-            "bull_edge_ci_low":  0.0,
-            "bull_edge_ci_high": 0.0,
-            "bear_edge_ci_low":  0.0,
-            "bear_edge_ci_high": 0.0,
-            "n_obs_current_state": n_total,
-        }
-    b_lo, b_hi = proportion_confint(n_bull, n_total, alpha=0.05, method="wilson")
-    r_lo, r_hi = proportion_confint(n_bear, n_total, alpha=0.05, method="wilson")
-
-    bull_edge = float(trans_row[BULL_STATES].sum()) - s_bull
-    bear_edge = float(trans_row[BEAR_STATES].sum()) - s_bear
-    belo = b_lo - s_bull
-    behi = b_hi - s_bull
-    relo = r_lo - s_bear
-    rehi = r_hi - s_bear
-
-    if bull_edge > 0 and belo > 0:
-        signal = "BUY"
-        confidence = min(belo / 0.15, 1.0)
-    elif bear_edge > 0 and relo > 0:
-        signal = "SELL"
-        confidence = min(relo / 0.15, 1.0)
-    else:
-        signal = "HOLD"
-        confidence = float(np.clip(1.0 - max(abs(belo), abs(relo)) / 0.1 * 0.5, 0.3, 1.0))
-
-    return {
-        "signal":            signal,
-        "confidence":        round(confidence, 4),
-        "bullish_edge":      round(bull_edge, 4),
-        "bearish_edge":      round(bear_edge, 4),
-        "bull_edge_ci_low":  round(belo, 4),
-        "bull_edge_ci_high": round(behi, 4),
-        "bear_edge_ci_low":  round(relo, 4),
-        "bear_edge_ci_high": round(rehi, 4),
-        "n_obs_current_state": n_total,
-    }
-
-# ── Matrix summarization helpers ──────────────────────────────────────────────
-
-def marginal_5x5(mat: np.ndarray, row_obs: np.ndarray) -> list[list[float]]:
-    """Observation-weighted 5×5 matrix (marginalized over vol buckets)."""
-    m, w = np.zeros((N_RET, N_RET)), np.zeros(N_RET)
-    for r1 in range(N_RET):
-        for v1 in range(N_VOL):
-            n = row_obs[si(r1, v1)]
-            if n > 0:
-                for r2 in range(N_RET):
-                    m[r1, r2] += n * sum(mat[si(r1, v1), si(r2, v2)] for v2 in range(N_VOL))
-                w[r1] += n
-        if w[r1] > 0:
-            m[r1] /= w[r1]
-        else:
-            m[r1] = np.full(N_RET, 1.0 / N_RET)
-    return m.tolist()
-
-def bullish_heatmap_5x3(mat: np.ndarray) -> list[list[float]]:
-    """5×3 array: P(next return bullish | current (return_bucket, vol_bucket))."""
-    return [
-        [round(float(sum(mat[si(r, v), bs] for bs in BULL_STATES)), 4) for v in range(N_VOL)]
-        for r in range(N_RET)
-    ]
-
-def obs_grid_5x3(row_obs: np.ndarray) -> list[list[int]]:
-    return [[int(row_obs[si(r, v)]) for v in range(N_VOL)] for r in range(N_RET)]
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 
@@ -786,51 +617,27 @@ def get_price_history(ticker: str, days: int = 760, period: Optional[str] = None
 
 @app.get("/api/signal/{ticker}")
 def get_signal(ticker: str):
+    """Price quote + the Gaussian-HMM bull/bear regime label for a ticker.
+
+    The discrete Markov chain that previously drove this endpoint was removed; the
+    composite multi-factor score (served by /api/factors) is now the system's signal.
+    """
     ticker = ticker.upper()
 
     # 2 years of OHLCV
     df = fetch_ohlcv(ticker, days=760, min_bars=260)
-    closes, returns, vol, vol_20d = extract_features(df)
+    closes, returns, _vol, _vol_20d = extract_features(df)
     hmm_returns = _normalize_returns_for_hmm(returns)
 
-    # Fit HMM on full 2-year return series
+    # Fit the Gaussian HMM on the full 2-year return series; hard-label the latest bar.
     try:
         regime_seq, bull_id, _ = fit_regimes(hmm_returns)
+        current_regime_id = int(regime_seq[-1])
+        regime_label = "bull" if current_regime_id == bull_id else "bear"
     except Exception as e:
         logger.warning("HMM failed for %s: %s — using single regime", ticker, e)
-        regime_seq = np.zeros(len(returns), dtype=int)
-        bull_id = 0
+        regime_label = "bull"
 
-    # Rolling 252-day window for transition matrices
-    w = min(ROLLING_WINDOW, len(returns))
-    rets_w    = returns[-w:]
-    vol_w     = vol[-w:]
-    vol_20d_w = vol_20d[-w:]
-
-    states_all, lo_t, hi_t = make_state_seq(rets_w, vol_w, vol_20d_w)
-
-    # Full-window, unconditioned transition matrix. The discrete-Markov signal/confidence and
-    # the displayed grids both read from this single matrix. The previous version split the
-    # window into the HMM-active regime's sub-states for the signal, which undersampled each
-    # current-state row (often below MIN_OBS) and pinned confidence at the floor — see the live
-    # signal path in _compute_factors. The Gaussian-HMM regime label (below) is independent and
-    # still surfaced for display.
-    mat_all, row_obs, cnt_all = build_matrix(states_all)
-    stat_all = stationary(mat_all)
-
-    # HMM hard-label for display only (RegimePill) — not used to condition the Markov signal.
-    current_regime_id = int(regime_seq[-1])
-    regime_label = "bull" if current_regime_id == bull_id else "bear"
-
-    # Current 2D state
-    ratios_w = vol_w / np.maximum(vol_20d_w, 1.0)
-    cur_rb = ret_bucket(float(rets_w[-1]))
-    cur_vb = vol_bucket(float(ratios_w[-1]), lo_t, hi_t)
-    cur_st = si(cur_rb, cur_vb)
-
-    sig = compute_signal(cnt_all[cur_st], mat_all[cur_st], stat_all)
-
-    # Price
     cur_price  = float(closes[-1])
     prev_price = float(closes[-2])
 
@@ -839,23 +646,7 @@ def get_signal(ticker: str):
         "price":       round(cur_price, 4),
         "prev_close":  round(prev_price, 4),
         "change_pct":  round((cur_price - prev_price) / prev_price * 100, 4),
-        **sig,
-        "regime":                 regime_label,
-        "current_state":          f"{RETURN_LABELS[cur_rb]}-{VOL_LABELS[cur_vb]}",
-        "current_return_bucket":  cur_rb,
-        "current_vol_bucket":     cur_vb,
-        "transition_matrix_5x5":  marginal_5x5(mat_all, row_obs),
-        "bullish_heatmap":        bullish_heatmap_5x3(mat_all),
-        "row_observations":       obs_grid_5x3(row_obs),
-        "stationary_distribution": [
-            round(float(sum(stat_all[si(r, v)] for v in range(N_VOL))), 4)
-            for r in range(N_RET)
-        ],
-        "return_labels":  RETURN_LABELS,
-        "vol_labels":     VOL_LABELS,
-        "high_confidence": bool(np.all(row_obs >= MIN_OBS)),
-        "num_returns":     len(rets_w),
-        "regime_window_size": len(states_all),
+        "regime":      regime_label,
     }
 
 # ── /api/backtest ─────────────────────────────────────────────────────────────
@@ -865,7 +656,7 @@ def get_backtest(ticker: str):
     ticker = ticker.upper()
 
     df = fetch_ohlcv(ticker, days=760, min_bars=260)
-    closes, returns, vol, vol_20d = extract_features(df)
+    closes, returns, _vol, _vol_20d = extract_features(df)
     dates = df.index.tolist()[1:]
     n = len(returns)  # = len(closes) - 1
 
@@ -876,6 +667,13 @@ def get_backtest(ticker: str):
     atr_mult     = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
     use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "true").lower() == "true"
     macro_filter = db.get_config("BACKTEST_MACRO_FILTER", "true").lower() == "true"
+    # Entry now mirrors the live trader: enter when the composite score clears the same
+    # bull-regime BUY threshold (default 63), not on a discrete-Markov BUY. The macro
+    # filter below only lets trades through when SPY is above its 200-day MA (a bull
+    # regime), so the bull threshold — not the higher bear threshold — is the right bar.
+    buy_threshold = float(db.get_config("bull_threshold", "63"))
+    # Mid-window deterioration exit, mirroring the live score-deterioration close.
+    exit_threshold = 40.0
 
     if n < TRAIN + TEST:
         raise HTTPException(status_code=400, detail="Need at least 2 years of history for backtest")
@@ -951,12 +749,12 @@ def get_backtest(ticker: str):
         "momentum_disagreement": 0,
         "reentry_cooldown": 0,
     }
-    total_buy_signals_raw = 0  # HMM=BUY signals before any gate
+    total_buy_signals_raw = 0  # composite >= threshold signals before any gate
 
-    # Diagnostic-only: per-event log of high-confidence BUY signals that a gate blocked.
+    # Diagnostic-only: per-event log of qualifying BUY signals that a gate blocked.
     # Visibility change only — does not affect signals, gate logic, or trade outcomes.
-    # Only signals scoring >= this threshold are logged (BUYs map to >=75 via the HMM
-    # factor score, so low-score days that were never going to trade are excluded).
+    # Only signals scoring >= this threshold are logged (a qualifying BUY already clears
+    # the buy threshold, so low-score days that were never going to trade are excluded).
     REJECTION_SCORE_FLOOR = 40.0
     rejection_events: list[dict] = []
 
@@ -975,31 +773,19 @@ def get_backtest(ticker: str):
 
     test_start = TRAIN
     while test_start + TEST <= n:
-        ts, te = test_start - TRAIN, test_start
-
-        tr_rets, tr_vol, tr_20d = returns[ts:te], vol[ts:te], vol_20d[ts:te]
-        tr_states, lo_t, hi_t = make_state_seq(tr_rets, tr_vol, tr_20d)
-
-        # Bug fix: generate the entry signal from the full training-window transition
-        # matrix — the same basis the multi-ticker portfolio backtest uses
-        # (compute_signal on cnt_full/mat_full/stat_full, ~main.py:2065). The previous
-        # version split the window into HMM bull/bear sub-matrices: inside the bull
-        # regime nearly all stationary mass already sits on bull states, so bull_edge
-        # could never clear its Wilson lower bound, and most per-state rows fell below
-        # MIN_OBS (forcing HOLD). Together those drove BUY signals to ~zero, so the
-        # backtest reported no trades even on tickers that clearly should have traded.
-        mat_full, _, cnt_full = build_matrix(tr_states)
-        stat_full = stationary(mat_full)
-
         for idx in range(test_start, min(test_start + TEST, n)):
-            r_t    = returns[idx]
-            ratio  = vol[idx] / max(vol_20d[idx], 1.0)
-            cur_st = si(ret_bucket(r_t), vol_bucket(ratio, lo_t, hi_t))
+            r_t = returns[idx]
+            # Composite score from price-derivable factors (momentum + vol-adjusted trend)
+            # on the history available at this decision point. Earnings, insider, and
+            # sentiment can't be reconstructed point-in-time historically, so they're
+            # treated as unavailable and the surviving weights renormalise — the exact
+            # mechanism the live engine uses when a factor is null. Entry mirrors live:
+            # enter when this composite clears the buy threshold (no discrete Markov).
+            composite = _backtest_composite(closes[: idx + 1])
+            if composite is None:
+                composite = 0.0
 
-            sig_res = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)
-            signal = sig_res["signal"]
-
-            # Portfolio update: earn r_t if already in position BEFORE this signal
+            # Portfolio update: earn r_t if already in position BEFORE this decision
             if in_pos:
                 atr_exit = False
                 if use_atr_stop:
@@ -1019,18 +805,19 @@ def get_backtest(ticker: str):
                     portfolio *= (1 + r_t)
                     daily_strat.append(r_t)
                     hold_left -= 1
-                    # Change 1: mid-window exit on SELL signal (mirrors live score deterioration gate)
-                    if signal == "SELL" or hold_left <= 0:
+                    # Mid-window exit on score deterioration (mirrors the live
+                    # score-deterioration close) or max-hold expiry.
+                    if composite < exit_threshold or hold_left <= 0:
                         portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: exit transaction cost
                         trade_results.append(portfolio > trade_entry_val)
                         in_pos = False
                         last_exit_idx = idx
             else:
                 daily_strat.append(0.0)
-                if signal == "BUY":
-                    # Diagnostic score for this BUY signal (0–100), same mapping the live
-                    # factor engine uses; logging only, never affects trade decisions.
-                    buy_score = _hmm_factor_score("BUY", sig_res["confidence"])
+                if composite >= buy_threshold:
+                    # Diagnostic score for this BUY signal (0–100): the composite itself.
+                    # Logging only, never affects trade decisions.
+                    buy_score = composite
                     spy_ok = (spy_above_ma is None) or bool(spy_above_ma[idx])
                     if macro_filter and not spy_ok:
                         _log_rejection(idx, "macro_circuit_breaker", buy_score,
@@ -1130,7 +917,7 @@ def get_backtest(ticker: str):
         "win_rate_trades":         round(win_rate_trades, 1),
         "num_trades":              len(trade_results),
         "num_windows":             (n - TRAIN) // TEST,
-        # Diagnostic-only: why high-confidence BUY signals didn't convert to trades
+        # Diagnostic-only: why qualifying BUY signals didn't convert to trades
         "gate_rejections":         rejection_events,
         "gate_rejection_summary":  gate_rejection_summary,
         # Change 1: gate comparison — how many BUY signals each gate filtered
@@ -1140,8 +927,10 @@ def get_backtest(ticker: str):
             "filters":                   gate_rejections,
             "transaction_cost_bps_per_side": int(TC_PER_SIDE * 10000),
             "notes": (
-                "earnings_within_2d and sector_cap gates omitted: require real-time data "
-                "not available in historical simulation."
+                "Entry uses composite score ≥ buy threshold (matches live). "
+                "Composite is computed from momentum + vol-adjusted trend only; earnings, "
+                "insider, sentiment, earnings_within_2d and sector_cap gates require "
+                "real-time data unavailable in historical simulation."
             ),
         },
     }
@@ -1156,15 +945,6 @@ def health():
 # ═══════════════════════════════════════════════════════════════════════════════
 # FACTOR ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _hmm_factor_score(signal: str, confidence: float) -> float:
-    """Map HMM signal+confidence → 0–100."""
-    if signal == "BUY":
-        return 75.0 + confidence * 25.0
-    if signal == "SELL":
-        return 25.0 - confidence * 25.0
-    return 50.0 + (confidence - 0.65) * 20.0  # HOLD: uncertainty→43, mid→50, high-conf→57
-
 
 def _momentum_score(closes: np.ndarray) -> float | None:
     """3m+12m momentum, skip last 21 days, each horizon z-scored against its own distribution."""
@@ -1217,6 +997,26 @@ def _vol_trend_score(closes: np.ndarray) -> tuple[float | None, dict | None]:
         "ma200": float(ma200),
     }
     return float(np.clip(score, 0, 100)), detail
+
+
+def _backtest_composite(closes: np.ndarray) -> float | None:
+    """Composite score for the walk-forward backtests, from the factors that *can* be
+    reconstructed point-in-time from price history alone: momentum and vol-adjusted
+    trend. Earnings, insider, and sentiment have no historical per-day source, so they
+    are treated as unavailable and the two surviving weights are renormalised — the same
+    null-factor renormalisation the live composite (_compute_factors) applies. Returns
+    None when neither factor has enough history yet."""
+    available: list[tuple[float, float]] = []  # (weight, score)
+    mom = _momentum_score(closes)
+    if mom is not None:
+        available.append((DEFAULT_FACTOR_WEIGHTS["momentum"], mom))
+    vt, _ = _vol_trend_score(closes)
+    if vt is not None:
+        available.append((DEFAULT_FACTOR_WEIGHTS["vol_trend"], vt))
+    total_w = sum(w for w, _ in available)
+    if total_w <= 0:
+        return None
+    return sum(s * w for w, s in available) / total_w
 
 
 def _extract_earnings_quarters(eh: pd.DataFrame | None, n: int = 4) -> list[dict]:
@@ -1635,6 +1435,19 @@ def _get_company_info(ticker: str) -> dict:
     return info
 
 
+def _composite_signal(score: Optional[float]) -> str:
+    """Map a 0–100 composite score to a BUY/HOLD/SELL badge for display. Mirrors the
+    verdict bands (≥63 = buy zone, <45 = weak). Display only — the live trader gates on
+    the macro-aware threshold, not this static mapping."""
+    if score is None:
+        return "HOLD"
+    if score >= 63.0:
+        return "BUY"
+    if score < 45.0:
+        return "SELL"
+    return "HOLD"
+
+
 def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     """Core factor computation shared by the API endpoint and the scheduler.
 
@@ -1674,7 +1487,7 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         regime_seq = np.zeros(len(returns), dtype=int)
         bull_id = 0
 
-    # Regime label based on Kalman-smoothed probability (keeps raw hard label for matrix math)
+    # Regime label based on the Kalman-smoothed Gaussian-HMM bull probability.
     if smoothed_bull_prob_last > 0.65:
         regime_label = "bull"
     elif smoothed_bull_prob_last < 0.35:
@@ -1682,26 +1495,6 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     else:
         regime_label = "transition"
 
-    w = min(ROLLING_WINDOW, len(returns))
-    rets_w, vol_w, vol_20d_w = returns[-w:], vol[-w:], vol_20d[-w:]
-    states_all, lo_t, hi_t = make_state_seq(rets_w, vol_w, vol_20d_w)
-    # Discrete-Markov signal/confidence use the full, unconditioned transition matrix over the
-    # whole rolling window. The previous version split the window into the HMM-active regime's
-    # sub-states, which left only a handful of observations per current-state row (often well
-    # below MIN_OBS), pinning confidence at the floor and forcing HOLD. The Gaussian-HMM regime
-    # detector (smoothed_bull_prob / regime_label) is unaffected — it stays the "what regime are
-    # we in" model; this only stops the discrete signal from re-conditioning on it.
-    mat_all, _, cnt_all = build_matrix(states_all)
-    stat_all = stationary(mat_all)
-
-    ratios_w = vol_w / np.maximum(vol_20d_w, 1.0)
-    # Fix 2-C: use the last *complete* bar [-2] for the current Markov state, consistent with
-    # the volume read below — today's bar is partial at signal time. Fall back to [-1] if short.
-    _cb = -2 if len(rets_w) >= 2 else -1
-    cur_st = si(ret_bucket(float(rets_w[_cb])), vol_bucket(float(ratios_w[_cb]), lo_t, hi_t))
-    sig = compute_signal(cnt_all[cur_st], mat_all[cur_st], stat_all)
-
-    hmm_score      = _hmm_factor_score(sig["signal"], sig["confidence"])
     mom_score      = _momentum_score(closes)
     vt_score, vt_detail     = _vol_trend_score(closes)
     earn_score, earn_detail = _earnings_score(yf.Ticker(ticker))
@@ -1737,7 +1530,6 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     weights = _load_ticker_weights(ticker)
 
     factors: dict[str, Any] = {
-        "hmm":       {"score": round(hmm_score, 2), "weight": weights["hmm"], "null": False},
         "momentum":  {"score": round(mom_score, 2)      if mom_score      is not None else None, "weight": weights["momentum"],  "null": mom_score      is None},
         "vol_trend": {"score": round(vt_score, 2)        if vt_score       is not None else None, "weight": weights["vol_trend"], "null": vt_score       is None},
         "earnings":  {"score": round(earn_score, 2)      if earn_score     is not None else None, "weight": weights["earnings"],  "null": earn_score     is None},
@@ -1752,6 +1544,10 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
 
     non_null_scores = [v["score"] for v in factors.values() if not v["null"] and v["score"] is not None]
     min_factor_score = min(non_null_scores) if non_null_scores else None
+
+    # Display BUY/HOLD/SELL badge derived from the composite (the live trader uses the
+    # macro-aware threshold; this is a static, display-only mapping for the watchlist).
+    signal = _composite_signal(round(composite, 2))
 
     c_lag   = closes[:-21] if len(closes) > 21 else closes
     ret_3m  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 63  else None
@@ -1776,8 +1572,7 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         "factors":             factors,
         "composite_score":     round(composite, 2),
         "min_factor_score":    round(min_factor_score, 2) if min_factor_score is not None else None,
-        "hmm_signal":          sig["signal"],
-        "hmm_confidence":      sig["confidence"],
+        "signal":              signal,
         "hmm_regime":          regime_label,
         "smoothed_bull_prob":  round(smoothed_bull_prob_last, 4),
         "raw_bull_prob":       round(raw_bull_prob_last, 4),
@@ -1818,13 +1613,13 @@ def _factors_payload(result: dict) -> dict:
 def _write_snapshot(ticker: str, result: dict) -> None:
     """Persist a ticker's freshly computed factors as a cached display snapshot.
 
-    Display-only: never affects trading logic. `signal` mirrors the Markov/HMM signal
-    already shown on the card (BUY/SELL/HOLD).
+    Display-only: never affects trading logic. `signal` is the composite-derived
+    BUY/SELL/HOLD badge shown on the card.
     """
     db.upsert_snapshot(
         ticker=ticker,
         composite_score=result.get("composite_score"),
-        signal=result.get("hmm_signal"),
+        signal=result.get("signal"),
         hmm_regime=result.get("hmm_regime"),
         price=result.get("current_price"),
         price_change_pct=result.get("price_change_pct"),
@@ -1853,7 +1648,7 @@ def get_factors_cluster(tickers: str = ""):
             results.append({
                 "ticker":           ticker,
                 "composite_score":  res["composite_score"],
-                "hmm_signal":       res["hmm_signal"],
+                "signal":           res["signal"],
                 "min_factor_score": res.get("min_factor_score"),
                 "volume_ratio":     res.get("volume_ratio"),
                 "volume_ok":        res.get("volume_ok"),
@@ -2245,7 +2040,6 @@ def get_short_interest(ticker: str):
 
 class TickerSignal(BaseModel):
     composite_score: float
-    confidence: float
 
 class SizingRequest(BaseModel):
     capital: float
@@ -2422,26 +2216,27 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         dates_idx = combined.index
         n_days, n_stocks = combined_arr.shape
 
-        # Precompute features per ticker
+        # Precompute features per ticker: closing prices + simple returns. (Volume is no
+        # longer needed — the discrete-Markov state machine that used it was removed.)
         features: dict[str, tuple] = {}
         for i, t in enumerate(valid):
             c = combined_arr[:, i]
-            vol_series = dfs[t]["Volume"].reindex(dates_idx).ffill().values
             ret = np.diff(c) / c[:-1]
-            vol_20d = pd.Series(vol_series).rolling(20, min_periods=1).mean().values
-            vol_aligned = vol_series[1:]
-            vol_20d_aligned = vol_20d[1:]
-            features[t] = (c, ret, vol_aligned, vol_20d_aligned)
+            features[t] = (c, ret)
 
         # Change 1: 7bps commission + 0.1% slippage per side
         TC_PER_SIDE_PB = 0.0017
+        # Entry/exit now mirror the live trader and the single-ticker backtest: allocate
+        # to tickers whose composite clears the buy threshold, exit on score deterioration.
+        buy_threshold = float(db.get_config("bull_threshold", "63"))
+        exit_threshold = 40.0
 
         # Walk-forward
         portfolio_val = req.capital
         equity_curve: list[dict] = []
         rebalance_events: list[dict] = []
         per_ticker_contrib: dict[str, float] = {t: 0.0 for t in valid}
-        mid_window_exits = 0  # Change 1: counter for SELL-signal early exits
+        mid_window_exits = 0  # Change 1: counter for score-deterioration early exits
 
         # SPY benchmark
         spy_closes = None
@@ -2455,38 +2250,22 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             ts = test_start - TRAIN
             te = test_start
 
-            # Compute vol-targeted weights at this rebalance point
-            # Change 1: also store per-ticker matrices for mid-window exit signal checking
+            # Compute vol-targeted weights at this rebalance point. Each ticker's signal
+            # comes from its composite score (momentum + vol-adjusted trend) on the price
+            # history available here — the same composite the live trader gates on.
             rvols: dict[str, float] = {}
             signals_window: dict[str, str] = {}
-            ticker_mat_pb: dict[str, np.ndarray] = {}
-            ticker_cnt_pb: dict[str, np.ndarray] = {}
-            ticker_stat_pb: dict[str, np.ndarray] = {}
-            ticker_lo_pb: dict[str, float] = {}
-            ticker_hi_pb: dict[str, float] = {}
 
             for t in valid:
-                c, ret, vol, vol_20d = features[t]
+                c, ret = features[t]
                 tr_rets = ret[ts:te]
-                tr_vol  = vol[ts:te]
-                tr_20d  = vol_20d[ts:te]
                 if len(tr_rets) < 22:
                     rvols[t] = 0.25
                     signals_window[t] = "HOLD"
                     continue
                 rvols[t] = tr_rets[-21:].std() * np.sqrt(252)
-                tr_states, lo_t, hi_t = make_state_seq(tr_rets, tr_vol, tr_20d)
-                mat_full, _, cnt_full = build_matrix(tr_states)
-                stat_full = stationary(mat_full)
-                ticker_mat_pb[t]  = mat_full
-                ticker_cnt_pb[t]  = cnt_full
-                ticker_stat_pb[t] = stat_full
-                ticker_lo_pb[t]   = lo_t
-                ticker_hi_pb[t]   = hi_t
-                ratios = tr_vol / np.maximum(tr_20d, 1.0)
-                cur_st = si(ret_bucket(float(tr_rets[-1])), vol_bucket(float(ratios[-1]), lo_t, hi_t))
-                sig = compute_signal(cnt_full[cur_st], mat_full[cur_st], stat_full)
-                signals_window[t] = sig["signal"]
+                composite = _backtest_composite(c[: te + 1])
+                signals_window[t] = "BUY" if (composite is not None and composite >= buy_threshold) else "HOLD"
 
             # Vol-targeted weights (only allocate to BUY signals)
             buy_tickers = [t for t in valid if signals_window[t] == "BUY"]
@@ -2516,27 +2295,16 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 
             # Simulate TEST days with these weights
             for idx in range(test_start, min(test_start + TEST, n_days - 1)):
-                # Change 1: check for mid-window SELL exits using training-period matrices
+                # Change 1: mid-window exit on composite score deterioration (mirrors the
+                # live score-deterioration close; replaces the old discrete-Markov SELL).
                 for t in valid:
                     if live_weights.get(t, 0.0) <= 0:
                         continue
-                    if t not in ticker_mat_pb:
+                    c_t, _ret_t = features[t]
+                    if idx < 1 or idx >= len(c_t):
                         continue
-                    _, ret_t, vol_t, vol_20d_t = features[t]
-                    if idx < 1 or idx - 1 >= len(ret_t):
-                        continue
-                    r_prev  = float(ret_t[idx - 1])
-                    v_prev  = float(vol_t[idx - 1])
-                    v20_prev = float(vol_20d_t[idx - 1])
-                    vr = v_prev / max(v20_prev, 1.0)
-                    lo = ticker_lo_pb[t]
-                    hi = ticker_hi_pb[t]
-                    cur_st = si(ret_bucket(r_prev), vol_bucket(vr, lo, hi))
-                    mat_d  = ticker_mat_pb[t]
-                    cnt_d  = ticker_cnt_pb[t]
-                    stat_d = ticker_stat_pb[t]
-                    sig_d  = compute_signal(cnt_d[cur_st], mat_d[cur_st], stat_d)
-                    if sig_d["signal"] == "SELL":
+                    composite = _backtest_composite(c_t[: idx + 1])
+                    if composite is not None and composite < exit_threshold:
                         # Apply exit cost proportional to this position's weight
                         portfolio_val *= (1.0 - TC_PER_SIDE_PB * live_weights[t])
                         live_weights[t] = 0.0
@@ -2617,7 +2385,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 "total_rebalances": (n_days - TRAIN) // TEST,
                 "mid_window_exits": mid_window_exits,
                 "transaction_cost_bps_per_side": int(TC_PER_SIDE_PB * 10000),
-                "notes": "mid_window_exits fired when training-period HMM matrix flips to SELL",
+                "notes": "mid_window_exits fired when a held ticker's composite fell below the deterioration threshold",
             },
         }
     except HTTPException:
@@ -2922,14 +2690,6 @@ def _write_gate_stats() -> None:
             "rejection_rate":   round(rejected / total, 4) if total > 0 else 0.0,
             "pct_of_evaluated": round(rejected / total, 4) if total > 0 else 0.0,
         }
-    # Informational pass-counter (not a rejection): how often the Gaussian HMM probability
-    # carried the HMM gate despite the transition matrix returning HOLD/SELL.
-    gaussian_passes = db.count_signal_reason("hmm_passed_via_gaussian", cutoff)
-    stats["hmm_passed_via_gaussian"] = {
-        "evaluated": total,
-        "passed": gaussian_passes,
-        "pct_of_evaluated": round(gaussian_passes / total, 4) if total > 0 else 0.0,
-    }
     with open(_GATE_STATS_PATH, "w") as f:
         json.dump(stats, f, indent=2)
     db.save_diagnostic("gate_stats", stats)
@@ -3042,7 +2802,7 @@ def _run_signal_job() -> None:
                 continue
 
             composite          = result["composite_score"]
-            hmm_signal         = result["hmm_signal"]
+            signal_label       = result.get("signal", "HOLD")  # composite-derived BUY/HOLD/SELL, for logging
             hmm_regime         = result.get("hmm_regime")
             smoothed_bull_prob = result.get("smoothed_bull_prob", 0.5)
             hmm_fit_failed     = bool(result.get("hmm_fit_failed", False))
@@ -3066,40 +2826,19 @@ def _run_signal_job() -> None:
                     _close_and_record(api, ticker, price, float(pos.avg_entry_price),
                                       "score_deterioration", entry_log, score=composite)
                 except Exception as e:
-                    db.log_signal(ticker, composite, hmm_signal, "skipped",
+                    db.log_signal(ticker, composite, signal_label, "skipped",
                                   f"close_failed:{e}", price, atr)
                 continue
 
-            if hmm_signal == "SELL" and composite < 45.0 and in_pos:
-                pos = positions[ticker]
-                entry_log = db.get_last_buy_signal(ticker)
-                try:
-                    _close_and_record(api, ticker, price, float(pos.avg_entry_price),
-                                      "sell_signal", entry_log, score=composite)
-                except Exception as e:
-                    db.log_signal(ticker, composite, "SELL", "skipped",
-                                  f"close_failed:{e}", price, atr)
-                continue
-
-            # Combined HMM gate: pass if the transition-matrix signal is BUY OR the
-            # Gaussian HMM is ≥70% confident in a bull regime. Neither model has sole veto.
-            hmm_passes = (hmm_signal == "BUY") or (smoothed_bull_prob >= 0.70)
-            if not hmm_passes:
-                db.log_signal(ticker, composite, hmm_signal, "skipped", "hmm_not_buy_transition", price, atr,
+            # Gaussian-HMM regime gate: require ≥70% confidence in a bull regime to enter.
+            if smoothed_bull_prob < 0.70:
+                db.log_signal(ticker, composite, signal_label, "skipped", "hmm_not_buy_transition", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob, hmm_fit_failed=hmm_fit_failed)
                 continue
 
-            # Informational only (hmm_source: gaussian): the Gaussian probability — not the
-            # transition matrix — carried the gate. Trade still proceeds; tracked in gate-stats.
-            if hmm_signal != "BUY":
-                db.log_signal(ticker, composite, hmm_signal, "evaluated",
-                              "hmm_passed_via_gaussian", price, atr,
-                              hmm_regime=hmm_regime, sentiment_score=sentiment,
-                              smoothed_bull_prob=smoothed_bull_prob)
-
-            # Kalman-smoothed regime gate: lowered to 0.55 since the combined gate above now
-            # already requires ≥0.70 to pass on the Gaussian path alone (avoids 0.65–0.70 ambiguity).
+            # Kalman-smoothed regime gate: lowered to 0.55 since the gate above now
+            # already requires ≥0.70 to pass on the Gaussian path (avoids 0.65–0.70 ambiguity).
             if smoothed_bull_prob <= 0.55:
                 db.log_signal(ticker, composite, "BUY", "skipped",
                               f"hmm_regime_uncertain:{smoothed_bull_prob:.3f}",
@@ -3108,7 +2847,7 @@ def _run_signal_job() -> None:
                 continue
 
             if effective_composite < buy_threshold:
-                db.log_signal(ticker, composite, hmm_signal, "skipped",
+                db.log_signal(ticker, composite, signal_label, "skipped",
                               f"score_below_threshold:{effective_composite:.1f}<{buy_threshold:.0f}",
                               price, atr, hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob)
@@ -3968,10 +3707,9 @@ def _decision_trail_detail(key: str, status: str, anchor: dict, ctx: dict) -> st
                 if status == "failed" else "Sufficient price history and factors computed")
     if key == "hmm_not_buy_transition":
         regime_txt = regime or "unknown"
-        path = "Gaussian probability" if ctx.get("gaussian_pass") else "transition matrix"
         if status == "failed":
-            return f"Regime {regime_txt} — neither the transition matrix nor Gaussian HMM (bull prob {_pct(bull_prob)}) confirmed a bull"
-        return f"Regime {regime_txt}, passed via {path} (bull prob {_pct(bull_prob)})"
+            return f"Regime {regime_txt} — Gaussian HMM bull probability {_pct(bull_prob)} below the 70% bar"
+        return f"Regime {regime_txt}, Gaussian HMM bull probability {_pct(bull_prob)} ≥ 70%"
     if key == "hmm_regime_uncertain":
         if status == "failed" and ":" in reason:
             val = reason.split(":", 1)[1]
@@ -4036,25 +3774,8 @@ def _build_decision_trail(ticker: str) -> dict:
 
     anchor = entry_rows[0]
     anchor_ts = anchor.get("timestamp") or ""
-    # Rows from the same run = same ticker within ~10 min of the anchor.
-    run_rows = [anchor]
-    try:
-        anchor_dt = datetime.fromisoformat(anchor_ts)
-        for r in entry_rows[1:]:
-            try:
-                dt = datetime.fromisoformat(r.get("timestamp") or "")
-            except Exception:
-                continue
-            if abs((anchor_dt - dt).total_seconds()) <= 600:
-                run_rows.append(r)
-    except Exception:
-        pass
-
-    # Informational marker logged when the Gaussian probability (not the matrix) carried HMM.
-    gaussian_pass = any((r.get("skip_reason") or "").startswith("hmm_passed_via_gaussian") for r in run_rows)
 
     ctx = {
-        "gaussian_pass": gaussian_pass,
         "threshold": None,
     }
     try:
@@ -4197,14 +3918,12 @@ def _build_briefing() -> dict:
         for r in eval_rows if r.get("action") == "ordered"
     ]
 
-    # Skip reason counts (one entry per skipped ticker; informational pass-markers excluded).
+    # Skip reason counts (one entry per skipped ticker).
     skip_counts: dict[str, int] = {}
     for r in eval_rows:
         if r.get("action") != "skipped":
             continue
         key = _skip_key(r.get("skip_reason"))
-        if key == "hmm_passed_via_gaussian":
-            continue
         skip_counts[key] = skip_counts.get(key, 0) + 1
     skip_breakdown = sorted(
         ({"key": k, "label": _SKIP_LABELS.get(k, k.replace("_", " ").title()), "count": v}

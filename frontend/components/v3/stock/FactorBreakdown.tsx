@@ -26,12 +26,6 @@ const FACTORS: { key: FactorKey; label: string; explanation: string }[] = [
       "Whether the company beat or missed analyst expectations in its last two earnings reports.",
   },
   {
-    key: "hmm",
-    label: "Markov / HMM",
-    explanation:
-      "Looks at the pattern of recent up/down days and estimates whether this specific stock's price behavior currently favors more upside or downside.",
-  },
-  {
     key: "insider",
     label: "Insider activity",
     explanation:
@@ -45,7 +39,7 @@ const FACTORS: { key: FactorKey; label: string; explanation: string }[] = [
   },
 ];
 
-type FactorKey = "momentum" | "vol_trend" | "earnings" | "hmm" | "insider" | "sentiment";
+type FactorKey = "momentum" | "vol_trend" | "earnings" | "insider" | "sentiment";
 
 export function FactorBreakdown({ data }: { data: FactorScoreData }) {
   // Raw detail for the insider and sentiment factors comes from the same
@@ -158,23 +152,6 @@ function RawNumbers({
         {labelled.map(({ v, q }, i) => (
           <Stat key={i} label={`${q} quarter surprise`} value={pct(v)} signed={v} />
         ))}
-      </div>
-    );
-  }
-
-  if (factorKey === "hmm") {
-    return (
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-zinc-500">
-        <span>
-          Signal <span className="text-zinc-300 font-medium">{data.hmm_signal}</span>
-        </span>
-        <span>
-          Confidence{" "}
-          <span className="text-zinc-300 font-medium tabular-nums">
-            {(data.hmm_confidence * 100).toFixed(0)}%
-          </span>
-        </span>
-        <span className="text-zinc-600">see Markov detail below</span>
       </div>
     );
   }

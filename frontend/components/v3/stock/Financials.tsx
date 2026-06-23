@@ -4,7 +4,7 @@ import { CompanyInfo as CompanyInfoData } from "@/lib/types";
 import { fetchCompany } from "@/lib/api";
 
 // Financials panel for the stock detail page — sits directly beneath Company Info.
-// Collapsed by default (same interaction as the Markov "Show anyway" toggle).
+// Collapsed by default behind a "Show anyway" toggle.
 // Groups: Valuation / Profitability & quality / Financial health / Market behavior,
 // plus a Recent earnings table. Pure read of /api/company/{ticker}; shares the
 // backend's 7-day cache with Company Info, so no extra yfinance fetch. Individual

@@ -5,7 +5,6 @@ import { SnapshotData } from "./types";
 
 const FACTOR_PHRASES: Record<string, string> = {
   momentum: "Strong momentum",
-  hmm: "Bullish regime",
   vol_trend: "Uptrend",
   earnings: "Earnings strength",
   insider: "Insider buying",

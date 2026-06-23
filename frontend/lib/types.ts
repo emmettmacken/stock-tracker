@@ -1,36 +1,10 @@
 export type Signal = "BUY" | "SELL" | "HOLD";
-export type Regime = "bull" | "bear";
 
 export interface QuoteData {
   ticker: string;
   price: number;
   prev_close: number;
   change_pct: number;
-}
-
-export interface SignalData extends QuoteData {
-  signal: Signal;
-  confidence: number;
-  current_state: string;
-  current_return_bucket: number;
-  current_vol_bucket: number;
-  bullish_edge: number;
-  bearish_edge: number;
-  bull_edge_ci_low: number;
-  bull_edge_ci_high: number;
-  bear_edge_ci_low: number;
-  bear_edge_ci_high: number;
-  n_obs_current_state: number;
-  regime: Regime;
-  high_confidence: boolean;
-  transition_matrix_5x5: number[][];
-  bullish_heatmap: number[][];   // [5][1] — vol dimension collapsed
-  row_observations: number[][];  // [5][1] — vol dimension collapsed
-  stationary_distribution: number[];
-  return_labels: string[];
-  vol_labels: string[];
-  num_returns: number;
-  regime_window_size: number;
 }
 
 export interface EquityPoint {
@@ -83,7 +57,6 @@ export interface EarningsDetail {
 export interface FactorScoreData {
   ticker: string;
   factors: {
-    hmm: FactorDetail;
     momentum: FactorDetail;
     vol_trend: FactorDetail;
     earnings: FactorDetail;
@@ -91,8 +64,7 @@ export interface FactorScoreData {
     sentiment?: FactorDetail;
   };
   composite_score: number;
-  hmm_signal: string;
-  hmm_confidence: number;
+  signal: Signal;
   hmm_regime?: "bull" | "bear" | "transition";
   min_factor_score: number | null;
   volume_ok: boolean;

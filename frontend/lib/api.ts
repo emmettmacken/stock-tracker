@@ -1,5 +1,5 @@
 import {
-  BacktestData, QuoteData, SignalData,
+  BacktestData, QuoteData,
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
@@ -8,15 +8,6 @@ import {
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
-export async function fetchSignal(ticker: string): Promise<SignalData> {
-  const res = await fetch(`${BASE}/api/signal/${ticker}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail ?? `Failed to fetch signal for ${ticker}`);
-  }
-  return res.json();
-}
 
 export async function fetchQuote(ticker: string): Promise<QuoteData> {
   const res = await fetch(`${BASE}/api/quote/${ticker}`);
@@ -86,7 +77,7 @@ export async function fetchShortInterest(ticker: string): Promise<ShortInterestD
 export async function fetchPortfolioSizing(req: {
   capital: number;
   tickers: string[];
-  signals: Record<string, { composite_score: number; confidence: number }>;
+  signals: Record<string, { composite_score: number }>;
 }): Promise<SizingResult> {
   const res = await fetch(`${BASE}/api/portfolio/sizing`, {
     method: "POST",

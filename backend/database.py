@@ -518,20 +518,6 @@ def count_gate_rejections(gate: str, cutoff: str) -> int:
         ).fetchone()[0]
 
 
-def count_signal_reason(reason: str, cutoff: str) -> int:
-    """Count signal_log rows by skip_reason prefix regardless of action.
-
-    Used for informational markers (e.g. hmm_passed_via_gaussian) that record a
-    gate *pass* rather than a rejection, so action is not 'skipped'.
-    """
-    with _conn() as conn:
-        return conn.execute(
-            """SELECT COUNT(*) FROM signal_log
-               WHERE skip_reason LIKE ? AND timestamp >= ?""",
-            (f"{reason}%", cutoff),
-        ).fetchone()[0]
-
-
 # ── Analytics queries ─────────────────────────────────────────────────────────
 
 def get_analytics_data() -> dict:

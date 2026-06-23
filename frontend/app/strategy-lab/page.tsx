@@ -60,12 +60,11 @@ export default function PortfolioPage() {
   // Recompute sizing when selection or capital changes and all factors are ready
   useEffect(() => {
     if (!allReady) return;
-    const signals: Record<string, { composite_score: number; confidence: number }> = {};
+    const signals: Record<string, { composite_score: number }> = {};
     selected.forEach((t) => {
       if (factorData[t]) {
         signals[t] = {
           composite_score: factorData[t].composite_score,
-          confidence: factorData[t].hmm_confidence,
         };
       }
     });

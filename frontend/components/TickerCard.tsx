@@ -2,7 +2,6 @@
 import { useRouter } from "next/navigation";
 import { SnapshotData, Signal } from "@/lib/types";
 import { SignalBadge } from "./SignalBadge";
-import { ConfidenceBar } from "./ConfidenceBar";
 import { FactorScorePill } from "./v3/FactorScorePill";
 import { RegimePill } from "./v3/RegimePill";
 import { relativeTime } from "@/lib/relativeTime";
@@ -25,7 +24,6 @@ export function TickerCard({ snapshot, onRemove, held = false }: Props) {
 
   const ticker = snapshot.ticker;
   const ready = snapshot.computed_at !== null;
-  const factors = snapshot.factors;
   const signal: Signal = snapshot.signal ?? "HOLD";
   const chip = ready ? whyChip(snapshot) : null;
 
@@ -115,12 +113,6 @@ export function TickerCard({ snapshot, onRemove, held = false }: Props) {
 
       {ready && (
         <>
-          {factors && (
-            <div className="mt-3">
-              <ConfidenceBar confidence={factors.hmm_confidence ?? 0} signal={signal} />
-            </div>
-          )}
-
           {/* Staleness indicator — the displayed score can be up to a day old. */}
           <div className="mt-2.5 flex items-center justify-between text-xs text-zinc-600">
             <span className="inline-flex items-center gap-1.5" title={`Computed at ${snapshot.computed_at}`}>
