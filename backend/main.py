@@ -202,6 +202,48 @@ def _history_ttl(period: str) -> int:
         return 300
     return 600
 
+
+def _timeframe_minutes(timeframe: str) -> int:
+    """Bar resolution of an Alpaca timeframe string ("15Min", "1H", "1D") in minutes."""
+    if timeframe.endswith("Min"):
+        return int(timeframe[:-3])
+    if timeframe.endswith("H"):
+        return int(timeframe[:-1]) * 60
+    return 24 * 60
+
+
+def _fill_intraday_gaps(points: list[dict], step_min: int) -> list[dict]:
+    """Bridge session gaps in an intraday equity curve with a flat, carry-forward line.
+
+    Alpaca's intraday history has no bars overnight / over the weekend, so the raw series
+    jumps straight from the last evening bar to the next morning's. To match Alpaca's own
+    dashboard we insert synthetic points (carrying the prior equity forward) at `step_min`
+    intervals across any gap wider than 1.5× the bar interval — Recharts then draws a flat
+    line through the closed period. The threshold scales with the bar resolution so normal
+    consecutive bars (15Min for 1D, 1H for 1W) are never filled, only true session gaps.
+    Only meaningful for intraday periods; daily curves expect multi-day weekend gaps.
+    """
+    if len(points) < 2:
+        return points
+    step = timedelta(minutes=step_min)
+    threshold = step * 1.5
+    filled: list[dict] = [points[0]]
+    for i in range(1, len(points)):
+        prev, cur = points[i - 1], points[i]
+        prev_ts = datetime.fromisoformat(prev["timestamp"].rstrip("Z"))
+        cur_ts = datetime.fromisoformat(cur["timestamp"].rstrip("Z"))
+        if cur_ts - prev_ts > threshold:
+            t = prev_ts + step
+            while t < cur_ts:
+                filled.append({
+                    "timestamp": t.isoformat() + "Z",
+                    "equity": prev["equity"],
+                    "synthetic": True,
+                })
+                t += step
+        filled.append(cur)
+    return filled
+
 # Aggregate-expectancy cache for the /portfolio Edge Statistics section. Read-only
 # aggregation over closed trades; 10-min TTL since it changes only when a trade exits.
 _EDGE_STATS_CACHE: Optional[tuple[dict, float]] = None  # (result, timestamp)
@@ -3719,6 +3761,13 @@ def api_portfolio_history(period: str = "1D"):
                     })
             except Exception:
                 pass
+
+        # Intraday curves (1D/1W) have no bars overnight or over weekends — fill those
+        # session gaps with a flat carry-forward line so the chart doesn't jump straight
+        # from the last evening bar to the next morning's. Daily curves (1M+) are left as
+        # is: their weekend gaps are expected and drawn as direct Fri→Mon connections.
+        if period in ("1D", "1W"):
+            points = _fill_intraday_gaps(points, _timeframe_minutes(timeframe))
 
         result = {"available": True, "period": period, "points": points}
         _PORTFOLIO_HISTORY_CACHE[cache_key] = (result, time.time())

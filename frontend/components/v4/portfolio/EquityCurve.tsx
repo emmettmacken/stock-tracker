@@ -23,11 +23,6 @@ function isMarketLikelyOpen(now: Date = new Date()): boolean {
 const RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
-}
 // DD/MM HH:MM in the viewer's local time — all parts from the same Date object so the
 // day and time can't disagree across the UTC boundary.
 function fmtDateTime(iso: string): string {
@@ -35,9 +30,10 @@ function fmtDateTime(iso: string): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
-// 1D shows intraday DD/MM HH:MM; every other range shows the date (MMM DD).
-function fmtAxis(iso: string, range: Range): string {
-  return range === "1D" ? fmtDateTime(iso) : fmtDate(iso);
+// Every range shows DD/MM HH:MM (axis ticks and tooltip alike) — minTickGap thins the
+// axis labels so the time component stays readable even on the longer periods.
+function fmtAxis(iso: string): string {
+  return fmtDateTime(iso);
 }
 
 interface Row {
@@ -131,7 +127,7 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
     if (!points) return [];
     return points
       .filter((p) => p.equity != null)
-      .map((p) => ({ ts: p.timestamp, label: fmtAxis(p.timestamp, range), equity: p.equity }));
+      .map((p) => ({ ts: p.timestamp, label: fmtAxis(p.timestamp), equity: p.equity }));
   }, [points, range]);
 
   // Total return $ and % across the visible window (first → last equity).
@@ -267,7 +263,7 @@ export function EquityCurve({ onLiveEquity }: EquityCurveProps = {}) {
               formatter={(v: number) => [fmtUSD(v), "Equity"]}
               labelFormatter={(_l, payload) => {
                 const ts = payload?.[0]?.payload?.ts as string | undefined;
-                return ts ? fmtAxis(ts, range) : "";
+                return ts ? fmtAxis(ts) : "";
               }}
             />
             {/* Vertical crosshair that follows the cursor to the nearest point. With the
