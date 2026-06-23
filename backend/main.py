@@ -178,10 +178,10 @@ _PRICE_HISTORY_LOCK = threading.Lock()
 _PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # "period:timeframe" → (result, timestamp)
 
 # Frontend period → Alpaca portfolio-history request spec (Alpaca period unit D/W/M/A
-# and timeframe resolution: 5Min/1H/1D). "YTD" starts at Jan 1 of the current year and
+# and timeframe resolution: 15Min/1H/1D). "YTD" starts at Jan 1 of the current year and
 # "Max" at the account's creation date — both computed in api_portfolio_history.
 _HISTORY_SPEC = {
-    "1D":  {"period": "1D", "timeframe": "5Min"},
+    "1D":  {"period": "1D", "timeframe": "15Min"},
     "1W":  {"period": "1W", "timeframe": "1H"},
     "1M":  {"period": "1M", "timeframe": "1D"},
     "3M":  {"period": "3M", "timeframe": "1D"},
@@ -3614,8 +3614,7 @@ def api_portfolio_history(period: str = "1D"):
     """Account equity curve from Alpaca's own portfolio history. Read-only, cached.
 
     `period` ∈ {1D,1W,1M,3M,YTD,1Y,Max} → Alpaca period units (D/W/M/A) and a
-    resolution that gets finer for short ranges (5Min for 1D, 1H for 1W, else 1D).
-    The 5Min/1D combo returns Alpaca's extended-hours session (~4am–10pm ET, ~78 bars).
+    resolution that gets finer for short ranges (15Min for 1D, 1H for 1W, else 1D).
     YTD starts at Jan 1 of the current year; Max at the account's creation date.
     Returns {available, period, points: [{timestamp: ISO string, equity: number}]}.
     """
@@ -3662,7 +3661,7 @@ def api_portfolio_history(period: str = "1D"):
         # unrealised gains. Append the live account equity as a final point (timestamp =
         # now) so the curve always ends at the real current value — unless today's date is
         # already represented. Skipped for 1D, whose intraday points already cover today's
-        # session right up to the latest 5-minute bar.
+        # session right up to the latest 15-minute bar.
         if period != "1D":
             try:
                 today = datetime.utcnow().strftime("%Y-%m-%d")
