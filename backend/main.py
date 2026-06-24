@@ -180,6 +180,12 @@ _SECTOR_TTL = 86400  # 24 hours
 _COMPANY_CACHE: dict[str, tuple[dict, float]] = {}  # ticker → (info dict, timestamp)
 _COMPANY_TTL = 7 * 86400  # 7 days
 _COMPANY_LOCK = threading.Lock()
+# Retry config for the .info fetch behind _get_company_info. Yahoo throttles the
+# 8-worker signal-job burst by returning a partial/empty .info dict with no exception;
+# we retry it (like _fetch_sector) and never cache a name-less result, so a rate-limited
+# burst can't freeze a ticker's name at None for the full 7-day TTL.
+_COMPANY_FETCH_ATTEMPTS = 3
+_COMPANY_FETCH_DELAY = 2.0  # seconds between attempts
 
 # Full-history price cache for the chart's "Max" range. A period="max" fetch can span
 # 20+ years (~270 KB for NVDA) and is user-triggered, so cache the projected points for
@@ -1489,69 +1495,87 @@ def _get_company_info(ticker: str) -> dict:
         if cached and (time.time() - ts) < _COMPANY_TTL:
             return cached
 
-    info: dict = {}
+    # Fetch .info with retry/backoff, mirroring _fetch_sector. A successful fetch has a
+    # usable name (longName/shortName); a partial/empty dict — Yahoo's silent response to
+    # the parallel signal-job burst — is treated as a transient failure and retried. raw
+    # stays {} when every attempt fails, so the info dict below degrades to all-None.
+    raw: dict = {}
+    tk = None
+    name: str | None = None
+    for attempt in range(1, _COMPANY_FETCH_ATTEMPTS + 1):
+        try:
+            tk = yf.Ticker(ticker)
+            raw = tk.info or {}
+            name = raw.get("longName") or raw.get("shortName") or None
+            if name:
+                break
+            logger.warning("Company info for %s returned no name field "
+                           "(attempt %d/%d, .info keys=%d — likely rate-limited)",
+                           ticker, attempt, _COMPANY_FETCH_ATTEMPTS, len(raw))
+            raw = {}
+        except Exception as e:
+            logger.warning("Company info lookup failed for %s (attempt %d/%d): %s",
+                           ticker, attempt, _COMPANY_FETCH_ATTEMPTS, e)
+            raw = {}
+        if attempt < _COMPANY_FETCH_ATTEMPTS:
+            time.sleep(_COMPANY_FETCH_DELAY)
+
+    sector = raw.get("sector") or "Unknown"
+    # Seed the sector cache from this same fetch so _get_sector won't re-fetch .info —
+    # but only on a real hit. Never poison the cache with "Unknown" from a partial /
+    # rate-limited .info response, which would freeze the sector panel for the 24h TTL.
+    if sector != "Unknown":
+        with _SECTOR_LOCK:
+            _SECTOR_CACHE[ticker] = (sector, time.time())
+    info = {
+        "ticker":             ticker,
+        "name":               name,
+        "sector":             sector,
+        "industry":           raw.get("industry") or None,
+        "summary":            raw.get("longBusinessSummary") or None,
+        # 2–4 trader-relevant additions that yfinance reliably populates
+        "market_cap":         raw.get("marketCap"),
+        "trailing_pe":        raw.get("trailingPE"),
+        "forward_pe":         raw.get("forwardPE"),
+        "dividend_yield":     raw.get("dividendYield"),
+        "fifty_two_week_high": raw.get("fiftyTwoWeekHigh"),
+        "fifty_two_week_low":  raw.get("fiftyTwoWeekLow"),
+        # Financials panel (stock detail page). All from this same .info fetch — no
+        # extra yfinance call. Verified to populate reliably across a diverse ticker
+        # set; individual nulls are hidden client-side.
+        "peg_ratio":          raw.get("pegRatio"),
+        "price_to_sales":     raw.get("priceToSalesTrailing12Months"),
+        "price_to_book":      raw.get("priceToBook"),
+        "ev_to_ebitda":       raw.get("enterpriseToEbitda"),
+        "profit_margin":      raw.get("profitMargins"),
+        "operating_margin":   raw.get("operatingMargins"),
+        "return_on_equity":   raw.get("returnOnEquity"),
+        "revenue_growth":     raw.get("revenueGrowth"),
+        "debt_to_equity":     raw.get("debtToEquity"),
+        "current_ratio":      raw.get("currentRatio"),
+        "free_cash_flow":     raw.get("freeCashflow"),
+        "beta":               raw.get("beta"),
+        "average_volume":     raw.get("averageVolume"),
+        "payout_ratio":       raw.get("payoutRatio"),
+    }
     earnings: list[dict] = []
-    try:
-        tk = yf.Ticker(ticker)
-        raw = tk.info or {}
-        sector = raw.get("sector") or "Unknown"
-        # Seed the sector cache from this same fetch so _get_sector won't re-fetch .info —
-        # but only on a real hit. Never poison the cache with "Unknown" from a partial /
-        # rate-limited .info response, which would freeze the sector panel for the 24h TTL.
-        if sector != "Unknown":
-            with _SECTOR_LOCK:
-                _SECTOR_CACHE[ticker] = (sector, time.time())
-        info = {
-            "ticker":             ticker,
-            "name":               raw.get("longName") or raw.get("shortName") or None,
-            "sector":             sector,
-            "industry":           raw.get("industry") or None,
-            "summary":            raw.get("longBusinessSummary") or None,
-            # 2–4 trader-relevant additions that yfinance reliably populates
-            "market_cap":         raw.get("marketCap"),
-            "trailing_pe":        raw.get("trailingPE"),
-            "forward_pe":         raw.get("forwardPE"),
-            "dividend_yield":     raw.get("dividendYield"),
-            "fifty_two_week_high": raw.get("fiftyTwoWeekHigh"),
-            "fifty_two_week_low":  raw.get("fiftyTwoWeekLow"),
-            # Financials panel (stock detail page). All from this same .info fetch — no
-            # extra yfinance call. Verified to populate reliably across a diverse ticker
-            # set; individual nulls are hidden client-side.
-            "peg_ratio":          raw.get("pegRatio"),
-            "price_to_sales":     raw.get("priceToSalesTrailing12Months"),
-            "price_to_book":      raw.get("priceToBook"),
-            "ev_to_ebitda":       raw.get("enterpriseToEbitda"),
-            "profit_margin":      raw.get("profitMargins"),
-            "operating_margin":   raw.get("operatingMargins"),
-            "return_on_equity":   raw.get("returnOnEquity"),
-            "revenue_growth":     raw.get("revenueGrowth"),
-            "debt_to_equity":     raw.get("debtToEquity"),
-            "current_ratio":      raw.get("currentRatio"),
-            "free_cash_flow":     raw.get("freeCashflow"),
-            "beta":               raw.get("beta"),
-            "average_volume":     raw.get("averageVolume"),
-            "payout_ratio":       raw.get("payoutRatio"),
-        }
+    if name and tk is not None:
         try:
             earnings = _extract_earnings_quarters(tk.earnings_history, n=4)
         except Exception as e:
             logger.warning("Earnings history lookup failed for %s: %s", ticker, e)
-    except Exception as e:
-        logger.warning("Company info lookup failed for %s: %s", ticker, e)
-        info = {"ticker": ticker, "name": None, "sector": "Unknown", "industry": None,
-                "summary": None, "market_cap": None, "trailing_pe": None,
-                "forward_pe": None, "dividend_yield": None,
-                "fifty_two_week_high": None, "fifty_two_week_low": None,
-                "peg_ratio": None, "price_to_sales": None, "price_to_book": None,
-                "ev_to_ebitda": None, "profit_margin": None, "operating_margin": None,
-                "return_on_equity": None, "revenue_growth": None, "debt_to_equity": None,
-                "current_ratio": None, "free_cash_flow": None, "beta": None,
-                "average_volume": None, "payout_ratio": None}
 
     info["earnings"] = earnings
     info = _sanitize_json(info)
-    with _COMPANY_LOCK:
-        _COMPANY_CACHE[ticker] = (info, time.time())
+    # Only cache a successful fetch (name present). A name-less result is returned for
+    # display but NOT cached, so the next call retries instead of freezing name=None for
+    # the full 7-day TTL — the cache-poisoning bug that mirrored the old sector "Unknown".
+    if name:
+        with _COMPANY_LOCK:
+            _COMPANY_CACHE[ticker] = (info, time.time())
+    else:
+        logger.error("Company info gave up for %s after %d attempts — not caching",
+                     ticker, _COMPANY_FETCH_ATTEMPTS)
     return info
 
 
