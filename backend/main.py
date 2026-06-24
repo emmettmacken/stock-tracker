@@ -326,6 +326,12 @@ def _append_weight_drift(ticker: str, drifts: dict) -> None:
 _EARNINGS_CACHE: dict[str, tuple[bool, float]] = {}
 _EARNINGS_TTL = 86400  # 24 hours
 
+# Upcoming-earnings cache (1h TTL) for the Strategy Lab earnings table. Stores per-ticker
+# {next earnings date + last two EPS surprises} or None when no calendar data is available.
+_UPCOMING_EARNINGS_LOCK = threading.Lock()
+_UPCOMING_EARNINGS_CACHE: dict[str, tuple[Optional[dict], float]] = {}
+_UPCOMING_EARNINGS_TTL = 3600  # 1 hour
+
 # Macro regime cache (5-min TTL — SPY/VIX checked once per signal job, not per ticker)
 _MACRO_CACHE: Optional[tuple] = None  # (detail_dict, timestamp); see _macro_regime_detail()
 _MACRO_TTL = 300  # seconds
@@ -2791,6 +2797,59 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
     return result
 
 
+def _upcoming_earnings_for_ticker(ticker: str) -> Optional[dict]:
+    """Next upcoming earnings date + last two EPS surprises for one ticker, cached 1h.
+
+    Shares its yfinance fetch pattern with _earnings_within_days (ticker.calendar) and its
+    surprise logic with _earnings_score (ticker.earnings_history), both off a single Ticker
+    object. Returns None — and caches None — when the calendar has no upcoming date, so the
+    caller skips the ticker without failing the whole request. days_until is intentionally
+    not cached (it's recomputed per request so it stays correct across a day rollover)."""
+    with _UPCOMING_EARNINGS_LOCK:
+        cached = _UPCOMING_EARNINGS_CACHE.get(ticker)
+        if cached is not None and (time.time() - cached[1]) < _UPCOMING_EARNINGS_TTL:
+            return cached[0]
+    result: Optional[dict] = None
+    try:
+        tk = yf.Ticker(ticker)
+        cal = tk.calendar
+        dates = []
+        if isinstance(cal, dict):
+            raw = cal.get("Earnings Date", [])
+            dates = raw if isinstance(raw, list) else [raw]
+        elif cal is not None and hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+            dates = cal["Earnings Date"].tolist()
+        today = datetime.now().date()
+        next_date = None
+        for d in dates:
+            try:
+                dt = d.replace(tzinfo=None) if hasattr(d, "tzinfo") else datetime.fromisoformat(str(d))
+                dd = dt.date()
+            except Exception:
+                continue
+            if (dd - today).days >= 0 and (next_date is None or dd < next_date):
+                next_date = dd
+        if next_date is not None:
+            last_pct = prior_pct = None
+            _, detail = _earnings_score(tk)
+            surprises = (detail or {}).get("surprises") or []  # oldest → newest, fractions
+            if surprises:
+                last_pct = round(surprises[-1] * 100, 2)
+                if len(surprises) >= 2:
+                    prior_pct = round(surprises[0] * 100, 2)
+            result = {
+                "earnings_date":      next_date.isoformat(),
+                "last_surprise_pct":  last_pct,
+                "prior_surprise_pct": prior_pct,
+            }
+    except Exception as exc:
+        logger.warning("%s: upcoming-earnings fetch failed: %s", ticker, exc)
+        result = None
+    with _UPCOMING_EARNINGS_LOCK:
+        _UPCOMING_EARNINGS_CACHE[ticker] = (result, time.time())
+    return result
+
+
 def _compute_kelly_params(trades: list[dict]) -> Optional[tuple[float, float, float]]:
     """Return (p, b, f_star) from a list of {return_pct} dicts, or None if insufficient data."""
     wins   = [t["return_pct"] for t in trades if t["return_pct"] > 0]
@@ -3772,6 +3831,53 @@ def api_watchlist_snapshot():
     for the explicit live-recompute paths.
     """
     return {"snapshots": db.get_watchlist_snapshots()}
+
+
+@app.get("/api/earnings/upcoming")
+def api_upcoming_earnings(days: int = 30):
+    """Watchlist tickers with earnings in the next `days` calendar days (default 30,
+    clamped to 7–90), sorted by date ascending. Per-ticker calendar/surprise fetches run
+    in parallel (≤8 workers) and are cached 1h; tickers with no calendar data are skipped.
+    composite_score comes from the cached watchlist snapshot (no extra compute)."""
+    days = max(7, min(90, days))
+    watchlist = [r["ticker"] for r in db.get_watchlist()]
+    snap_scores = {s["ticker"]: s.get("composite_score") for s in db.get_watchlist_snapshots()}
+
+    raw: dict[str, Optional[dict]] = {}
+    if watchlist:
+        with ThreadPoolExecutor(max_workers=min(8, len(watchlist))) as pool:
+            futures = {pool.submit(_upcoming_earnings_for_ticker, t): t for t in watchlist}
+            for fut in as_completed(futures):
+                t = futures[fut]
+                try:
+                    raw[t] = fut.result()
+                except Exception:
+                    raw[t] = None
+
+    today = datetime.now().date()
+    earnings: list[dict] = []
+    for ticker in watchlist:
+        info = raw.get(ticker)
+        if not info or not info.get("earnings_date"):
+            continue
+        try:
+            ed = datetime.fromisoformat(info["earnings_date"]).date()
+        except Exception:
+            continue
+        days_until = (ed - today).days
+        if days_until < 0 or days_until > days:
+            continue
+        earnings.append({
+            "ticker":             ticker,
+            "company_name":       _get_company_info(ticker).get("name"),
+            "earnings_date":      info["earnings_date"],
+            "days_until":         days_until,
+            "last_surprise_pct":  info.get("last_surprise_pct"),
+            "prior_surprise_pct": info.get("prior_surprise_pct"),
+            "composite_score":    snap_scores.get(ticker),
+        })
+    earnings.sort(key=lambda e: e["earnings_date"])
+    return {"days": days, "earnings": earnings}
 
 
 def _compute_and_store_snapshot(ticker: str, force: bool = False) -> Optional[dict]:

@@ -396,6 +396,21 @@ export interface PaperAccount {
   error?: string;
 }
 
+export interface UpcomingEarning {
+  ticker: string;
+  company_name: string | null;
+  earnings_date: string; // YYYY-MM-DD
+  days_until: number;
+  last_surprise_pct: number | null;
+  prior_surprise_pct: number | null;
+  composite_score: number | null;
+}
+
+export interface UpcomingEarnings {
+  days: number;
+  earnings: UpcomingEarning[];
+}
+
 // Aggregate expectancy across all closed trades (Portfolio → Edge Statistics).
 export interface EdgeStats {
   n: number;

@@ -6,6 +6,7 @@ import {
   AnalyticsData, FactorContributionData, GateRejectionsData, DrawdownData,
   SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
   EquityHistory, CompanyInfo, PortfolioHistory, EntrySignals, EdgeStats,
+  UpcomingEarnings,
 } from "./types";
 
 export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -127,6 +128,12 @@ export async function fetchWatchlistSnapshot(): Promise<SnapshotData[]> {
   if (!res.ok) throw new Error("Failed to fetch watchlist snapshot");
   const data = await res.json();
   return data.snapshots ?? [];
+}
+
+export async function fetchUpcomingEarnings(days = 30): Promise<UpcomingEarnings> {
+  const res = await fetch(`${BASE}/api/earnings/upcoming?days=${days}`);
+  if (!res.ok) throw new Error("Failed to fetch upcoming earnings");
+  return res.json();
 }
 
 // Explicit live recompute of a single ticker; returns its refreshed snapshot.

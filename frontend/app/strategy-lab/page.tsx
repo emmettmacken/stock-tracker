@@ -7,6 +7,7 @@ import { AllocationTable } from "@/components/v3/portfolio/AllocationTable";
 import { PortfolioBacktestPanel } from "@/components/v3/portfolio/PortfolioBacktestPanel";
 import { scoreTextColor } from "@/components/v3/FactorScorePill";
 import { Skeleton } from "@/components/v3/Skeleton";
+import { UpcomingEarnings } from "@/components/v4/UpcomingEarnings";
 
 export default function PortfolioPage() {
   const [watchlist, setWatchlist] = useState<string[]>([]);
@@ -87,6 +88,10 @@ export default function PortfolioPage() {
             Size positions and backtest multi-ticker portfolios using composite factor signals.
           </p>
         </header>
+
+        <div className="mb-8">
+          <UpcomingEarnings />
+        </div>
 
         <div className="flex gap-6 items-start">
           {/* Sidebar */}
