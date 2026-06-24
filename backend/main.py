@@ -3916,12 +3916,19 @@ def api_portfolio_history(period: str = "1D"):
             start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
             req = GetPortfolioHistoryRequest(start=start, end=now, timeframe="1D")
         elif period in ("1Y", "Max"):
-            # Both show the full account history: account creation → now. Fall back to a
-            # long period if the creation date couldn't be fetched (so the chart still loads).
-            req = (GetPortfolioHistoryRequest(start=created_at, timeframe="1D") if created_at is not None
+            # Both show the full account history: account creation → now (the account is
+            # <1 year old, so 1Y and Max are the same window). Explicit end=now for the same
+            # reason as YTD — a lone start lets Alpaca return an all-zero placeholder series.
+            # Fall back to a long period if the creation date couldn't be fetched (so the
+            # chart still loads).
+            now = datetime.now(timezone.utc)
+            req = (GetPortfolioHistoryRequest(start=created_at, end=now, timeframe="1D")
+                   if created_at is not None
                    else GetPortfolioHistoryRequest(period="1A", timeframe="1D"))
-        else:  # 1M, 3M
-            req = GetPortfolioHistoryRequest(period=period, timeframe="1D")
+        else:  # 1M, 3M — explicit rolling start/end window at daily bars
+            now = datetime.now(timezone.utc)
+            start = now - timedelta(days=30 if period == "1M" else 90)
+            req = GetPortfolioHistoryRequest(start=start, end=now, timeframe="1D")
 
         hist = _alpaca_client.get_portfolio_history(req)
         tstamps  = getattr(hist, "timestamp", None) or []
