@@ -11,6 +11,9 @@ import {
   triggerSignalJob, fetchPaperPositions,
   fetchSignalLog, fetchTradeHistory, fetchBriefing,
 } from "@/lib/api";
+import {
+  useTimezone, formatEtScheduledTime, TIMEZONE_OPTIONS,
+} from "@/lib/timezone";
 
 // Short, glanceable label for a skip-reason key (for the one-line run summary).
 const SHORT_SKIP: Record<string, string> = {
@@ -86,10 +89,32 @@ function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void 
   );
 }
 
+function TimezoneSelector({
+  value, onChange,
+}: { value: string; onChange: (v: string) => void }) {
+  return (
+    <label className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+      <span className="uppercase tracking-widest">Timezone</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label="Display timezone"
+        className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-200
+          hover:border-zinc-700 focus:border-zinc-600 focus:outline-none transition-colors"
+      >
+        {TIMEZONE_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>{o.label}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 export default function AutomationPage() {
   const [activeTab, setActiveTab] = useState<Tab>("Overview");
   const [running, setRunning] = useState(false);
   const [runMsg, setRunMsg] = useState<string | null>(null);
+  const { choice: tzChoice, setChoice: setTzChoice, timeZone, mounted: tzReady } = useTimezone();
 
   // ── Shared data state (single 60s polling interval) ──────────────────────────
   const [positionsData, setPositionsData] = useState<{
@@ -166,10 +191,13 @@ export default function AutomationPage() {
           <div>
             <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight text-white text-balance">Automation</h1>
             <p className="mt-1.5 text-zinc-400 text-sm leading-relaxed">
-              Paper trading runs daily at 15:30 ET · stop-loss check at 09:35 ET
+              {tzReady
+                ? `Paper trading runs daily at ${formatEtScheduledTime(15, 30, timeZone)} · stop-loss check at ${formatEtScheduledTime(9, 35, timeZone)}`
+                : "Paper trading runs daily at 15:30 ET · stop-loss check at 09:35 ET"}
             </p>
           </div>
           <div className="flex flex-col items-end gap-1.5">
+            <TimezoneSelector value={tzChoice} onChange={setTzChoice} />
             <button
               onClick={handleRunNow}
               disabled={running}
@@ -234,6 +262,7 @@ export default function AutomationPage() {
                 data={positionsData}
                 loading={positionsLoading}
                 lastUpdated={overviewUpdated}
+                timeZone={tzReady ? timeZone : undefined}
               />
             </section>
           </div>

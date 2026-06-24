@@ -9,9 +9,10 @@ interface Props {
   data: { available: boolean; positions?: PaperPosition[]; error?: string } | null;
   loading: boolean;
   lastUpdated: Date | null;
+  timeZone?: string;
 }
 
-export function PositionsTable({ data, loading, lastUpdated }: Props) {
+export function PositionsTable({ data, loading, lastUpdated, timeZone }: Props) {
   if (loading) return <Skeleton className="h-32 w-full" />;
 
   if (!data || !data.available) {
@@ -100,7 +101,9 @@ export function PositionsTable({ data, loading, lastUpdated }: Props) {
         </table>
       </div>
       <p className="text-zinc-700 text-[10px] mt-2">
-        {lastUpdated ? `Last updated ${lastUpdated.toLocaleTimeString()}` : ""} · auto-refreshes every 60s
+        {lastUpdated
+          ? `Last updated ${lastUpdated.toLocaleTimeString([], timeZone ? { timeZone } : undefined)}`
+          : ""} · auto-refreshes every 60s
       </p>
     </div>
   );
