@@ -1716,9 +1716,19 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     # macro-aware threshold; this is a static, display-only mapping for the watchlist).
     signal = _composite_signal(round(composite, 2))
 
-    c_lag   = closes[:-21] if len(closes) > 21 else closes
-    ret_3m  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 63  else None
-    ret_12m = float(c_lag[-1] / c_lag[-252] - 1.0) if len(c_lag) >= 252 else None
+    # Display-only true trailing returns: end at the latest close (no 21-day skip).
+    # The skip is intentional for _momentum_score's 12-1 z-score (avoids short-term
+    # reversal) but is misleading for a field the UI labels plainly "3-month return",
+    # so the displayed numbers measure today vs 63/252 trading days ago.
+    ret_3m  = float(closes[-1] / closes[-64]  - 1.0) if len(closes) >= 64  else None
+    ret_12m = float(closes[-1] / closes[-253] - 1.0) if len(closes) >= 253 else None
+
+    # Skip-21 returns feeding the live momentum-disagreement gate (matches the
+    # backtest's ret_3m_bt/ret_12m_bt, which skip the most recent 21 days). Kept
+    # separate from the display fields above so the gate's input never changes.
+    c_lag        = closes[:-21] if len(closes) > 21 else closes
+    ret_3m_skip  = float(c_lag[-1] / c_lag[-63]  - 1.0) if len(c_lag) >= 63  else None
+    ret_12m_skip = float(c_lag[-1] / c_lag[-252] - 1.0) if len(c_lag) >= 252 else None
 
     # Display-only: day-over-day price change for the snapshot/homepage cards.
     prev_close = float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
@@ -1754,6 +1764,9 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         "mom_score":           round(mom_score, 2) if mom_score is not None else None,
         "ret_3m":              ret_3m,
         "ret_12m":             ret_12m,
+        # Internal (not displayed): skip-21 momentum returns for the live disagreement gate
+        "ret_3m_skip":         ret_3m_skip,
+        "ret_12m_skip":        ret_12m_skip,
         # Display-only raw breakdowns for the stock detail page (never used in scoring)
         "vol_trend_detail":    vt_detail,
         "earnings_detail":     earn_detail,
@@ -3221,8 +3234,9 @@ def _run_signal_job() -> None:
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob)
                 continue
-            ret_3m  = result.get("ret_3m")
-            ret_12m = result.get("ret_12m")
+            # Gate uses the skip-21 returns (matches the backtest), not the display fields
+            ret_3m  = result.get("ret_3m_skip")
+            ret_12m = result.get("ret_12m_skip")
             if ret_3m is not None and ret_12m is not None:
                 if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
                     db.log_signal(ticker, effective_composite, "BUY", "skipped",
