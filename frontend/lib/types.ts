@@ -177,8 +177,7 @@ export interface SectorBucket {
   sector: string;
   count: number;
   tickers: string[];
-  market_value: number;
-  // Real share of invested capital (sum of open position market values).
+  // Slot usage as a percentage: open positions / MAX_SECTOR_POSITIONS, capped at 100.
   pct: number;
   at_cap: boolean;
   near_cap: boolean;
@@ -189,8 +188,6 @@ export interface SectorExposure {
   error?: string;
   max_per_sector: number;
   total_positions: number;
-  equity: number;
-  invested_value: number;
   sectors: SectorBucket[];
 }
 

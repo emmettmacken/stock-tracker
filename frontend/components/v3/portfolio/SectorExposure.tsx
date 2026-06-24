@@ -54,14 +54,8 @@ export function SectorExposurePanel() {
               </span>
             </div>
             <span className="w-40 shrink-0 text-right text-[11px] leading-tight tabular-nums">
-              <span className="block">
-                <span className="text-zinc-300 font-medium">{s.pct.toFixed(1)}%</span>
-                <span className="text-zinc-500"> of invested capital</span>
-              </span>
-              <span className="block">
-                <span className="text-zinc-300 font-medium">{s.count} of {data.max_per_sector}</span>
-                <span className="text-zinc-500"> sector slots</span>
-              </span>
+              <span className="text-zinc-300 font-medium">{s.count} of {data.max_per_sector}</span>
+              <span className="text-zinc-500"> slots</span>
             </span>
             {(s.at_cap || s.near_cap) && (
               <span
