@@ -3906,40 +3906,52 @@ def api_paper_sector_exposure():
     """Sector breakdown of currently open Alpaca positions.
 
     Read-only: reuses the cached _get_sector lookup (same data the concentration gate
-    uses) to count open positions per sector. No new sector fetching logic, no scoring.
+    uses) to bucket open positions per sector. Each sector's weight is the real fraction
+    of invested capital its positions occupy — summed from Alpaca's reported market_value
+    per position, divided by total invested value (sum of all open position market values,
+    cash excluded). No new sector fetching logic, no scoring, no sizing.
     """
     if _alpaca_client is None:
         return {"available": False, "error": _alpaca_err}
     try:
         positions = _alpaca_client.get_all_positions()
+        equity = float(_alpaca_client.get_account().equity)
     except Exception as e:
         return {"available": False, "error": str(e)}
 
     max_per_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
-    buckets: dict[str, list[str]] = {}
+    # Bucket per sector, tracking both the ticker list and summed market value.
+    buckets: dict[str, dict] = {}
     for pos in positions:
         sector = _get_sector(pos.symbol)
-        buckets.setdefault(sector, []).append(pos.symbol)
+        b = buckets.setdefault(sector, {"tickers": [], "value": 0.0})
+        b["tickers"].append(pos.symbol)
+        b["value"] += float(pos.market_value)
 
-    total = sum(len(v) for v in buckets.values())
+    total = sum(len(b["tickers"]) for b in buckets.values())
+    invested_value = sum(b["value"] for b in buckets.values())
     sectors = sorted(
         (
             {
                 "sector": sec,
-                "count": len(tks),
-                "tickers": sorted(tks),
-                "pct": round(len(tks) / total * 100, 1) if total else 0.0,
-                "at_cap": len(tks) >= max_per_sector,
-                "near_cap": len(tks) == max_per_sector - 1,
+                "count": len(b["tickers"]),
+                "tickers": sorted(b["tickers"]),
+                "market_value": round(b["value"], 2),
+                # Real share of invested capital (sum of open position market values).
+                "pct": round(b["value"] / invested_value * 100, 1) if invested_value else 0.0,
+                "at_cap": len(b["tickers"]) >= max_per_sector,
+                "near_cap": len(b["tickers"]) == max_per_sector - 1,
             }
-            for sec, tks in buckets.items()
+            for sec, b in buckets.items()
         ),
-        key=lambda x: x["count"], reverse=True,
+        key=lambda x: x["market_value"], reverse=True,
     )
     return {
         "available": True,
         "max_per_sector": max_per_sector,
         "total_positions": total,
+        "equity": round(equity, 2),
+        "invested_value": round(invested_value, 2),
         "sectors": sectors,
     }
 
