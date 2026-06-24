@@ -8,7 +8,7 @@ import time
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
@@ -2297,17 +2297,26 @@ def portfolio_sizing(req: SizingRequest):
         tickers = [t.upper() for t in req.tickers]
         signals = {k.upper(): v for k, v in req.signals.items()}
 
-        closes_map: dict[str, np.ndarray] = {}
-        vols_map: dict[str, float] = {}
-        for t in tickers:
+        # Fetch 120-day closes for all tickers in parallel (was a sequential loop ~4s for a
+        # full watchlist). Every ticker still gets an entry in both maps — a failed fetch
+        # falls back to an empty close series and a 0.25 vol prior, exactly as before.
+        closes_map: dict[str, np.ndarray] = {t: np.array([]) for t in tickers}
+        vols_map: dict[str, float] = {t: 0.25 for t in tickers}
+
+        def _fetch_closes(t: str) -> tuple[str, Optional[np.ndarray]]:
             try:
                 df = fetch_ohlcv(t, days=120, min_bars=30)
-                c = df["Close"].values.astype(float)
-                closes_map[t] = c
-                vols_map[t] = _realised_vol(c)
+                return t, df["Close"].values.astype(float)
             except Exception:
-                vols_map[t] = 0.25
-                closes_map[t] = np.array([])
+                return t, None
+
+        with ThreadPoolExecutor(max_workers=min(8, len(tickers)) or 1) as pool:
+            futures = {pool.submit(_fetch_closes, t): t for t in tickers}
+            for fut in as_completed(futures):
+                t, c = fut.result()
+                if c is not None:
+                    closes_map[t] = c
+                    vols_map[t] = _realised_vol(c)
 
         # Scores
         scores = {t: signals[t].composite_score if t in signals else 50.0 for t in tickers}

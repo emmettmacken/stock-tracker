@@ -1,7 +1,7 @@
 "use client";
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { FactorScoreData, SizingResult } from "@/lib/types";
-import { fetchFactors, fetchPortfolioSizing } from "@/lib/api";
+import { fetchWatchlistSnapshot, fetchPortfolioSizing } from "@/lib/api";
 import { loadWatchlist } from "@/lib/watchlist";
 import { AllocationTable } from "@/components/v3/portfolio/AllocationTable";
 import { PortfolioBacktestPanel } from "@/components/v3/portfolio/PortfolioBacktestPanel";
@@ -15,8 +15,7 @@ export default function PortfolioPage() {
   const [method, setMethod] = useState<"kelly" | "vol">("vol");
 
   const [factorData, setFactorData] = useState<Record<string, FactorScoreData>>({});
-  const factorLoadingRef = useRef<Set<string>>(new Set());
-  const [factorLoadingTickers, setFactorLoadingTickers] = useState<Set<string>>(new Set());
+  const [factorsLoading, setFactorsLoading] = useState(true);
 
   const [sizing, setSizing] = useState<SizingResult | null>(null);
   const [sizingLoading, setSizingLoading] = useState(false);
@@ -29,27 +28,22 @@ export default function PortfolioPage() {
     setSelected(list);
   }, []);
 
-  // Fetch factors for any selected ticker we don't have yet
+  // Load factor scores for the whole watchlist in one fast snapshot read instead of
+  // 28 live /api/factors recomputes. The snapshot's `factors` field is the same full
+  // FactorScoreData payload /api/factors returns, so downstream consumers are unchanged.
   useEffect(() => {
-    selected.forEach((ticker) => {
-      if (factorData[ticker] || factorLoadingRef.current.has(ticker)) return;
-      factorLoadingRef.current.add(ticker);
-      setFactorLoadingTickers((prev) => new Set([...prev, ticker]));
-      fetchFactors(ticker)
-        .then((data) => {
-          setFactorData((prev) => ({ ...prev, [ticker]: data }));
-        })
-        .catch(() => {})
-        .finally(() => {
-          factorLoadingRef.current.delete(ticker);
-          setFactorLoadingTickers((prev) => {
-            const next = new Set(prev);
-            next.delete(ticker);
-            return next;
-          });
+    setFactorsLoading(true);
+    fetchWatchlistSnapshot()
+      .then((snapshots) => {
+        const map: Record<string, FactorScoreData> = {};
+        snapshots.forEach((s) => {
+          if (s.factors) map[s.ticker] = s.factors;
         });
-    });
-  }, [selected]); // eslint-disable-line react-hooks/exhaustive-deps
+        setFactorData(map);
+      })
+      .catch(() => {})
+      .finally(() => setFactorsLoading(false));
+  }, []);
 
   const selectedKey = useMemo(() => [...selected].sort().join(","), [selected]);
   const allReady = useMemo(
@@ -82,7 +76,7 @@ export default function PortfolioPage() {
     );
   }
 
-  const loadingCount = factorLoadingTickers.size;
+  const loadingCount = factorsLoading ? selected.filter((t) => !factorData[t]).length : 0;
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -106,7 +100,7 @@ export default function PortfolioPage() {
             <div className="space-y-2">
               {watchlist.map((ticker) => {
                 const fd = factorData[ticker];
-                const isLoading = factorLoadingTickers.has(ticker);
+                const isLoading = factorsLoading && !fd;
                 return (
                   <label
                     key={ticker}
