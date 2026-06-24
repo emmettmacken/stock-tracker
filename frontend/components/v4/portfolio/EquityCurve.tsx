@@ -23,14 +23,14 @@ function isMarketLikelyOpen(now: Date = new Date()): boolean {
 const RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "Max"] as const;
 type Range = (typeof RANGES)[number];
 
-// 1D bars are all from today/yesterday, so the time is what matters — show HH:MM. Every
-// other period is daily bars where the date matters — show DD/MM/YY. All parts come from
-// the same Date object so the day and time can't disagree across the UTC boundary.
-function fmtLabel(iso: string, range: Range): string {
+// Always show date + time (DD/MM HH:MM) across every period so the axis and tooltip stay
+// consistent — 1D bars are intraday and the rest are daily, but a midnight-anchored daily
+// bar still reads cleanly as "00:00". All parts come from the same Date object so the day
+// and time can't disagree across the UTC boundary.
+function fmtLabel(iso: string): string {
   const d = new Date(iso);
   const p = (n: number) => String(n).padStart(2, "0");
-  if (range === "1D") return `${p(d.getHours())}:${p(d.getMinutes())}`;
-  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${p(d.getFullYear() % 100)}`;
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 interface Row {
@@ -127,8 +127,8 @@ export function EquityCurve({ onLiveEquity, showNetDeposits = false, netDeposits
     if (!points) return [];
     return points
       .filter((p) => p.equity != null)
-      .map((p) => ({ ts: p.timestamp, label: fmtLabel(p.timestamp, range), equity: p.equity }));
-  }, [points, range]);
+      .map((p) => ({ ts: p.timestamp, label: fmtLabel(p.timestamp), equity: p.equity }));
+  }, [points]);
 
   // Total return $ and % across the visible window (first → last equity).
   const change = useMemo(() => {
@@ -265,7 +265,7 @@ export function EquityCurve({ onLiveEquity, showNetDeposits = false, netDeposits
               formatter={(v: number) => [fmtUSD(v), "Equity"]}
               labelFormatter={(_l, payload) => {
                 const ts = payload?.[0]?.payload?.ts as string | undefined;
-                return ts ? fmtLabel(ts, range) : "";
+                return ts ? fmtLabel(ts) : "";
               }}
             />
             {/* Net-deposits reference line at the starting balance (opt-in setting). */}

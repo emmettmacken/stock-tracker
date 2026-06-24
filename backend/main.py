@@ -3907,8 +3907,14 @@ def api_portfolio_history(period: str = "1D"):
                 intraday_reporting="extended_hours",
             )
         elif period == "YTD":
-            start = datetime(datetime.utcnow().year, 1, 1)
-            req = GetPortfolioHistoryRequest(start=start, timeframe="1D")
+            # Jan 1 of the current year → now, both tz-aware. The explicit `end` matters:
+            # given only a `start` that predates account creation, Alpaca returns a short
+            # all-zero placeholder series (which the eq<=0 / pre-creation filters then drop
+            # entirely, leaving the chart empty). Passing end=now yields the full daily
+            # series including the real post-creation equity.
+            now = datetime.now(timezone.utc)
+            start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+            req = GetPortfolioHistoryRequest(start=start, end=now, timeframe="1D")
         elif period in ("1Y", "Max"):
             # Both show the full account history: account creation → now. Fall back to a
             # long period if the creation date couldn't be fetched (so the chart still loads).

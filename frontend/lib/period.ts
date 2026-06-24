@@ -4,7 +4,7 @@
 export const PERIODS = ["1D", "1W", "1M", "3M", "YTD", "1Y", "Max"] as const;
 export type Period = (typeof PERIODS)[number];
 
-export const DEFAULT_PERIOD: Period = "3M";
+export const DEFAULT_PERIOD: Period = "1D";
 
 // Human label for inline copy, e.g. "3M: +8.2%".
 export const PERIOD_LABEL: Record<Period, string> = {
