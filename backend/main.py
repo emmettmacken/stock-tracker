@@ -194,8 +194,9 @@ _PRICE_HISTORY_LOCK = threading.Lock()
 # (see _history_ttl): 1D every minute, 1W every 5 min, longer ranges every 10 min.
 _PORTFOLIO_HISTORY_CACHE: dict[str, tuple[dict, float]] = {}  # period → (result, timestamp)
 
-# Selector periods the /api/portfolio/history endpoint accepts. 1D is served from our own
-# equity_snapshots; the rest map to an Alpaca portfolio-history request (all at 1D bars).
+# Selector periods the /api/portfolio/history endpoint accepts. 1D is a rolling 24h window
+# from Alpaca (1Min bars, extended hours), with equity_snapshots as fallback; the rest map
+# to an Alpaca portfolio-history request at 1D bars.
 _HISTORY_PERIODS = {"1D", "1W", "1M", "3M", "YTD", "1Y", "Max"}
 
 # Account creation date (start of the 1Y / Max curves), fetched from Alpaca once per
@@ -3823,10 +3824,11 @@ def api_paper_equity_history(days: int = 30):
 def api_portfolio_history(period: str = "1D"):
     """Account equity curve for the /portfolio page. Read-only, cached per period.
 
-    `period` ∈ {1D,1W,1M,3M,YTD,1Y,Max}. 1D is built from our own equity_snapshots
-    (the last 24h); every other period comes from Alpaca's portfolio-history endpoint
-    at 1D bars — 1W/1M/3M by Alpaca period, YTD from Jan 1, and 1Y/Max from the account
-    creation date (both show the full account history).
+    `period` ∈ {1D,1W,1M,3M,YTD,1Y,Max}. 1D is a rolling now-24h→now window from Alpaca
+    (1Min bars, extended-hours reporting — matches Alpaca's own dashboard), with our
+    equity_snapshots as a fallback. Every other period comes from Alpaca's portfolio-history
+    endpoint at 1D bars — 1W/1M/3M by Alpaca period, YTD from Jan 1, and 1Y/Max from the
+    account creation date (both show the full account history).
     Returns {available, period, points: [{timestamp: ISO string, equity: number}]}.
     """
     if period == "all":  # legacy alias from older frontends
@@ -3838,18 +3840,49 @@ def api_portfolio_history(period: str = "1D"):
     if cached is not None and (time.time() - ts) < _history_ttl(period):
         return cached
 
-    # 1D: rolling 24h window from our own snapshots (Alpaca's intraday history clamps to
-    # the current session and can't return a true rolling-24h window).
+    # 1D: rolling 24h window matching Alpaca's own dashboard — a true now-24h→now span at
+    # 1-minute bars with extended_hours reporting. This yields pre/post-market activity and
+    # a single overnight gap (post-market close ~00:00 UTC → pre-market open ~08:00 UTC) that
+    # the chart renders as the flat overnight line. Our equity_snapshots DB is the fallback
+    # if Alpaca is unavailable or returns too few points.
     if period == "1D":
-        try:
-            snaps = db.get_equity_snapshots(int(time.time() - 24 * 3600))
-        except Exception as e:
-            return {"available": False, "error": str(e), "period": period}
-        points = [
-            {"timestamp": datetime.utcfromtimestamp(int(s["ts"])).isoformat() + "Z",
-             "equity": round(float(s["equity"]), 2)}
-            for s in snaps if s["equity"] is not None and float(s["equity"]) > 0
-        ]
+        points: list[dict] = []
+        if _alpaca_client is not None:
+            try:
+                now = datetime.now(timezone.utc)
+                req = GetPortfolioHistoryRequest(
+                    start=now - timedelta(hours=24),
+                    end=now,
+                    timeframe="1Min",
+                    extended_hours=True,
+                    intraday_reporting="extended_hours",
+                )
+                hist = _alpaca_client.get_portfolio_history(req)
+                tstamps  = getattr(hist, "timestamp", None) or []
+                equities = getattr(hist, "equity", None) or []
+                for t, e in zip(tstamps, equities):
+                    if e is None:
+                        continue
+                    eq = float(e)
+                    if eq <= 0:
+                        continue
+                    points.append({"timestamp": datetime.utcfromtimestamp(int(t)).isoformat() + "Z",
+                                   "equity": round(eq, 2)})
+            except Exception:
+                points = []  # fall through to the equity_snapshots fallback below
+
+        # Fallback: rebuild from our own rolling-24h snapshots when Alpaca gave us nothing.
+        if not points:
+            try:
+                snaps = db.get_equity_snapshots(int(time.time() - 24 * 3600))
+            except Exception as e:
+                return {"available": False, "error": str(e), "period": period}
+            points = [
+                {"timestamp": datetime.utcfromtimestamp(int(s["ts"])).isoformat() + "Z",
+                 "equity": round(float(s["equity"]), 2)}
+                for s in snaps if s["equity"] is not None and float(s["equity"]) > 0
+            ]
+
         result = {"available": True, "period": period, "points": points}
         _PORTFOLIO_HISTORY_CACHE[period] = (result, time.time())
         return result
