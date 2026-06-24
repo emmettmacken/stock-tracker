@@ -3826,9 +3826,10 @@ def api_portfolio_history(period: str = "1D"):
 
     `period` ∈ {1D,1W,1M,3M,YTD,1Y,Max}. 1D is a rolling now-24h→now window from Alpaca
     (1Min bars, extended-hours reporting — matches Alpaca's own dashboard), with our
-    equity_snapshots as a fallback. Every other period comes from Alpaca's portfolio-history
-    endpoint at 1D bars — 1W/1M/3M by Alpaca period, YTD from Jan 1, and 1Y/Max from the
-    account creation date (both show the full account history).
+    equity_snapshots as a fallback. 1W is likewise a rolling now-7d→now window from Alpaca
+    (1Hour bars, extended-hours reporting). Every other period comes from Alpaca's
+    portfolio-history endpoint at 1D bars — 1M/3M by Alpaca period, YTD from Jan 1, and
+    1Y/Max from the account creation date (both show the full account history).
     Returns {available, period, points: [{timestamp: ISO string, equity: number}]}.
     """
     if period == "all":  # legacy alias from older frontends
@@ -3893,7 +3894,19 @@ def api_portfolio_history(period: str = "1D"):
     created_at = _get_account_created_at()
 
     try:
-        if period == "YTD":
+        if period == "1W":
+            # Rolling 7-day window at hourly bars with extended-hours reporting — same
+            # pattern as the 1D fix. Gives pre/post-market each day plus the overnight
+            # gaps that render as flat lines, matching Alpaca's dashboard.
+            now = datetime.now(timezone.utc)
+            req = GetPortfolioHistoryRequest(
+                start=now - timedelta(days=7),
+                end=now,
+                timeframe="1H",  # portfolio-history's hourly bar (not "1Hour", which it rejects)
+                extended_hours=True,
+                intraday_reporting="extended_hours",
+            )
+        elif period == "YTD":
             start = datetime(datetime.utcnow().year, 1, 1)
             req = GetPortfolioHistoryRequest(start=start, timeframe="1D")
         elif period in ("1Y", "Max"):
@@ -3901,7 +3914,7 @@ def api_portfolio_history(period: str = "1D"):
             # long period if the creation date couldn't be fetched (so the chart still loads).
             req = (GetPortfolioHistoryRequest(start=created_at, timeframe="1D") if created_at is not None
                    else GetPortfolioHistoryRequest(period="1A", timeframe="1D"))
-        else:  # 1W, 1M, 3M
+        else:  # 1M, 3M
             req = GetPortfolioHistoryRequest(period=period, timeframe="1D")
 
         hist = _alpaca_client.get_portfolio_history(req)
