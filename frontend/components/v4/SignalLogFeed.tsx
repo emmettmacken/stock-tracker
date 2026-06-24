@@ -1,4 +1,5 @@
 "use client";
+import { useMemo, useState } from "react";
 import { SignalLogEntry } from "@/lib/types";
 import { SignalBadge } from "@/components/SignalBadge";
 import { Skeleton } from "@/components/v3/Skeleton";
@@ -62,6 +63,136 @@ function relTime(ts: string) {
   }
 }
 
+// Local-timezone YYYY-MM-DD for a date. Timestamps from the API carry no
+// zone suffix and are UTC, so we append "Z" before reading local calendar
+// fields — an entry from late-UTC yesterday lands in today's group in Ireland.
+function localDateKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function entryDate(ts: string): Date {
+  const d = new Date(ts + "Z");
+  return isNaN(d.getTime()) ? new Date(ts) : d;
+}
+
+// "Tuesday, 24 June 2026" — built from a local-midnight Date so no zone shift.
+function formatDateLabel(key: string): string {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-GB", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+interface DateGroup {
+  key: string;
+  label: string;
+  entries: SignalLogEntry[];
+}
+
+function groupByDate(entries: SignalLogEntry[]): DateGroup[] {
+  // Sort newest-first so both the groups and the rows within them descend.
+  const sorted = [...entries].sort(
+    (a, b) => entryDate(b.timestamp).getTime() - entryDate(a.timestamp).getTime()
+  );
+  const groups: DateGroup[] = [];
+  const byKey = new Map<string, DateGroup>();
+  for (const e of sorted) {
+    const key = localDateKey(entryDate(e.timestamp));
+    let group = byKey.get(key);
+    if (!group) {
+      group = { key, label: formatDateLabel(key), entries: [] };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.entries.push(e);
+  }
+  return groups;
+}
+
+function EntryRow({ e }: { e: SignalLogEntry }) {
+  return (
+    <div
+      className="flex items-start gap-3 bg-zinc-900 border border-zinc-800/60 rounded-lg px-3 py-2.5 text-xs
+        hover:border-zinc-700/80 transition-colors duration-150 ease-out-quart"
+    >
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-bold text-zinc-200">{e.ticker}</span>
+          {e.signal && <SignalBadge signal={e.signal as "BUY" | "SELL" | "HOLD"} />}
+          <ActionPill action={e.action} />
+          {e.composite_score != null && (
+            <span className="text-zinc-500 tabular-nums">score {e.composite_score.toFixed(1)}</span>
+          )}
+        </div>
+        {e.skip_reason && (
+          <div className="text-zinc-600 text-[10px] mt-0.5 truncate">
+            {formatSkipReason(e.skip_reason)}
+          </div>
+        )}
+      </div>
+      <div className="text-zinc-600 text-[10px] shrink-0 text-right">
+        <div>{relTime(e.timestamp)}</div>
+        {e.price_at_signal != null && (
+          <div className="text-zinc-700">${e.price_at_signal.toFixed(2)}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DateSection({
+  group,
+  open,
+  onToggle,
+}: {
+  group: DateGroup;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const count = group.entries.length;
+  return (
+    <div>
+      <button
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 text-left py-1.5"
+      >
+        <svg
+          width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden
+          className={`text-zinc-500 transition-transform duration-150 ease-out-quart ${open ? "rotate-90" : ""}`}
+        >
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+        <span className="text-sm font-medium text-zinc-200">{group.label}</span>
+        <span className="inline-flex px-1.5 py-0.5 rounded-full bg-zinc-800 text-zinc-500 text-[10px] font-medium">
+          {count} signal{count === 1 ? "" : "s"}
+        </span>
+      </button>
+      {/* grid-rows 0fr↔1fr gives a CSS-only smooth height transition. */}
+      <div
+        className={`grid transition-[grid-template-rows] duration-200 ease-out-quart ${
+          open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+        }`}
+      >
+        <div className="overflow-hidden">
+          <div className="space-y-1.5 pl-6 pt-1 pb-1">
+            {group.entries.map((e) => (
+              <EntryRow key={e.id} e={e} />
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface Props {
   entries: SignalLogEntry[] | null;
   loading: boolean;
@@ -89,37 +220,31 @@ export function SignalLogFeed({ entries, loading, error, onRetry }: Props) {
     </div>
   );
 
+  return <GroupedLog entries={entries} />;
+}
+
+function GroupedLog({ entries }: { entries: SignalLogEntry[] }) {
+  const groups = useMemo(() => groupByDate(entries), [entries]);
+  const todayKey = localDateKey(new Date());
+  // Explicit toggles only; a key absent from this map falls back to the
+  // default (today expanded, every earlier day collapsed).
+  const [overrides, setOverrides] = useState<Record<string, boolean>>({});
+
   return (
-    <div className="space-y-1.5">
-      {entries.map((e) => (
-        <div
-          key={e.id}
-          className="flex items-start gap-3 bg-zinc-900 border border-zinc-800/60 rounded-lg px-3 py-2.5 text-xs
-            hover:border-zinc-700/80 transition-colors duration-150 ease-out-quart"
-        >
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="font-bold text-zinc-200">{e.ticker}</span>
-              {e.signal && <SignalBadge signal={e.signal as "BUY" | "SELL" | "HOLD"} />}
-              <ActionPill action={e.action} />
-              {e.composite_score != null && (
-                <span className="text-zinc-500 tabular-nums">score {e.composite_score.toFixed(1)}</span>
-              )}
-            </div>
-            {e.skip_reason && (
-              <div className="text-zinc-600 text-[10px] mt-0.5 truncate">
-                {formatSkipReason(e.skip_reason)}
-              </div>
-            )}
-          </div>
-          <div className="text-zinc-600 text-[10px] shrink-0 text-right">
-            <div>{relTime(e.timestamp)}</div>
-            {e.price_at_signal != null && (
-              <div className="text-zinc-700">${e.price_at_signal.toFixed(2)}</div>
-            )}
-          </div>
-        </div>
-      ))}
+    <div className="space-y-1">
+      {groups.map((group) => {
+        const open = overrides[group.key] ?? group.key === todayKey;
+        return (
+          <DateSection
+            key={group.key}
+            group={group}
+            open={open}
+            onToggle={() =>
+              setOverrides((prev) => ({ ...prev, [group.key]: !open }))
+            }
+          />
+        );
+      })}
     </div>
   );
 }
