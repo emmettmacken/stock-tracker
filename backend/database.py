@@ -152,6 +152,26 @@ def _run_migrations() -> None:
             f"[migrations] signal_log has {len(after_cols)} columns after migration — "
             f"{'added ' + ', '.join(added) if added else 'no schema changes'}"
         )
+    _migrate_config_baselines()
+
+
+def _migrate_config_baselines() -> None:
+    """One-time correction of stale threshold config.
+
+    The bull threshold default was lowered from 70 → 63 (BULL_MIN), but the
+    value persisted in system_config predates that change and stays stale at 70
+    forever: get_config's "63" default only applies when the key is absent, and
+    the adaptive job either skips (preserving the old value) or drifts it back
+    up. Reset bull/bear to the intended baseline once — guarded by a marker key
+    so a later legitimate adaptive adjustment isn't clobbered on every restart.
+    """
+    MARKER = "threshold_baseline_v2_applied"
+    if get_config(MARKER):
+        return
+    set_config("bull_threshold", "63")
+    set_config("bear_threshold", "80")
+    set_config(MARKER, datetime.utcnow().isoformat())
+    print("[migrations] reset threshold baseline → bull 63 / bear 80 (one-time)")
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
