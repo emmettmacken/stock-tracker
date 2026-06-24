@@ -479,6 +479,8 @@ def fetch_ohlcv_window(
     interval: str = "1d",
     yf_period: Optional[str] = None,
     start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    prepost: bool = False,
     min_bars: int = 2,
     max_retries: int = 3,
 ) -> pd.DataFrame:
@@ -488,19 +490,29 @@ def fetch_ohlcv_window(
     daily (1M/3M/YTD/1Y). yfinance only serves intraday bars for recent windows (1m ≤ 30d,
     15m ≤ 60d), which is fine since 1D/1W are recent by definition. Separate from fetch_ohlcv
     (the 760-day signal window) and fetch_ohlcv_max (full daily history) so none constrains
-    the others. Pass either `start` (e.g. YTD's Jan 1) or `yf_period` (e.g. "1mo")."""
+    the others. Pass either `start`/`end` (e.g. 1D's rolling 24h window, or YTD's Jan 1) or
+    `yf_period` (e.g. "1mo"). `prepost=True` includes pre-market/after-hours bars (intraday)."""
     last_exc = None
     for attempt in range(max_retries):
         try:
-            kwargs = dict(interval=interval, auto_adjust=True, raise_errors=True)
+            kwargs = dict(interval=interval, auto_adjust=True, raise_errors=True,
+                          prepost=prepost)
             if start is not None:
-                kwargs["start"] = start.strftime("%Y-%m-%d")
+                kwargs["start"] = start
+                if end is not None:
+                    kwargs["end"] = end
             else:
                 kwargs["period"] = yf_period
             df = yf.Ticker(ticker).history(**kwargs)
             if df.empty or len(df) < min_bars:
                 raise HTTPException(status_code=404, detail=f"Insufficient data for '{ticker}'")
-            return df[["High", "Low", "Close", "Volume"]].dropna()
+            # Drop NaN rows and any zero-close bars (yfinance occasionally emits empty
+            # pre/post-market placeholder rows with Close == 0).
+            df = df[["High", "Low", "Close", "Volume"]].dropna()
+            df = df[df["Close"] > 0]
+            if len(df) < min_bars:
+                raise HTTPException(status_code=404, detail=f"Insufficient data for '{ticker}'")
+            return df
         except HTTPException:
             raise
         except Exception as exc:
@@ -580,10 +592,13 @@ def _project_points(df: pd.DataFrame, intraday: bool = False) -> list:
     ]
 
 
-# Stock-chart intraday periods → yfinance interval + window (1D/1W only).
+# Stock-chart intraday periods → yfinance interval + window (1D/1W only). Both fetch
+# pre/post-market bars (prepost). 1D uses a rolling 24h start/end window (not yfinance
+# period="1d", which only covers the regular 9:30–16:00 ET session) so the chart matches
+# the portfolio equity curve: pre-market from ~04:00 ET and after-hours to ~20:00 ET.
 _CHART_INTRADAY_SPEC = {
-    "1D": {"interval": "1m",  "yf_period": "1d"},
-    "1W": {"interval": "15m", "yf_period": "5d"},
+    "1D": {"interval": "1m",  "window_hours": 24, "prepost": True},
+    "1W": {"interval": "15m", "yf_period": "5d",  "prepost": True},
 }
 # Daily-interval periods → calendar-day lookback for the *visible* window. 1Y uses 366 to
 # cover leap years; YTD is handled separately (visible window starts at Jan 1).
@@ -627,8 +642,16 @@ def get_price_history(ticker: str, days: int = 760, period: Optional[str] = None
 
         spec = _CHART_INTRADAY_SPEC.get(period)
         if spec:
-            df = fetch_ohlcv_window(ticker, interval=spec["interval"],
-                                    yf_period=spec["yf_period"], min_bars=2)
+            if spec.get("window_hours"):
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(hours=spec["window_hours"])
+                df = fetch_ohlcv_window(ticker, interval=spec["interval"],
+                                        start=start, end=end,
+                                        prepost=spec.get("prepost", False), min_bars=2)
+            else:
+                df = fetch_ohlcv_window(ticker, interval=spec["interval"],
+                                        yf_period=spec["yf_period"],
+                                        prepost=spec.get("prepost", False), min_bars=2)
             return {"ticker": ticker, "period": period, "intraday": True,
                     "points": _project_points(df, intraday=True)}
 
