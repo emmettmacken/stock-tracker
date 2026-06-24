@@ -44,15 +44,19 @@ export function UpcomingEarnings() {
   const [openPositions, setOpenPositions] = useState<Set<string>>(new Set());
 
   // Open positions drive the earnings-blackout warning badge. Fetched independently — a
-  // failure here just means no badges, never an error on the earnings table itself.
+  // failure here just means no badges, never an error on the earnings table itself — but
+  // it's logged (not swallowed) so a silently-empty position set is diagnosable. Tickers
+  // are uppercased so the badge lookup is case-insensitive against the earnings rows.
   useEffect(() => {
     fetchPaperPositions()
       .then((res) => {
         if (res.available && res.positions) {
-          setOpenPositions(new Set(res.positions.map((p) => p.ticker)));
+          setOpenPositions(new Set(res.positions.map((p) => p.ticker.toUpperCase())));
+        } else {
+          console.warn("Upcoming earnings: open positions unavailable", res.error);
         }
       })
-      .catch(() => {});
+      .catch((e) => console.warn("Upcoming earnings: open positions fetch failed", e));
   }, []);
 
   useEffect(() => {
@@ -124,7 +128,7 @@ export function UpcomingEarnings() {
             </thead>
             <tbody className="divide-y divide-zinc-900">
               {earnings.map((e) => {
-                const blackout = e.days_until <= 2 && openPositions.has(e.ticker);
+                const blackout = e.days_until <= 2 && openPositions.has(e.ticker.toUpperCase());
                 return (
                   <tr key={e.ticker} className="text-zinc-300">
                     <td className="py-2 pr-3">
@@ -135,13 +139,17 @@ export function UpcomingEarnings() {
                         {e.ticker}
                       </Link>
                     </td>
-                    <td className="py-2 pr-3 text-zinc-400 max-w-[200px] truncate">
-                      {e.company_name ?? "—"}
-                      {blackout && (
-                        <span className="ml-2 inline-block rounded bg-yellow-500/15 px-1.5 py-0.5 text-[10px] font-medium text-yellow-400 align-middle whitespace-nowrap">
-                          ⚠ Open position — earnings blackout active
+                    <td className="py-2 pr-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-zinc-400 max-w-[200px] truncate">
+                          {e.company_name ?? "—"}
                         </span>
-                      )}
+                        {blackout && (
+                          <span className="shrink-0 rounded bg-yellow-500/15 px-1.5 py-0.5 text-[10px] font-medium text-yellow-400 whitespace-nowrap">
+                            ⚠ Open position — earnings blackout active
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="py-2 pr-3 tabular-nums text-zinc-400">{fmtDate(e.earnings_date)}</td>
                     <td className="py-2 pr-3 text-zinc-400">{fmtDaysUntil(e.days_until)}</td>
