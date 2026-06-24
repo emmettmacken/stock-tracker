@@ -3,7 +3,8 @@ import {
   FactorScoreData, SentimentData, InsiderData, ShortInterestData,
   SizingResult, PortfolioBacktestResult,
   WatchlistTicker, SignalLogEntry, TradeOutcome, PaperPosition, PaperAccount,
-  AnalyticsData, SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
+  AnalyticsData, FactorContributionData, GateRejectionsData, DrawdownData,
+  SnapshotData, DecisionTrail, PriceHistory, Briefing, SectorExposure,
   EquityHistory, CompanyInfo, PortfolioHistory, EntrySignals, EdgeStats,
 } from "./types";
 
@@ -276,6 +277,24 @@ export async function triggerSignalJob(): Promise<{ status: string; message: str
 export async function fetchAnalytics(): Promise<AnalyticsData> {
   const res = await fetch(`${BASE}/api/analytics`);
   if (!res.ok) throw new Error("Failed to fetch analytics");
+  return res.json();
+}
+
+export async function fetchFactorContribution(): Promise<FactorContributionData> {
+  const res = await fetch(`${BASE}/api/analytics/factor-contribution`);
+  if (!res.ok) throw new Error("Failed to fetch factor contribution");
+  return res.json();
+}
+
+export async function fetchGateRejections(): Promise<GateRejectionsData> {
+  const res = await fetch(`${BASE}/api/analytics/gate-rejections`);
+  if (!res.ok) throw new Error("Failed to fetch gate rejections");
+  return res.json();
+}
+
+export async function fetchDrawdown(): Promise<DrawdownData> {
+  const res = await fetch(`${BASE}/api/analytics/drawdown`);
+  if (!res.ok) throw new Error("Failed to fetch drawdown");
   return res.json();
 }
 

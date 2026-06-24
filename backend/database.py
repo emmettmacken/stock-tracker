@@ -397,6 +397,39 @@ def get_equity_snapshots(since_ts: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_equity_peak_and_count() -> tuple[Optional[float], int]:
+    """All-time max equity and total sample count in one read. Used by the live
+    drawdown-from-peak stat. Returns (None, 0) when the table is empty."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(equity) AS peak, COUNT(*) AS n FROM equity_snapshots"
+        ).fetchone()
+    if not row:
+        return (None, 0)
+    return (row["peak"], row["n"])
+
+
+def get_gate_rejection_stats(since_iso: str) -> dict:
+    """Live gate-rejection counts over signal_log rows with timestamp >= since_iso.
+
+    total_evaluated = every signal_log row in the window (the denominator for context);
+    `skipped` groups action='skipped' rows by skip_reason, highest count first.
+    """
+    with _conn() as conn:
+        total_evaluated = conn.execute(
+            "SELECT COUNT(*) FROM signal_log WHERE timestamp >= ?", (since_iso,)
+        ).fetchone()[0]
+        skipped = conn.execute(
+            """SELECT skip_reason AS skip_reason, COUNT(*) AS cnt
+                 FROM signal_log
+                WHERE timestamp >= ? AND action = 'skipped'
+                GROUP BY skip_reason
+                ORDER BY cnt DESC""",
+            (since_iso,),
+        ).fetchall()
+    return {"total_evaluated": total_evaluated, "skipped": [dict(r) for r in skipped]}
+
+
 def prune_equity_snapshots(max_age_days: int = 30) -> int:
     """Delete equity samples older than max_age_days. Returns rows removed.
     Keeps the table bounded (~43k rows at 1/min over 30 days)."""

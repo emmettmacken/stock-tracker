@@ -3610,6 +3610,135 @@ def get_analytics():
     }
 
 
+# ── Analytics deep-dives ────────────────────────────────────────────────────────
+# Additive panels for the Automation → Analytics tab. Each is independently cached
+# (different freshness needs) via the tiny TTL helper below; all are read-only.
+
+_ANALYTICS_CACHE: dict[str, tuple[Any, float]] = {}
+_ANALYTICS_LOCK = threading.Lock()
+
+
+def _analytics_cached(key: str, ttl: float, compute):
+    """Return a cached value for `key`, recomputing via `compute()` when stale."""
+    with _ANALYTICS_LOCK:
+        hit = _ANALYTICS_CACHE.get(key)
+        if hit is not None and (time.time() - hit[1]) < ttl:
+            return hit[0]
+    value = compute()
+    with _ANALYTICS_LOCK:
+        _ANALYTICS_CACHE[key] = (value, time.time())
+    return value
+
+
+def _compute_factor_contribution() -> dict:
+    snapshots = db.get_watchlist_snapshots()
+    all_acc: dict[str, list[float]] = {}
+    act_acc: dict[str, list[float]] = {}
+    weight_for: dict[str, float] = {}
+    ticker_count = 0
+    actionable_count = 0
+    for snap in snapshots:
+        # snap["factors"] is the full cached factors payload; the per-factor
+        # breakdown ({name: {score, weight, null}}) is nested under its "factors" key.
+        payload = snap.get("factors")
+        factors = payload.get("factors") if isinstance(payload, dict) else None
+        if not isinstance(factors, dict):
+            continue
+        ticker_count += 1
+        composite = snap.get("composite_score")
+        is_actionable = composite is not None and composite >= 63
+        if is_actionable:
+            actionable_count += 1
+        for name, fd in factors.items():
+            if not isinstance(fd, dict) or fd.get("null"):
+                continue
+            score = fd.get("score")
+            if score is None:
+                continue
+            all_acc.setdefault(name, []).append(float(score))
+            weight_for[name] = float(fd.get("weight") or DEFAULT_FACTOR_WEIGHTS.get(name, 0.0))
+            if is_actionable:
+                act_acc.setdefault(name, []).append(float(score))
+    out = []
+    for name, scores in all_acc.items():
+        act = act_acc.get(name, [])
+        out.append({
+            "name":   name,
+            "weight": round(weight_for.get(name, 0.0), 4),
+            "avg_score_all":        round(sum(scores) / len(scores), 2),
+            "avg_score_actionable": round(sum(act) / len(act), 2) if act else None,
+        })
+    out.sort(key=lambda x: x["avg_score_all"])
+    return {"factors": out, "ticker_count": ticker_count, "actionable_count": actionable_count}
+
+
+@app.get("/api/analytics/factor-contribution")
+def get_factor_contribution():
+    """Average factor scores across the current watchlist snapshot, plus the
+    actionable subset (composite >= 63). Sorted lowest avg_score_all first so the
+    factors dragging composites down surface at the top. Cached 5 minutes."""
+    return _analytics_cached("factor_contribution", 300, _compute_factor_contribution)
+
+
+def _compute_gate_rejections() -> dict:
+    since = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    stats = db.get_gate_rejection_stats(since)
+    total_skipped = sum(r["cnt"] for r in stats["skipped"])
+    # skip_reasons carry a variable suffix (e.g. "score_below_threshold:51.9<80");
+    # collapse to the gate name before the colon so each gate is one bucket.
+    by_gate: dict[str, int] = {}
+    for r in stats["skipped"]:
+        gate = (r["skip_reason"] or "unknown").split(":", 1)[0]
+        by_gate[gate] = by_gate.get(gate, 0) + r["cnt"]
+    rejections = [
+        {
+            "gate":  gate,
+            "count": count,
+            "pct_of_skipped": round(count / total_skipped * 100, 1) if total_skipped else 0.0,
+        }
+        for gate, count in sorted(by_gate.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    return {
+        "period_days":     30,
+        "total_evaluated": stats["total_evaluated"],
+        "total_skipped":   total_skipped,
+        "rejections":      rejections,
+    }
+
+
+@app.get("/api/analytics/gate-rejections")
+def get_gate_rejections():
+    """Which gates blocked the most live signals over the last 30 days, from
+    signal_log action='skipped' rows grouped by skip_reason. Cached 10 minutes."""
+    return _analytics_cached("gate_rejections", 600, _compute_gate_rejections)
+
+
+def _compute_drawdown() -> dict:
+    peak, snapshot_count = db.get_equity_peak_and_count()
+    current: Optional[float] = None
+    if _alpaca_client:
+        try:
+            current = round(float(_alpaca_client.get_account().equity), 2)
+        except Exception:
+            pass
+    drawdown_pct: Optional[float] = None
+    if peak and current is not None and peak > 0:
+        drawdown_pct = round((current - peak) / peak * 100, 2)
+    return {
+        "peak":           round(peak, 2) if peak is not None else None,
+        "current":        current,
+        "drawdown_pct":   drawdown_pct,
+        "snapshot_count": snapshot_count,
+    }
+
+
+@app.get("/api/analytics/drawdown")
+def get_drawdown():
+    """Current live-account drawdown from all-time peak equity (equity_snapshots
+    MAX vs the live Alpaca equity). Cached 60 seconds."""
+    return _analytics_cached("drawdown", 60, _compute_drawdown)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WATCHLIST API
 # ═══════════════════════════════════════════════════════════════════════════════

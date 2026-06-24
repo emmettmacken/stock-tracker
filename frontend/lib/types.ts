@@ -438,6 +438,39 @@ export interface AnalyticsTickerPerf {
   avg_return: number;
 }
 
+export interface FactorContribution {
+  name: string;
+  weight: number;
+  avg_score_all: number;
+  avg_score_actionable: number | null;
+}
+
+export interface FactorContributionData {
+  factors: FactorContribution[];
+  ticker_count: number;
+  actionable_count: number;
+}
+
+export interface LiveGateRejection {
+  gate: string;
+  count: number;
+  pct_of_skipped: number;
+}
+
+export interface GateRejectionsData {
+  period_days: number;
+  total_evaluated: number;
+  total_skipped: number;
+  rejections: LiveGateRejection[];
+}
+
+export interface DrawdownData {
+  peak: number | null;
+  current: number | null;
+  drawdown_pct: number | null;
+  snapshot_count: number;
+}
+
 export interface AnalyticsData {
   by_exit_reason: AnalyticsExitReason[];
   by_score_bucket: AnalyticsScoreBucket[];

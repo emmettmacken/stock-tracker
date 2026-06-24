@@ -1,11 +1,16 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ReferenceLine,
+  BarChart, Bar, XAxis, YAxis, Tooltip, ReferenceLine, Legend,
   ResponsiveContainer, Cell,
 } from "recharts";
-import { AnalyticsData, AnalyticsTickerPerf } from "@/lib/types";
-import { fetchAnalytics } from "@/lib/api";
+import {
+  AnalyticsData, AnalyticsTickerPerf,
+  FactorContributionData, GateRejectionsData, DrawdownData,
+} from "@/lib/types";
+import {
+  fetchAnalytics, fetchFactorContribution, fetchGateRejections, fetchDrawdown,
+} from "@/lib/api";
 import { Skeleton } from "@/components/v3/Skeleton";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -125,16 +130,119 @@ const EXIT_LABELS: Record<string, string> = {
   macro_drawdown_protection: "Macro Exit",
 };
 
+// snake_case gate/factor key → Title Case label
+function prettyLabel(s: string): string {
+  return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// Factor-score color band: green ≥ 60, amber 40–59, red < 40.
+function scoreColor(v: number): string {
+  if (v >= 60) return "#10b981";
+  if (v >= 40) return "#f59e0b";
+  return "#f87171";
+}
+
+// ── Factor contribution (horizontal bars: watchlist avg + actionable subset) ────
+
+function FactorContributionChart({ data }: { data: FactorContributionData }) {
+  const rows = data.factors.map((f) => ({
+    ...f,
+    label: prettyLabel(f.name),
+  }));
+  return (
+    <ResponsiveContainer width="100%" height={Math.max(140, rows.length * 46)}>
+      <BarChart data={rows} layout="vertical" margin={{ top: 4, right: 12, left: 8, bottom: 0 }}>
+        <XAxis
+          type="number"
+          domain={[0, 100]}
+          tick={{ fontSize: 10, fill: "#71717a" }}
+        />
+        <YAxis
+          type="category"
+          dataKey="label"
+          width={72}
+          tick={{ fontSize: 10, fill: "#a1a1aa" }}
+        />
+        <Tooltip
+          contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6 }}
+          labelStyle={{ color: "#a1a1aa", fontSize: 11 }}
+          formatter={(v, name) => [
+            typeof v === "number" ? v.toFixed(1) : "—",
+            name === "avg_score_all" ? "All" : "Actionable (≥63)",
+          ]}
+        />
+        <Legend
+          wrapperStyle={{ fontSize: 10, paddingTop: 4 }}
+          formatter={(v) => (v === "avg_score_all" ? "Watchlist avg" : "Actionable (≥63)")}
+        />
+        <ReferenceLine x={60} stroke="#52525b" strokeDasharray="4 2" />
+        <Bar dataKey="avg_score_all" radius={[0, 3, 3, 0]} barSize={11}>
+          {rows.map((r) => (
+            <Cell key={r.name} fill={scoreColor(r.avg_score_all)} />
+          ))}
+        </Bar>
+        <Bar dataKey="avg_score_actionable" radius={[0, 3, 3, 0]} barSize={11} fill="#818cf8" />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+// ── Live gate rejections (ranked bars, BacktestPanel style) ─────────────────────
+
+function GateRejectionList({ data }: { data: GateRejectionsData }) {
+  const maxCount = data.rejections.length ? data.rejections[0].count : 0;
+  return (
+    <div className="space-y-1.5">
+      {data.rejections.map((r) => (
+        <div key={r.gate} className="flex items-center gap-2 text-xs">
+          <div className="w-40 shrink-0 text-zinc-400 truncate" title={prettyLabel(r.gate)}>
+            {prettyLabel(r.gate)}
+          </div>
+          <div className="flex-1 bg-zinc-800/50 rounded h-4 overflow-hidden">
+            <div
+              className="h-full bg-amber-500/70 rounded transition-[width] duration-300 ease-out-quart"
+              style={{ width: `${maxCount ? (r.count / maxCount) * 100 : 0}%` }}
+            />
+          </div>
+          <div className="w-8 shrink-0 text-right tabular-nums text-zinc-300">{r.count}</div>
+          <div className="w-12 shrink-0 text-right tabular-nums text-zinc-500">
+            {r.pct_of_skipped.toFixed(0)}%
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Drawdown-from-peak value (colored, for a System Health chip) ────────────────
+
+function DrawdownValue({ d }: { d: DrawdownData | null }) {
+  if (!d || d.snapshot_count < 10 || d.drawdown_pct === null) {
+    return <span className="text-zinc-500">Insufficient data</span>;
+  }
+  const dd = d.drawdown_pct;
+  const color = dd < -2 ? "text-red-400" : dd < -1 ? "text-amber-400" : "text-zinc-400";
+  return <span className={`tabular-nums ${color}`}>{dd.toFixed(2)}%</span>;
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function AnalyticsTab() {
   const [data, setData] = useState<AnalyticsData | null>(null);
+  const [factorContrib, setFactorContrib] = useState<FactorContributionData | null>(null);
+  const [gateRej, setGateRej] = useState<GateRejectionsData | null>(null);
+  const [drawdown, setDrawdown] = useState<DrawdownData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
+    // The additive deep-dives load independently and degrade to empty states on
+    // failure so they never break the core analytics sections.
+    fetchFactorContribution().then(setFactorContrib).catch(() => setFactorContrib(null));
+    fetchGateRejections().then(setGateRej).catch(() => setGateRej(null));
+    fetchDrawdown().then(setDrawdown).catch(() => setDrawdown(null));
     fetchAnalytics()
       .then(setData)
       .catch((e) => setError(e.message))
@@ -203,6 +311,55 @@ export function AnalyticsTab() {
         {!loading && data && data.by_score_bucket.length > 0 && (
           <p className="text-[10px] text-zinc-600 mt-1">
             Bars rising left → right confirm scores are predictive. Reference line = 50% baseline.
+          </p>
+        )}
+      </div>
+
+      {/* Factor contribution */}
+      <div>
+        <SectionTitle>Factor Contribution — Current Watchlist Average</SectionTitle>
+        <p className="text-[10px] text-zinc-600 mb-3">
+          Average factor scores across your watchlist. Low scores indicate factors
+          dragging composites below threshold.
+        </p>
+        {loading ? <ChartSkeleton /> : factorContrib && factorContrib.factors.length > 0 ? (
+          <>
+            <FactorContributionChart data={factorContrib} />
+            <p className="text-[10px] text-zinc-600 mt-1">
+              Across {factorContrib.ticker_count} ticker{factorContrib.ticker_count === 1 ? "" : "s"}
+              {factorContrib.actionable_count > 0
+                ? ` · ${factorContrib.actionable_count} actionable (composite ≥ 63)`
+                : ""}.
+              Green ≥ 60 · amber 40–59 · red &lt; 40. Reference line = 60.
+            </p>
+          </>
+        ) : !loading && (
+          <p className="text-zinc-600 text-xs py-6 text-center">
+            No watchlist factor data yet.
+          </p>
+        )}
+      </div>
+
+      {/* Live gate rejections */}
+      <div>
+        <SectionTitle>Live Gate Rejections — Last 30 Days</SectionTitle>
+        {loading ? (
+          <div className="space-y-2">{[1, 2, 3].map((i) => <Skeleton key={i} className="h-4 w-full" />)}</div>
+        ) : gateRej && gateRej.rejections.length > 0 ? (
+          <>
+            <GateRejectionList data={gateRej} />
+            <p className="text-[10px] text-zinc-600 mt-3">
+              {gateRej.total_evaluated} signal{gateRej.total_evaluated === 1 ? "" : "s"} evaluated,{" "}
+              {gateRej.total_skipped} skipped (
+              {gateRej.total_evaluated
+                ? ((gateRej.total_skipped / gateRej.total_evaluated) * 100).toFixed(0)
+                : "0"}
+              %) in the last {gateRej.period_days} days.
+            </p>
+          </>
+        ) : !loading && (
+          <p className="text-zinc-600 text-xs py-6 text-center">
+            No skipped signals logged in the last 30 days.
           </p>
         )}
       </div>
@@ -298,6 +455,7 @@ export function AnalyticsTab() {
             <HealthChip label="Last Stop-Loss Job" value={fmtTs(data.system_health.last_stoploss_job)} />
             <HealthChip label="Open Positions" value={data.system_health.open_positions} />
             <HealthChip label="Total Closed Trades" value={data.system_health.total_closed_trades} />
+            <HealthChip label="Drawdown from Peak" value={<DrawdownValue d={drawdown} />} />
           </div>
         ) : null}
       </div>
