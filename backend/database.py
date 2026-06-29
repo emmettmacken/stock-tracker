@@ -181,6 +181,11 @@ def _run_migrations() -> None:
             f"[migrations] signal_log has {len(after_cols)} columns after migration — "
             f"{'added ' + ', '.join(added) if added else 'no schema changes'}"
         )
+        # One-time cleanup: purge any zero/negative equity rows written before the
+        # insert-time guard existed. Idempotent — a no-op once the table is clean.
+        purged = conn.execute("DELETE FROM equity_snapshots WHERE equity <= 0").rowcount
+        if purged:
+            print(f"[migrations] purged {purged} invalid (<=0) equity_snapshots rows")
     _migrate_config_baselines()
 
 
@@ -408,7 +413,14 @@ def get_signal_log(limit: int = 50) -> list[dict]:
 
 def insert_equity_snapshot(equity: float) -> None:
     """Record one account-equity sample at the current UTC time. Cheap append-only
-    write; called from the live-equity poll and the 5-min sampler job."""
+    write; called from the live-equity poll and the 5-min sampler job.
+
+    Guards against bad samples (Alpaca occasionally returns 0 on a transient glitch):
+    a zero/negative/None equity is rejected here so neither write path can poison the
+    table — downstream readers (1D curve, drawdown peak) trust that rows are positive."""
+    if equity is None or float(equity) <= 0:
+        print(f"[equity] insert_equity_snapshot: rejecting invalid equity value {equity} — skipping write")
+        return
     with _conn() as conn:
         conn.execute(
             "INSERT INTO equity_snapshots (ts, equity) VALUES (?, ?)",
