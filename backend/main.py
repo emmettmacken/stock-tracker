@@ -3072,11 +3072,15 @@ def _skip_if_locked(
     return False
 
 
-def _close_and_record(api, ticker: str, current_price: float, entry_price: float,
-                      exit_reason: str, entry_log: Optional[dict],
-                      score: Optional[float] = None) -> None:
-    """Close an Alpaca position and write trade_outcomes."""
-    api.close_position(ticker)
+def _record_close(ticker: str, current_price: float, entry_price: float,
+                  exit_reason: str, entry_log: Optional[dict],
+                  score: Optional[float] = None) -> None:
+    """Write signal_log SELL + trade_outcomes + ticker_performance for a close that has
+    already executed at the broker, arming the re-entry cooldown.
+
+    Retries transient DB failures (e.g. SQLite locks when the scheduler and a request
+    handler hit the DB at once) up to 3 times before giving up, so a momentary lock does
+    not permanently lose the trade record."""
     ret = (current_price - entry_price) / entry_price * 100
     hold = 0
     if entry_log:
@@ -3086,20 +3090,37 @@ def _close_and_record(api, ticker: str, current_price: float, entry_price: float
             )
         except Exception:
             pass
-    try:
-        db.record_close_transaction(
-            ticker, score, exit_reason, current_price, entry_price,
-            ret, hold,
-            entry_log["id"] if entry_log else None,
-            entry_log.get("composite_score") if entry_log else None,
-        )
-    except Exception as db_err:
-        logger.error(
-            "%s: broker close SUCCEEDED (%s) but DB transaction FAILED — "
-            "position not recorded, cooldown not set: %s",
-            ticker, exit_reason, db_err,
-        )
+    for attempt in range(3):
+        try:
+            db.record_close_transaction(
+                ticker, score, exit_reason, current_price, entry_price,
+                ret, hold,
+                entry_log["id"] if entry_log else None,
+                entry_log.get("composite_score") if entry_log else None,
+            )
+            break
+        except Exception as db_err:
+            if attempt < 2:
+                logger.warning(
+                    "DB write failed (attempt %d/3) for %s close — retrying: %s",
+                    attempt + 1, ticker, db_err,
+                )
+                time.sleep(1)
+            else:
+                logger.error(
+                    "broker close SUCCEEDED but DB transaction FAILED after 3 attempts "
+                    "for %s — cooldown not set, trade unrecorded: %s",
+                    ticker, db_err,
+                )
     logger.info("%s: closed (%s) at %.2f (%.1f%%)", ticker, exit_reason, current_price, ret)
+
+
+def _close_and_record(api, ticker: str, current_price: float, entry_price: float,
+                      exit_reason: str, entry_log: Optional[dict],
+                      score: Optional[float] = None) -> None:
+    """Close an Alpaca position and write trade_outcomes."""
+    api.close_position(ticker)
+    _record_close(ticker, current_price, entry_price, exit_reason, entry_log, score)
 
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
@@ -4390,13 +4411,44 @@ def api_portfolio_close_position(req: ClosePositionRequest):
     """
     if _alpaca_client is None:
         return {"success": False, "error": _alpaca_err}
+    ticker = req.ticker.upper()
+    qty = round(req.qty, 6)
     try:
+        # Capture entry/current price before submitting so we can record the close.
+        pos = None
+        try:
+            for p in _alpaca_client.get_all_positions():
+                if p.symbol == ticker:
+                    pos = p
+                    break
+        except Exception:
+            pos = None
+
         order = _alpaca_client.submit_order(MarketOrderRequest(
-            symbol=req.ticker.upper(),
-            qty=round(req.qty, 6),
+            symbol=ticker,
+            qty=qty,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         ))
+
+        # Record the close so manual exits match automated ones (signal_log SELL +
+        # trade_outcomes + ticker_performance, arming the re-entry cooldown). Only a
+        # full close is recorded — a partial sell leaves the position open, so writing
+        # a close transaction and arming the cooldown would be wrong.
+        if pos is not None:
+            try:
+                pos_qty = abs(float(pos.qty))
+                if qty >= pos_qty - 1e-6:
+                    _record_close(
+                        ticker,
+                        float(pos.current_price),
+                        float(pos.avg_entry_price),
+                        "manual_close",
+                        db.get_last_buy_signal(ticker),
+                    )
+            except Exception as rec_err:
+                logger.error("%s: manual close order OK but recording failed: %s",
+                             ticker, rec_err)
         return {"success": True, "order_id": str(order.id)}
     except Exception as e:
         return {"success": False, "error": str(e)}
