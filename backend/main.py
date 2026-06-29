@@ -2815,6 +2815,7 @@ def _earnings_within_days(ticker: str, days: int = 2) -> bool:
         logger.warning("%s: earnings_within_2d gate data unavailable: %s", ticker, exc)
         db.log_signal(ticker, None, None, "evaluated",
                       f"earnings_check_failed:{exc}", None, None)
+        return False  # fail open, do NOT cache — retry on next signal job run
     with _EARNINGS_LOCK:
         _EARNINGS_CACHE[ticker] = (result, time.time())
     return result
