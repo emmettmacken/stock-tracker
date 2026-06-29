@@ -40,7 +40,12 @@ except Exception:
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, GetPortfolioHistoryRequest
+    from alpaca.trading.requests import (
+        MarketOrderRequest, GetOrdersRequest, GetPortfolioHistoryRequest,
+        # Aliased: main.py defines its own ClosePositionRequest (FastAPI body model) below,
+        # which would otherwise shadow this SDK type and break the partial-close call.
+        ClosePositionRequest as AlpacaClosePositionRequest,
+    )
     from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
     ALPACA_OK = True
 except Exception:
@@ -2492,6 +2497,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         rebalance_events: list[dict] = []
         per_ticker_contrib: dict[str, float] = {t: 0.0 for t in valid}
         mid_window_exits = 0  # Change 1: counter for score-deterioration early exits
+        # Profit-take bookkeeping: per-ticker entry close (the +15% trim basis), the set of
+        # names already trimmed this holding (trim once, not every bar), and a run counter.
+        entry_prices_bt: dict[str, float] = {}
+        profit_taken_bt: set[str] = set()
+        profit_takes_bt = 0
 
         # SPY benchmark
         spy_closes = None
@@ -2659,6 +2669,18 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             # Change 1: live_weights tracks positions that haven't been exited mid-window
             live_weights = dict(weights)
 
+            # Profit-take bookkeeping: record each newly entered ticker's entry close (basis
+            # kept across windows while the name stays held), and drop the basis/flag for any
+            # name not held this window so a later re-entry is measured from a fresh entry.
+            for t in valid:
+                if weights.get(t, 0.0) > 0:
+                    entry_prices_bt.setdefault(
+                        t, float(combined_arr[test_start, valid.index(t)])
+                    )
+                else:
+                    entry_prices_bt.pop(t, None)
+                    profit_taken_bt.discard(t)
+
             # Simulate TEST days with these weights
             for idx in range(test_start, min(test_start + TEST, n_days - 1)):
                 # Change 1: mid-window exit on composite score deterioration (mirrors the
@@ -2669,6 +2691,22 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     c_t, _ret_t = features[t]
                     if idx < 1 or idx >= len(c_t):
                         continue
+
+                    # Profit-take: halve the weight once this name is +15% above its entry
+                    # close. The remaining half keeps running for the rest of the window; the
+                    # position stays open, so no re-entry cooldown is armed (mirrors the live
+                    # profit-take which leaves the other half under the trailing stop).
+                    if t not in profit_taken_bt:
+                        entry_px = entry_prices_bt.get(t)
+                        if entry_px and (c_t[idx] - entry_px) / entry_px >= 0.15:
+                            half_weight = live_weights[t] * 0.5
+                            # Charge exit cost on the closed half only
+                            portfolio_val *= (1.0 - TC_PER_SIDE_PB * half_weight)
+                            live_weights[t] = half_weight
+                            profit_taken_bt.add(t)
+                            profit_takes_bt += 1
+                            continue
+
                     composite = _backtest_composite(c_t[: idx + 1])
                     if composite is not None and composite < exit_threshold:
                         # Apply exit cost proportional to this position's weight
@@ -2676,6 +2714,9 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         live_weights[t] = 0.0
                         mid_window_exits += 1
                         last_exit_idx[t] = idx  # arm the re-entry cooldown
+                        # Full exit: clear the profit-take basis so a re-entry starts fresh.
+                        entry_prices_bt.pop(t, None)
+                        profit_taken_bt.discard(t)
 
                 contrib_sum = 0.0
                 for i, t in enumerate(valid):
@@ -2747,12 +2788,14 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             "per_ticker_contrib": {t: round(v * 100, 3) for t, v in per_ticker_contrib.items()},
             "rebalance_events": rebalance_events,
             "efficient_frontier": ef_points,
+            "profit_takes": profit_takes_bt,
             # Change 1: gate comparison showing mid-window exit impact and cost drag
             "gate_comparison": {
                 "total_rebalances": (n_days - TRAIN) // TEST,
                 "mid_window_exits": mid_window_exits,
+                "profit_takes": profit_takes_bt,
                 "transaction_cost_bps_per_side": int(TC_PER_SIDE_PB * 10000),
-                "notes": "mid_window_exits fired when a held ticker's composite fell below the deterioration threshold",
+                "notes": "mid_window_exits fired when a held ticker's composite fell below the deterioration threshold; profit_takes halved a position once it reached +15% above entry",
             },
         }
     except HTTPException:
@@ -3142,6 +3185,22 @@ def _record_close(ticker: str, current_price: float, entry_price: float,
             )
         except Exception:
             pass
+
+    # Partial profit-take: the position is only halved, not flat. Record it in signal_log for
+    # visibility but do NOT call record_close_transaction — that would arm the re-entry
+    # cooldown and count the trim as a win/loss in ticker_performance. The remaining half is
+    # still open and managed by the trailing-stop / hold / deterioration logic.
+    if exit_reason == "profit_take_half":
+        try:
+            db.log_signal(
+                ticker, score, None, "closed",
+                f"profit_take_half:+{ret:.1f}%", current_price, None,
+            )
+        except Exception as db_err:
+            logger.error("profit-take log_signal failed for %s: %s", ticker, db_err)
+        logger.info("%s: profit-take half at %.2f (+%.1f%%)", ticker, current_price, ret)
+        return
+
     for attempt in range(3):
         try:
             db.record_close_transaction(
@@ -3666,6 +3725,26 @@ def _run_stoploss_job() -> None:
             entry_log   = db.get_last_buy_signal(ticker)
             if not entry_log:
                 continue
+
+            # Profit-take: close half the position once it is up +15% from entry. The
+            # remaining half stays open under the trailing-stop / hold logic below. Skip when
+            # the position is user-locked, or when we already trimmed this holding — entry_log
+            # is the current BUY, so a later re-entry resets the basis and re-arms the trim.
+            current_return = (price - entry_price) / entry_price
+            if (current_return >= 0.15
+                    and not db.is_position_locked(ticker)
+                    and not db.has_partial_close_since(ticker, entry_log["timestamp"])):
+                try:
+                    api.close_position(
+                        ticker, close_options=AlpacaClosePositionRequest(percentage="50")
+                    )
+                    _record_close(ticker, price, entry_price, "profit_take_half",
+                                  entry_log, score=None)
+                    logger.info("%s: profit-take half at +%.1f%%", ticker, current_return * 100)
+                except Exception as e:
+                    logger.error("%s: profit-take failed: %s", ticker, e)
+                continue
+
             atr_entry = entry_log.get("atr_at_signal") or 0.0
             hold_days = _trading_days_between(
                 datetime.fromisoformat(entry_log["timestamp"]), now

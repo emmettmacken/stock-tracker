@@ -532,6 +532,23 @@ def get_last_buy_signal(ticker: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def has_partial_close_since(ticker: str, since_iso: str) -> bool:
+    """True if a profit-take half-close was already logged for this ticker after `since_iso`
+    (typically the BUY timestamp of the current holding). Lets the stop-loss job trim a
+    position once per holding instead of re-halving it on every daily run while it sits
+    above the +15% target."""
+    with _conn() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM signal_log
+               WHERE ticker = ? AND action = 'closed'
+                 AND skip_reason LIKE 'profit_take_half%'
+                 AND timestamp > ?
+               LIMIT 1""",
+            (ticker.upper(), since_iso),
+        ).fetchone()
+    return row is not None
+
+
 # ── Trade outcomes ────────────────────────────────────────────────────────────
 
 def get_trade_history() -> list[dict]:
