@@ -2553,6 +2553,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             # history available here — the same composite the live trader gates on.
             rvols: dict[str, float] = {}
             signals_window: dict[str, str] = {}
+            composites_window: dict[str, float] = {}  # point-in-time composite per ticker
 
             for t in valid:
                 c, ret = features[t]
@@ -2560,10 +2561,27 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 if len(tr_rets) < 22:
                     rvols[t] = 0.25
                     signals_window[t] = "HOLD"
+                    composites_window[t] = 0.0
                     continue
                 rvols[t] = tr_rets[-21:].std() * np.sqrt(252)
                 composite = _backtest_composite(c[: te + 1])
-                is_buy = composite is not None and composite >= buy_threshold
+                composites_window[t] = composite if composite is not None else 0.0
+
+                # Fix 3 — HMM bull-confidence gate (issue 10). Per-bar smoothed HMM state
+                # can't be reconstructed point-in-time in this rebalancing model, so the
+                # composite is used as a conservative proxy: require composite >= 70,
+                # approximating the live trader's smoothed_bull_prob >= 0.70 entry gate.
+                if composite is None or composite < 70:
+                    signals_window[t] = "HOLD"
+                    continue
+
+                # Fix 4 — regime-adaptive threshold (issue 11). In a bear regime (SPY below
+                # its 200-day MA) the live trader raises the buy bar; mirror that with an 80
+                # threshold, falling back to the normal bull threshold otherwise. spy_above_ma
+                # may be None (data fail-open) → treat as bull regime.
+                bull_regime = (spy_above_ma is None) or bool(spy_above_ma[test_start])
+                regime_threshold = buy_threshold if bull_regime else 80.0
+                is_buy = composite >= regime_threshold
                 # Re-entry cooldown: block a BUY within 2 trading days of a mid-window exit.
                 if is_buy and (test_start - last_exit_idx[t]) < 2:
                     is_buy = False
@@ -2581,13 +2599,47 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 for t in valid:
                     signals_window[t] = "HOLD"
 
-            # Vol-targeted weights (only allocate to BUY signals)
+            # Fix 2 — no equal-weight fallback (issue 9). When nothing signals BUY the
+            # portfolio holds cash; we never deploy capital into names that didn't signal.
             buy_tickers = [t for t in valid if signals_window[t] == "BUY"]
-            if not buy_tickers and entries_allowed:
-                buy_tickers = valid  # fallback: equal weight (only when entries are allowed)
-            inv_vol = {t: 1.0 / max(rvols.get(t, 0.25), 0.01) for t in buy_tickers}
-            total_inv = sum(inv_vol.values())
-            weights = {t: inv_vol[t] / total_inv for t in buy_tickers}
+
+            # Fix 1 — _correlation_penalty-aware, score-ordered sizing (issues 8 + 13),
+            # replacing pure inverse-vol weighting. Highest-conviction names are sized first
+            # so the correlation penalty shrinks later names that move with them, mirroring
+            # /api/portfolio/sizing and the live _position_dollars path. All price slices are
+            # point-in-time (rows 0..test_start inclusive) — no look-ahead.
+            buy_tickers_sorted = sorted(
+                buy_tickers, key=lambda t: composites_window.get(t, 0.0), reverse=True
+            )
+            hist_prices = {t: combined_arr[: test_start + 1, valid.index(t)] for t in valid}
+
+            sized: dict[str, float] = {}
+            held_so_far: list[str] = []
+            for t in buy_tickers_sorted:
+                # Vol-target base weight (target ~1% vol contribution), matching _position_dollars.
+                rvol = rvols.get(t, 0.25)
+                base_weight = 0.01 / max(rvol, 0.001)
+                # Conviction multiplier from composite score (75→1×, 95→1.5×).
+                score = composites_window.get(t, buy_threshold)
+                conviction = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
+                # Correlation penalty against already-sized (higher-conviction) names.
+                penalty, _, _ = _correlation_penalty(t, held_so_far, hist_prices)
+                # Per-position hard cap at 10% of the portfolio (matches _position_dollars).
+                weight = min(base_weight * conviction * penalty, 0.10)
+                sized[t] = weight
+                held_so_far.append(t)
+
+            # Normalize so aggregate exposure never exceeds 1.0 (PORTFOLIO_KELLY_CAP equivalent).
+            total_w = sum(sized.values())
+            if total_w > 1.0:
+                sized = {t: w / total_w for t, w in sized.items()}
+
+            # Fix 5 — drop sub-floor positions (POSITION_FLOOR_PCT = 0.5%) not worth opening,
+            # then re-normalize the survivors against the same cap.
+            weights = {t: w for t, w in sized.items() if w >= POSITION_FLOOR_PCT}
+            total_w = sum(weights.values())
+            if total_w > 1.0:
+                weights = {t: w / total_w for t, w in weights.items()}
             for t in valid:
                 if t not in weights:
                     weights[t] = 0.0
