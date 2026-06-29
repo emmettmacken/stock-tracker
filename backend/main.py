@@ -1491,7 +1491,7 @@ def _fetch_sector(ticker: str, attempts: int = 3, delay: float = 2.0) -> Optiona
 
     Returns the sector string on success, or None if every attempt fails (so the caller
     can avoid caching a failure). The signal job calls .info for the whole watchlist
-    concurrently (ThreadPoolExecutor, 8 workers), and Yahoo rate-limits that burst by
+    concurrently (ThreadPoolExecutor, 2 workers), and Yahoo rate-limits that burst by
     returning a *partial/empty .info dict with no exception raised* — the silent path
     that previously produced "Unknown". We treat a missing sector the same as an error,
     retry it, and log every failure so it's visible in the logs rather than swallowed."""
@@ -2352,7 +2352,7 @@ def portfolio_sizing(req: SizingRequest):
             except Exception:
                 return t, None
 
-        with ThreadPoolExecutor(max_workers=min(8, len(tickers)) or 1) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {pool.submit(_fetch_closes, t): t for t in tickers}
             for fut in as_completed(futures):
                 t, c = fut.result()
@@ -2430,7 +2430,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             except Exception:
                 return t, None
 
-        with ThreadPoolExecutor(max_workers=min(8, len(all_tickers))) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             for t, df in pool.map(_fetch_one, all_tickers):
                 if df is not None:
                     dfs[t] = df
@@ -3182,7 +3182,7 @@ def _run_signal_job() -> None:
             logger.error("Factor compute failed for %s: %s", ticker, exc)
             return ticker, None
 
-    with ThreadPoolExecutor(max_workers=min(len(watchlist), 8)) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         factor_results: dict[str, Optional[dict]] = dict(pool.map(_fetch_factors_safe, watchlist))
 
     # Sentinel: log warning if >50% of tickers returned None sentiment
@@ -3860,7 +3860,7 @@ def api_watchlist_snapshot():
 def api_upcoming_earnings(days: int = 30):
     """Watchlist tickers with earnings in the next `days` calendar days (default 30,
     clamped to 7–90), sorted by date ascending. Per-ticker calendar/surprise fetches run
-    in parallel (≤8 workers) and are cached 1h; tickers with no calendar data are skipped.
+    in parallel (≤2 workers) and are cached 1h; tickers with no calendar data are skipped.
     composite_score comes from the cached watchlist snapshot (no extra compute)."""
     days = max(7, min(90, days))
     watchlist = [r["ticker"] for r in db.get_watchlist()]
@@ -3868,7 +3868,7 @@ def api_upcoming_earnings(days: int = 30):
 
     raw: dict[str, Optional[dict]] = {}
     if watchlist:
-        with ThreadPoolExecutor(max_workers=min(8, len(watchlist))) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {pool.submit(_upcoming_earnings_for_ticker, t): t for t in watchlist}
             for fut in as_completed(futures):
                 t = futures[fut]
