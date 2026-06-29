@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -77,6 +77,12 @@ import database as db
 # against the exact same file every other DB operation uses at runtime.
 db.init_db()
 
+# Auth wiring. Imported after load_dotenv() so JWT_SECRET is available (auth.py
+# raises at import if it's missing) and after init_db() so the users / token
+# tables exist.
+import auth
+from routers import auth_router
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -97,17 +103,34 @@ logging.getLogger("hmmlearn").setLevel(logging.ERROR)
 
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Stock Signal Tracker v2")
+# require_auth is applied app-wide: every request must carry a valid access-token
+# cookie except CORS preflight, GET /health, and the /auth/* routes (the gate
+# exempts those by path). This is the router-level-equivalent enforcement for a
+# codebase whose 50 endpoints all hang off this single `app`, not off APIRouters.
+app = FastAPI(
+    title="Stock Signal Tracker v2",
+    dependencies=[Depends(auth.require_auth)],
+)
 
+# Cookie auth is cross-site (frontend on Vercel, API on Railway), so CORS must
+# echo the exact origin and allow credentials — a "*" origin is forbidden once
+# allow_credentials=True. FRONTEND_URL is the deployed app; CORS_ORIGINS can add
+# more; the regex keeps every localhost port working in dev.
 _cors_origins_env = os.getenv("CORS_ORIGINS", "")
 _extra_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+if _frontend_url:
+    _extra_origins.append(_frontend_url)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_extra_origins,
     allow_origin_regex=r"http://localhost:\d+",
+    allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router.router)
 
 
 @app.on_event("startup")

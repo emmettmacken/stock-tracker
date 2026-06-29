@@ -1,15 +1,14 @@
 "use client";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
+import { logout } from "@/lib/auth";
 
 export function Nav() {
   const path = usePathname();
-  const router = useRouter();
 
   async function handleLogout() {
-    await fetch("/api/auth/logout", { method: "POST" });
-    router.push("/login");
-    router.refresh();
+    // Revokes the refresh token + clears cookies on the API, then redirects to /login.
+    await logout();
   }
 
   return (

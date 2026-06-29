@@ -135,7 +135,36 @@ def _run_migrations() -> None:
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN entry_dollars REAL"),
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN equity_at_entry REAL"),
     ]
+    # Auth tables (JWT login + email verification). Created here in _run_migrations
+    # so they land on every existing deployment without needing a fresh init_db.
+    auth_tables = """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL,
+            is_verified INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS email_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            token TEXT UNIQUE NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            token_hash TEXT UNIQUE NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );
+    """
+
     with _conn() as conn:
+        conn.executescript(auth_tables)
         before_cols = {r[1] for r in conn.execute("PRAGMA table_info(signal_log)")}
         print(
             f"[migrations] migrating DB at {os.path.abspath(DB_PATH)} — "
@@ -827,3 +856,94 @@ def get_edge_stats() -> dict:
         "expectancy_pct": round(expectancy, 2),
         "avg_hold_days": round(avg_hold, 1),
     }
+
+
+# ── Auth: users, email verification, refresh tokens ──────────────────────────────
+# Thin helpers for the JWT auth flow (see auth.py / routers/auth_router.py). All
+# timestamps are compared against SQLite's datetime('now') (UTC) so expiry checks
+# stay in one timezone regardless of the app server's local time.
+
+def get_user_by_email(email: str) -> Optional[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email,)
+        ).fetchone()
+
+
+def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+
+
+def create_user(email: str, hashed_password: str) -> int:
+    """Insert a new (unverified) user; returns the new user id."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO users (email, hashed_password) VALUES (?, ?)",
+            (email, hashed_password),
+        )
+        return int(cur.lastrowid)
+
+
+def mark_user_verified(user_id: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET is_verified = 1 WHERE id = ?", (user_id,)
+        )
+
+
+def create_email_verification(user_id: int, token: str, expires_at: str) -> None:
+    """Store a verification token. `expires_at` is an ISO/SQLite datetime string (UTC)."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO email_verifications (user_id, token, expires_at) "
+            "VALUES (?, ?, ?)",
+            (user_id, token, expires_at),
+        )
+
+
+def get_valid_email_verification(token: str) -> Optional[sqlite3.Row]:
+    """Return an unused, unexpired verification row for `token`, else None."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM email_verifications "
+            "WHERE token = ? AND used = 0 AND expires_at > datetime('now')",
+            (token,),
+        ).fetchone()
+
+
+def mark_email_verification_used(verification_id: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE email_verifications SET used = 1 WHERE id = ?",
+            (verification_id,),
+        )
+
+
+def store_refresh_token(user_id: int, token_hash: str, expires_at: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) "
+            "VALUES (?, ?, ?)",
+            (user_id, token_hash, expires_at),
+        )
+
+
+def get_valid_refresh_token(token_hash: str) -> Optional[sqlite3.Row]:
+    """Return a non-revoked, unexpired refresh-token row for `token_hash`, else None."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM refresh_tokens "
+            "WHERE token_hash = ? AND revoked = 0 AND expires_at > datetime('now')",
+            (token_hash,),
+        ).fetchone()
+
+
+def revoke_refresh_token(token_hash: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?",
+            (token_hash,),
+        )
