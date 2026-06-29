@@ -3,7 +3,9 @@
 // an expired access token once, and bounces to /login when the session is truly
 // gone.
 
-export const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Empty base = same-origin requests. Next.js rewrites (see next.config.mjs) proxy
+// /api/* and /auth/* to the backend, so cookies stay first-party to this origin.
+export const BASE = "";
 
 const PUBLIC_PATHS = new Set(["/login", "/register", "/verify-email"]);
 

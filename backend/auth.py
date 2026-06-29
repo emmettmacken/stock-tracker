@@ -11,11 +11,11 @@ Required environment variables (set in backend/.env locally and in Railway):
     RESEND_API_KEY=...        # Resend API key for transactional email
     RESEND_DOMAIN=...         # the domain verified with Resend (from = noreply@<domain>)
     FRONTEND_URL=...          # e.g. https://your-app.vercel.app — used in the verify link
-    COOKIE_SECURE=true        # optional; default true. Set false only for plain-HTTP local dev.
 
-Cookies are issued with SameSite=None; Secure because the frontend (Vercel) and the
-API (Railway) live on different sites — Lax cookies would never be sent on a
-cross-site fetch. That also requires CORS allow_credentials=True (see main.py).
+Cookies are issued with SameSite=Lax. The frontend proxies all API traffic to this
+backend through Next.js rewrites (see frontend/next.config.mjs), so the browser
+only ever talks to the Vercel origin and the cookies are first-party — no
+cross-site exemption (SameSite=None) and no CORS allow_credentials is required.
 """
 from __future__ import annotations
 
@@ -43,12 +43,12 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 
-# Cross-site cookies (Vercel frontend → Railway API) require SameSite=None + Secure.
-# For plain-HTTP local dev set COOKIE_SECURE=false: browsers reject SameSite=None
-# without Secure, so we fall back to Lax — which is fine locally because the dev
-# frontend (localhost:3000) and API (localhost:8000) are same-site.
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() != "false"
-COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
+# The frontend proxies all API traffic to this backend via Next.js rewrites, so
+# from the browser's perspective these cookies are first-party to the Vercel
+# domain — SameSite=Lax is sufficient and no cross-site/CORS exemption is needed.
+# Secure stays on (both Vercel and Railway are HTTPS); it's harmless either way.
+COOKIE_SECURE = True
+COOKIE_SAMESITE = "lax"
 ACCESS_COOKIE = "access_token"
 REFRESH_COOKIE = "refresh_token"
 
