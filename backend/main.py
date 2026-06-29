@@ -1736,7 +1736,15 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
 
     available = {k: v for k, v in factors.items() if not v["null"]}
     total_w = sum(v["weight"] for v in available.values())
-    composite = sum(v["score"] * v["weight"] / total_w for v in available.values()) if total_w > 0 else 0.0
+    composite = sum(v["score"] * v["weight"] / total_w for v in available.values()) if total_w > 0 else None
+
+    # Every factor was unavailable (total_w == 0) → there is no score, not a score of 0.
+    # Return None like the price-fetch failure path (see the `return None` above) so the
+    # caller treats this as data_unavailable and never acts on a degenerate composite —
+    # in particular, never fires a spurious score-deterioration SELL.
+    if composite is None:
+        logger.warning("All factors unavailable for %s — returning None (data_unavailable)", ticker)
+        return None
 
     non_null_scores = [v["score"] for v in factors.values() if not v["null"] and v["score"] is not None]
     min_factor_score = min(non_null_scores) if non_null_scores else None
@@ -3246,8 +3254,22 @@ def _run_signal_job() -> None:
                 if mfs is not None and mfs < min_factor_floor:
                     effective_composite = min(composite, buy_threshold - 5.0)
 
+            # Minimum factor coverage before acting on a deterioration SELL: require at
+            # least 3 of the 5 factors to have valid (non-null) scores. A composite built
+            # from one or two surviving factors is too thin to justify force-closing a
+            # position — bad/missing factor data must never trigger a spurious SELL.
+            factor_coverage = sum(1 for v in result.get("factors", {}).values() if not v["null"])
+
             # Score deterioration exit — skip for transition regime (smoothed_bull_prob in [0.35, 0.65])
             if in_pos and composite < 40.0 and hmm_regime != "transition":
+                if factor_coverage < 3:
+                    db.log_signal(ticker, composite, signal_label, "skipped",
+                                  "insufficient_factor_coverage", price, atr,
+                                  hmm_regime=hmm_regime, sentiment_score=sentiment,
+                                  smoothed_bull_prob=smoothed_bull_prob)
+                    logger.info("%s: deterioration SELL skipped — only %d/5 factors available",
+                                ticker, factor_coverage)
+                    continue
                 if _skip_if_locked(ticker, composite=composite, signal=signal_label,
                                    price=price, atr=atr):
                     continue
