@@ -51,7 +51,9 @@ export interface VolTrendDetail {
 }
 
 export interface EarningsDetail {
-  surprises: number[]; // last two quarters, oldest → newest, as fractions (0.05 = +5%)
+  surprises?: number[]; // last two quarters, oldest → newest, as fractions (0.05 = +5%)
+  stale?: boolean; // true when the factor was nulled because the last report is too old
+  days?: number; // days since the most recent earnings report (set alongside stale)
 }
 
 export interface FactorScoreData {

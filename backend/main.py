@@ -1205,6 +1205,20 @@ def _earnings_score(ticker_obj: yf.Ticker) -> tuple[float | None, dict | None]:
             return None, None
         # Most recent two quarters
         last2 = eh.sort_index().tail(2)
+        # Staleness guard: earnings_history always returns the most recent rows regardless
+        # of age, but reports only update ~quarterly. If the latest report is older than a
+        # quarter + buffer, null the factor (like absent data) instead of contributing a
+        # stale beats/misses score to the composite.
+        most_recent = last2.index[-1]
+        try:
+            report_date = most_recent.to_pydatetime().replace(tzinfo=None)
+            days_since = (datetime.now() - report_date).days
+            if days_since > 120:  # older than ~1 quarter + 30 day buffer
+                logger.debug("%s: earnings factor stale (%d days since last report) — nulling",
+                             getattr(ticker_obj, "ticker", "?"), days_since)
+                return None, {"stale": True, "days": days_since}
+        except Exception:
+            pass  # if date parse fails, proceed with existing data
         surprises = []
         for col in ["epsActual", "epsEstimate"]:
             if col not in last2.columns:
