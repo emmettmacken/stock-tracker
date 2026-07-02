@@ -3048,7 +3048,16 @@ def _position_dollars(
             daily_vol = float(rets_21.std())
         except Exception:
             daily_vol = 0.0
-    vol_weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
+    # C1 fix (Jul 2026): target against ANNUALIZED vol (daily × √252), the same
+    # convention as the portfolio backtest and /api/portfolio/sizing. The old daily-vol
+    # denominator made vol_weight ~16× too large, so vol-target sizes always slammed
+    # into the 10% hard cap and the 3×-vol-target Kelly guard below could never bind.
+    ann_vol = daily_vol * math.sqrt(252.0) if daily_vol > 0 else 0.0
+    vol_weight = (0.01 / ann_vol) if ann_vol > 0 else 0.05
+    # Pre-fix (daily-vol) weight, kept ONLY for the one-cycle [SIZING_MIGRATION_CHECK]
+    # comparison logs below; remove together with them once the first post-deploy
+    # signal-job run has been reviewed.
+    old_vol_weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
 
     # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5×
     multiplier = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
@@ -3063,6 +3072,7 @@ def _position_dollars(
             perf_multiplier = 0.7
 
     vol_base = vol_weight * equity * multiplier * perf_multiplier
+    old_vol_base = old_vol_weight * equity * multiplier * perf_multiplier  # migration log only
 
     # ── Correlation penalty vs currently-held positions ─────────────────────────
     # Mirror /api/portfolio/sizing via the shared _correlation_penalty helper: shrink
@@ -3123,22 +3133,47 @@ def _position_dollars(
             sizing_method = "kelly_portfolio_prior"
 
     if sizing_method != "vol_target_fallback":
-        kelly_dollars = kelly_frac * equity * multiplier * perf_multiplier
-        # If Kelly is more than 3× vol-target, warn and cap
+        kelly_raw = kelly_frac * equity * multiplier * perf_multiplier
+        # If Kelly is more than 3× vol-target, warn and cap. With the annualized
+        # vol-target reference this cap can now genuinely bind (against the old
+        # daily-vol reference, ~16× too high, it never did).
         cap_3x = vol_base * 3.0
-        if kelly_dollars > cap_3x:
+        cap_binds = kelly_raw > cap_3x
+        kelly_dollars = kelly_raw
+        if cap_binds:
             logger.warning(
                 "%s: Kelly $%.0f exceeds 3× vol-target $%.0f — capping",
-                ticker, kelly_dollars, cap_3x,
+                ticker, kelly_raw, cap_3x,
             )
             kelly_dollars = cap_3x
         # Correlation penalty, then hard cap 10%, floor POSITION_FLOOR_PCT
         kelly_dollars = _penalize(kelly_dollars)
         kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * POSITION_FLOOR_PCT)
+        # One-cycle migration check: pre-fix (daily-vol) size alongside the new size so
+        # the first post-deploy signal run can be sanity-checked from Railway logs.
+        # Remove this block (and old_vol_weight/old_vol_base above) once reviewed.
+        old_cap_3x = old_vol_base * 3.0
+        old_dollars = max(
+            min(min(kelly_raw, old_cap_3x) * penalty, equity * 0.10),
+            equity * POSITION_FLOOR_PCT,
+        )
+        logger.info(
+            "[SIZING_MIGRATION_CHECK] %s method=%s old_size=$%.0f new_size=$%.0f "
+            "cap3x_binds_old=%s cap3x_binds_new=%s ann_vol=%.4f",
+            ticker, sizing_method, old_dollars, kelly_dollars,
+            kelly_raw > old_cap_3x, cap_binds, ann_vol,
+        )
         return kelly_dollars, round(kelly_frac, 6), sizing_method
 
     # Vol-targeting fallback
     raw_dollars = max(min(_penalize(vol_base), equity * 0.10), equity * POSITION_FLOOR_PCT)
+    # One-cycle migration check — see the note on the Kelly path above.
+    old_dollars = max(min(old_vol_base * penalty, equity * 0.10), equity * POSITION_FLOOR_PCT)
+    logger.info(
+        "[SIZING_MIGRATION_CHECK] %s method=vol_target_fallback old_size=$%.0f "
+        "new_size=$%.0f ann_vol=%.4f",
+        ticker, old_dollars, raw_dollars, ann_vol,
+    )
     return raw_dollars, 0.0, "vol_target_fallback"
 
 
