@@ -848,6 +848,19 @@ def get_backtest(ticker: str):
     # Change 1: 7bps commission + 0.1% slippage per trade side = 0.17% per side
     TC_PER_SIDE = 0.0017
 
+    # Phase 4b: vol-targeted position sizing. This backtest previously went 100% of
+    # the portfolio into every trade, exercising no sizing logic at all — its Sharpe
+    # and drawdown were not comparable to what live would do with the same signal.
+    # Entries are now sized like the live vol-target path (_position_dollars) and the
+    # portfolio backtest: base weight 0.01 / annualized 21-day vol, × the conviction
+    # multiplier from the composite score (75→1×, 95→1.5×), capped at 10% of the
+    # portfolio and floored at POSITION_FLOOR_PCT (sub-floor sizes are raised to the
+    # floor, exactly like _position_dollars — a single-ticker run has no portfolio
+    # normalization pass that could drop them). Kelly and the correlation penalty are
+    # deliberately out of scope: both need portfolio-level context (trade history
+    # across names / co-held positions) that a single-ticker simulation doesn't have.
+    # The unallocated remainder sits in cash earning 0.
+
     # Walk-forward simulation
     portfolio   = 1.0
     bah_base    = float(closes[TRAIN])
@@ -855,6 +868,7 @@ def get_backtest(ticker: str):
     hold_left   = 0
     trail_stop  = 0.0
     pos_weight  = 1.0   # fraction of the portfolio in the stock (halves after a profit-take)
+    entry_weights: list[float] = []  # diagnostic: vol-targeted weight of each entry
     entry_price_bt = 0.0
     profit_taken = False
     profit_takes = 0
@@ -1024,10 +1038,17 @@ def get_backtest(ticker: str):
 
                     in_pos = True
                     hold_left = HOLD
-                    pos_weight = 1.0
+                    # Phase 4b: vol-targeted entry weight (see sizing note above the loop).
+                    # returns[idx-21:idx] are the 21 daily returns ending at this decision
+                    # close — strictly point-in-time (returns[idx] is tomorrow's move).
+                    ann_vol_entry = float(returns[idx - 21: idx].std()) * np.sqrt(252.0)
+                    base_weight = 0.01 / max(ann_vol_entry, 0.001)
+                    conviction = min(1.0 + max(0.0, composite - 75.0) / 40.0, 1.5)
+                    pos_weight = max(min(base_weight * conviction, 0.10), POSITION_FLOOR_PCT)
+                    entry_weights.append(pos_weight)
                     profit_taken = False
                     entry_price_bt = float(closes[idx])
-                    portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: entry transaction cost
+                    portfolio *= (1.0 - TC_PER_SIDE * pos_weight)  # Change 1: entry transaction cost
                     trade_entry_val = portfolio
                     if use_atr_stop:
                         atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * 0.02
@@ -1088,11 +1109,17 @@ def get_backtest(ticker: str):
             "trades_after_gates":        trades_after_gates,
             "profit_takes":              profit_takes,
             "transaction_cost_bps_per_side": int(TC_PER_SIDE * 10000),
+            # Phase 4b: average vol-targeted entry weight (fraction of portfolio), so
+            # readers can see this backtest no longer goes all-in per trade.
+            "avg_entry_weight":          round(float(np.mean(entry_weights)), 4) if entry_weights else None,
             "filters":                   gate_rejections,
             "notes": (
                 "Entry mirrors live: composite ≥ buy threshold, composite ≥ 70 HMM "
                 "bull-confidence proxy, and the raised adaptive bear threshold when SPY "
-                "is below its 200-day MA. Profit-take halves the position at +15%. "
+                "is below its 200-day MA. Positions are VOL-TARGET SIZED (0.01 / "
+                "annualized 21d vol × conviction, 10% cap, 0.5% floor) — NOT 100% of "
+                "the portfolio per trade; the remainder sits in cash. "
+                "Profit-take halves the position at +15%. "
                 "Composite is computed from momentum + vol-adjusted trend only; "
                 "intentionally omitted (need real-time or point-in-time data this "
                 "simulation doesn't reconstruct): the earnings, insider and sentiment "
