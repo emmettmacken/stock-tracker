@@ -761,16 +761,27 @@ def get_backtest(ticker: str):
     TEST  = int(db.get_config("BACKTEST_TEST", "21"))
     # Fix 2-E: align with live system — 21-day max hold and ATR trailing stop on by default
     HOLD  = int(db.get_config("BACKTEST_HOLD", "21"))
+    # Shared ATR-stop multiplier for BOTH backtests. Default 1.5 = the live trader's
+    # multiplier (hardcoded there); changing this config moves both backtests together.
     atr_mult     = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
     use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "true").lower() == "true"
     macro_filter = db.get_config("BACKTEST_MACRO_FILTER", "true").lower() == "true"
-    # Entry now mirrors the live trader: enter when the composite score clears the same
-    # bull-regime BUY threshold (default 63), not on a discrete-Markov BUY. The macro
-    # filter below only lets trades through when SPY is above its 200-day MA (a bull
-    # regime), so the bull threshold — not the higher bear threshold — is the right bar.
-    buy_threshold = float(db.get_config("bull_threshold", "63"))
+    # Entry mirrors the live trader: enter when the composite clears the adaptive BUY
+    # threshold (bull default 63). In a bear regime (SPY below its 200-day MA) the bar
+    # rises to the adaptive bear threshold — exactly like live, a raised threshold, not
+    # the full entry block this backtest previously applied.
+    buy_threshold  = float(db.get_config("bull_threshold", "63"))
+    bear_threshold = float(db.get_config("bear_threshold", "80"))
+    # Overextension gate reads the same config as the live gate (was hardcoded 1.25 here).
+    oe_ratio = 1.0 + float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
+    # Live requires smoothed HMM bull-prob >= 0.70 to enter. That per-bar smoothed state
+    # can't be reconstructed point-in-time here, so composite >= 70 is used as a proxy —
+    # the same stand-in the portfolio backtest applies.
+    HMM_PROXY_THRESHOLD = 70.0
     # Mid-window deterioration exit, mirroring the live score-deterioration close.
     exit_threshold = 40.0
+    # Profit-take: close half at +15% above entry (parity with live + portfolio backtest).
+    PROFIT_TAKE_PCT = 0.15
 
     if n < TRAIN + TEST:
         raise HTTPException(status_code=400, detail="Need at least 2 years of history for backtest")
@@ -787,8 +798,10 @@ def get_backtest(ticker: str):
     # Change 1: precompute VIX history aligned to ticker dates for the VIX>30 gate.
     # Align by calendar date: the ^VIX feed is tz-aware in a different zone (CT) than
     # df.index (ET), so a direct timestamp reindex misses on every row and leaves the
-    # whole series NaN. Any date still missing (or a failed fetch) is treated as
-    # fail-open by the gate test in the loop below.
+    # whole series NaN. Parity with live: when the VIX feed is unavailable the gate
+    # fails CLOSED (live treats a failed VIX fetch as elevated volatility and blocks
+    # all new buys) — vix_unavailable below rejects every entry, replacing the old
+    # fail-open skip of the gate.
     vix_series_bt: Optional[np.ndarray] = None
     try:
         vix_df_bt = yf.Ticker("^VIX").history(period="2y")
@@ -799,7 +812,8 @@ def get_backtest(ticker: str):
             ).ffill().bfill()
             vix_series_bt = vix_aligned.values.astype(float)[1:]  # length n, aligned with returns
     except Exception:
-        vix_series_bt = None  # fail open: skip VIX gate if data unavailable
+        vix_series_bt = None
+    vix_unavailable = vix_series_bt is None  # fail closed, matching live
 
     # Change 1: precompute SPY 200-day MA for macro filter (one SPY fetch, no in-loop calls)
     spy_above_ma: Optional[np.ndarray] = None
@@ -840,6 +854,10 @@ def get_backtest(ticker: str):
     in_pos      = False
     hold_left   = 0
     trail_stop  = 0.0
+    pos_weight  = 1.0   # fraction of the portfolio in the stock (halves after a profit-take)
+    entry_price_bt = 0.0
+    profit_taken = False
+    profit_takes = 0
     daily_strat: list[float] = []
     equity_curve: list[dict] = []
     trade_results: list[bool] = []
@@ -848,6 +866,8 @@ def get_backtest(ticker: str):
 
     # Change 1: gate rejection counters for comparison output
     gate_rejections: dict[str, int] = {
+        "hmm_proxy": 0,
+        "bear_regime_threshold": 0,
         "vix_too_high": 0,
         "overextended": 0,
         "momentum_disagreement": 0,
@@ -891,14 +911,26 @@ def get_backtest(ticker: str):
 
             # Portfolio update: earn r_t if already in position BEFORE this decision
             if in_pos:
+                cur_price = closes[idx]
+                # Profit-take (parity with live + portfolio backtest): once the position
+                # is +15% above its entry close, close half. The banked half stops
+                # earning (pos_weight halves); the remaining half keeps running under
+                # the trailing-stop / hold / deterioration exits. Trim once per holding;
+                # no re-entry cooldown is armed (the position stays open). Checked
+                # before the stop, mirroring the live stop-loss job's order.
+                if (not profit_taken and entry_price_bt > 0
+                        and (cur_price - entry_price_bt) / entry_price_bt >= PROFIT_TAKE_PCT):
+                    portfolio *= (1.0 - TC_PER_SIDE * pos_weight * 0.5)  # exit cost on the closed half
+                    pos_weight *= 0.5
+                    profit_taken = True
+                    profit_takes += 1
                 atr_exit = False
                 if use_atr_stop:
-                    cur_price = closes[idx]
                     atr_now = atr_series[idx] if atr_series[idx] > 0 else cur_price * 0.02
                     candidate = cur_price - atr_mult * atr_now
                     trail_stop = max(trail_stop, candidate)
                     if cur_price < trail_stop:
-                        portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: exit transaction cost
+                        portfolio *= (1.0 - TC_PER_SIDE * pos_weight)  # Change 1: exit transaction cost
                         trade_results.append(portfolio > trade_entry_val)
                         in_pos = False
                         last_exit_idx = idx
@@ -906,13 +938,13 @@ def get_backtest(ticker: str):
                 if atr_exit:
                     daily_strat.append(0.0)
                 else:
-                    portfolio *= (1 + r_t)
-                    daily_strat.append(r_t)
+                    portfolio *= (1 + pos_weight * r_t)
+                    daily_strat.append(pos_weight * r_t)
                     hold_left -= 1
                     # Mid-window exit on score deterioration (mirrors the live
                     # score-deterioration close) or max-hold expiry.
                     if composite < exit_threshold or hold_left <= 0:
-                        portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: exit transaction cost
+                        portfolio *= (1.0 - TC_PER_SIDE * pos_weight)  # Change 1: exit transaction cost
                         trade_results.append(portfolio > trade_entry_val)
                         in_pos = False
                         last_exit_idx = idx
@@ -922,59 +954,84 @@ def get_backtest(ticker: str):
                     # Diagnostic score for this BUY signal (0–100): the composite itself.
                     # Logging only, never affects trade decisions.
                     buy_score = composite
-                    spy_ok = (spy_above_ma is None) or bool(spy_above_ma[idx])
-                    if macro_filter and not spy_ok:
-                        _log_rejection(idx, "macro_circuit_breaker", buy_score,
-                                       "SPY below its 200-day MA")
-                    if not macro_filter or spy_ok:
-                        total_buy_signals_raw += 1
+                    total_buy_signals_raw += 1
 
-                        # Change 1: VIX > 30 gate
-                        if vix_series_bt is not None and idx < len(vix_series_bt):
-                            if vix_series_bt[idx] > 30.0:
-                                gate_rejections["vix_too_high"] += 1
-                                _log_rejection(idx, "vix_too_high", buy_score,
-                                               f"VIX={vix_series_bt[idx]:.1f} > 30")
-                                continue
+                    # HMM bull-confidence proxy (parity with live + portfolio backtest):
+                    # live requires smoothed_bull_prob >= 0.70 to enter; composite >= 70
+                    # is the accepted point-in-time stand-in.
+                    if composite < HMM_PROXY_THRESHOLD:
+                        gate_rejections["hmm_proxy"] += 1
+                        _log_rejection(idx, "hmm_proxy", buy_score,
+                                       f"composite {composite:.1f} < {HMM_PROXY_THRESHOLD:.0f} HMM bull-confidence proxy")
+                        continue
 
-                        # Change 1: overextension gate (price > 1.25×MA20 unless top-quartile momentum)
-                        if idx < len(ma20_series) and ma20_series[idx] > 0:
-                            price_ratio = closes[idx] / ma20_series[idx]
-                            top_q_mom = (
-                                not np.isnan(ret_63d_bt[idx]) and
-                                not np.isnan(mom_q75_bt[idx]) and
-                                ret_63d_bt[idx] >= mom_q75_bt[idx]
-                            )
-                            if price_ratio > 1.25 and not top_q_mom:
-                                gate_rejections["overextended"] += 1
-                                _log_rejection(idx, "overextended", buy_score,
-                                               f"price {price_ratio:.2f}× MA20 (>1.25), not top-quartile momentum")
-                                continue
+                    # Bear-regime threshold (parity with live): SPY below its 200-day MA
+                    # raises the buy bar to the adaptive bear threshold instead of
+                    # blocking entries outright (the old macro_circuit_breaker). Fails
+                    # open to the bull threshold when SPY data is unavailable, matching
+                    # live's macro fallback.
+                    bull_regime = (not macro_filter) or (spy_above_ma is None) or bool(spy_above_ma[idx])
+                    if not bull_regime and composite < bear_threshold:
+                        gate_rejections["bear_regime_threshold"] += 1
+                        _log_rejection(idx, "bear_regime_threshold", buy_score,
+                                       f"bear regime (SPY<200d MA): composite {composite:.1f} < raised threshold {bear_threshold:.0f}")
+                        continue
 
-                        # Change 1: momentum disagreement gate
-                        r3  = ret_3m_bt[idx]
-                        r12 = ret_12m_bt[idx]
-                        if not np.isnan(r3) and not np.isnan(r12):
-                            if (r3 + r12) <= 0 or r3 < -0.10 or r12 < -0.10:
-                                gate_rejections["momentum_disagreement"] += 1
-                                _log_rejection(idx, "momentum_disagreement", buy_score,
-                                               f"3m={r3:+.1%}, 12m={r12:+.1%}")
-                                continue
-
-                        # Change 1: re-entry cooldown (2 trading days after last exit)
-                        if idx - last_exit_idx < 2:
-                            gate_rejections["reentry_cooldown"] += 1
-                            _log_rejection(idx, "reentry_cooldown", buy_score,
-                                           f"{idx - last_exit_idx} days since last exit, cooldown=2")
+                    # Change 1: VIX > 30 gate — fails CLOSED when VIX data is missing (matches live)
+                    if vix_unavailable:
+                        gate_rejections["vix_too_high"] += 1
+                        _log_rejection(idx, "vix_too_high", buy_score,
+                                       "VIX data unavailable — failing closed (matches live)")
+                        continue
+                    if vix_series_bt is not None and idx < len(vix_series_bt):
+                        if vix_series_bt[idx] > 30.0:
+                            gate_rejections["vix_too_high"] += 1
+                            _log_rejection(idx, "vix_too_high", buy_score,
+                                           f"VIX={vix_series_bt[idx]:.1f} > 30")
                             continue
 
-                        in_pos = True
-                        hold_left = HOLD
-                        portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: entry transaction cost
-                        trade_entry_val = portfolio
-                        if use_atr_stop:
-                            atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * 0.02
-                            trail_stop = closes[idx] - atr_mult * atr_entry
+                    # Change 1: overextension gate (price > oe_ratio×MA20 unless top-quartile
+                    # momentum) — same OVEREXTENDED_THRESHOLD_PCT config as the live gate.
+                    if idx < len(ma20_series) and ma20_series[idx] > 0:
+                        price_ratio = closes[idx] / ma20_series[idx]
+                        top_q_mom = (
+                            not np.isnan(ret_63d_bt[idx]) and
+                            not np.isnan(mom_q75_bt[idx]) and
+                            ret_63d_bt[idx] >= mom_q75_bt[idx]
+                        )
+                        if price_ratio > oe_ratio and not top_q_mom:
+                            gate_rejections["overextended"] += 1
+                            _log_rejection(idx, "overextended", buy_score,
+                                           f"price {price_ratio:.2f}× MA20 (>{oe_ratio:.2f}), not top-quartile momentum")
+                            continue
+
+                    # Change 1: momentum disagreement gate
+                    r3  = ret_3m_bt[idx]
+                    r12 = ret_12m_bt[idx]
+                    if not np.isnan(r3) and not np.isnan(r12):
+                        if (r3 + r12) <= 0 or r3 < -0.10 or r12 < -0.10:
+                            gate_rejections["momentum_disagreement"] += 1
+                            _log_rejection(idx, "momentum_disagreement", buy_score,
+                                           f"3m={r3:+.1%}, 12m={r12:+.1%}")
+                            continue
+
+                    # Change 1: re-entry cooldown (2 trading days after last exit)
+                    if idx - last_exit_idx < 2:
+                        gate_rejections["reentry_cooldown"] += 1
+                        _log_rejection(idx, "reentry_cooldown", buy_score,
+                                       f"{idx - last_exit_idx} days since last exit, cooldown=2")
+                        continue
+
+                    in_pos = True
+                    hold_left = HOLD
+                    pos_weight = 1.0
+                    profit_taken = False
+                    entry_price_bt = float(closes[idx])
+                    portfolio *= (1.0 - TC_PER_SIDE)  # Change 1: entry transaction cost
+                    trade_entry_val = portfolio
+                    if use_atr_stop:
+                        atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * 0.02
+                        trail_stop = closes[idx] - atr_mult * atr_entry
 
             bah_val = float(closes[idx + 1]) / bah_base if idx + 1 < len(closes) else float(closes[-1]) / bah_base
             raw_date = dates[idx]
@@ -1021,6 +1078,7 @@ def get_backtest(ticker: str):
         "win_rate_trades":         round(win_rate_trades, 1),
         "num_trades":              len(trade_results),
         "num_windows":             (n - TRAIN) // TEST,
+        "profit_takes":            profit_takes,
         # Diagnostic-only: why qualifying BUY signals didn't convert to trades
         "gate_rejections":         rejection_events,
         "gate_rejection_summary":  gate_rejection_summary,
@@ -1028,13 +1086,19 @@ def get_backtest(ticker: str):
         "gate_comparison": {
             "total_buy_signals_raw":     total_buy_signals_raw,
             "trades_after_gates":        trades_after_gates,
-            "filters":                   gate_rejections,
+            "profit_takes":              profit_takes,
             "transaction_cost_bps_per_side": int(TC_PER_SIDE * 10000),
+            "filters":                   gate_rejections,
             "notes": (
-                "Entry uses composite score ≥ buy threshold (matches live). "
-                "Composite is computed from momentum + vol-adjusted trend only; earnings, "
-                "insider, sentiment, earnings_within_2d and sector_cap gates require "
-                "real-time data unavailable in historical simulation."
+                "Entry mirrors live: composite ≥ buy threshold, composite ≥ 70 HMM "
+                "bull-confidence proxy, and the raised adaptive bear threshold when SPY "
+                "is below its 200-day MA. Profit-take halves the position at +15%. "
+                "Composite is computed from momentum + vol-adjusted trend only; "
+                "intentionally omitted (need real-time or point-in-time data this "
+                "simulation doesn't reconstruct): the earnings, insider and sentiment "
+                "factors, the earnings_within_2d and sector_cap gates, the "
+                "volume_below_average gate, and the volume-divergence modifier inside "
+                "the vol-trend factor."
             ),
         },
     }
@@ -2487,9 +2551,17 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         # Change 1: 7bps commission + 0.1% slippage per side
         TC_PER_SIDE_PB = 0.0017
         # Entry/exit now mirror the live trader and the single-ticker backtest: allocate
-        # to tickers whose composite clears the buy threshold, exit on score deterioration.
-        buy_threshold = float(db.get_config("bull_threshold", "63"))
+        # to tickers whose composite clears the buy threshold, exit on score deterioration,
+        # trail a 1.5×ATR stop, and take half profit at +15%.
+        buy_threshold  = float(db.get_config("bull_threshold", "63"))
+        # Parity with live: the same adaptive bear threshold the live trader raises the
+        # bar to when SPY is below its 200-day MA (was hardcoded 80.0 here).
+        bear_threshold = float(db.get_config("bear_threshold", "80"))
+        # Same shared ATR-stop multiplier as the single-ticker backtest; default 1.5 =
+        # the live trader's multiplier.
+        atr_mult_pb = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
         exit_threshold = 40.0
+        PROFIT_TAKE_PCT = 0.15
 
         # Walk-forward
         portfolio_val = req.capital
@@ -2497,11 +2569,15 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         rebalance_events: list[dict] = []
         per_ticker_contrib: dict[str, float] = {t: 0.0 for t in valid}
         mid_window_exits = 0  # Change 1: counter for score-deterioration early exits
+        stop_loss_exits = 0   # Parity (C3): counter for trailing-ATR-stop exits
         # Profit-take bookkeeping: per-ticker entry close (the +15% trim basis), the set of
         # names already trimmed this holding (trim once, not every bar), and a run counter.
         entry_prices_bt: dict[str, float] = {}
         profit_taken_bt: set[str] = set()
         profit_takes_bt = 0
+        # Trailing-stop bookkeeping (parity with live / single-ticker backtest): current
+        # stop level per held ticker, seeded at entry and ratcheted up per bar below.
+        trail_stops_pb: dict[str, float] = {}
 
         # SPY benchmark
         spy_closes = None
@@ -2511,12 +2587,13 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             spy_closes = spy_aligned.values
 
         # Entry gates added to narrow the divergence from the live trader and the
-        # single-ticker backtest, which both refuse new entries under these conditions.
-        # These are computed POINT-IN-TIME (one value per historical date), mirroring the
-        # single-ticker backtest — not from the live _macro_regime() snapshot, which only
-        # describes today and would be wrong applied across historical rebalance points.
+        # single-ticker backtest. These are computed POINT-IN-TIME (one value per
+        # historical date), mirroring the single-ticker backtest — not from the live
+        # _macro_regime() snapshot, which only describes today and would be wrong applied
+        # across historical rebalance points.
         #
-        # Macro gate: SPY below its 200-day MA → no new entries this rebalance (go to cash).
+        # Macro regime: SPY below its 200-day MA raises the per-ticker buy bar to the
+        # adaptive bear threshold (parity with live) — it no longer blocks entries outright.
         spy_above_ma: Optional[np.ndarray] = None
         if "SPY" in dfs:
             try:
@@ -2528,8 +2605,9 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 
         # VIX gate: VIX > 30 → no new entries this rebalance. Align by calendar date: the
         # ^VIX feed is tz-aware in a different zone (CT) than dates_idx (ET), so a direct
-        # timestamp reindex would miss on every row. Any date still missing (or a failed
-        # fetch) leaves NaN and is treated as fail-open by the gate test below.
+        # timestamp reindex would miss on every row. Parity with live: an unavailable VIX
+        # feed fails CLOSED (live treats a failed fetch as elevated volatility and blocks
+        # all new buys) — vix_ok below is False when the series is missing.
         vix_series_pb: Optional[np.ndarray] = None
         try:
             vix_df_pb = yf.Ticker("^VIX").history(period="2y")
@@ -2539,7 +2617,24 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     [vix_by_date.get(d.date(), np.nan) for d in dates_idx]
                 ).ffill().bfill().values.astype(float)  # length n_days
         except Exception:
-            vix_series_pb = None  # fail open: skip VIX gate if data unavailable
+            vix_series_pb = None  # fail closed: entries blocked while VIX is unavailable
+
+        # Parity (C3): per-ticker Wilder-21 ATR series for the trailing stop, aligned to
+        # the combined date index (same _wilder_atr the live path and the single-ticker
+        # backtest use). NaN early indices are handled by the 2%-of-price fallback below.
+        atr_series_pb: dict[str, np.ndarray] = {}
+        for _t in valid:
+            _atr_full = np.full(n_days, np.nan)
+            try:
+                _h = dfs[_t]["High"].reindex(dates_idx).ffill().bfill().values.astype(float)
+                _l = dfs[_t]["Low"].reindex(dates_idx).ffill().bfill().values.astype(float)
+                _c = combined_arr[:, valid.index(_t)]
+                _tr = np.maximum(_h[1:] - _l[1:],
+                                 np.maximum(np.abs(_h[1:] - _c[:-1]), np.abs(_l[1:] - _c[:-1])))
+                _atr_full[1:] = _wilder_atr(_tr, 21)
+            except Exception:
+                pass  # missing High/Low → fallback ATR (2% of price) applies per bar
+            atr_series_pb[_t] = _atr_full
 
         # Re-entry cooldown: a ticker exited mid-window on score deterioration may not be
         # re-bought until 2 trading days have passed (mirrors the live trader / single-ticker
@@ -2548,11 +2643,15 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         # would otherwise sit 1 day from its prior window and never re-enter).
         last_exit_idx: dict[str, int] = {t: -100 for t in valid}
 
-        # Remaining divergence (intentional, not fixed here): the live trader and single-ticker
-        # backtest also apply overextension and 3m/12m momentum-disagreement gates. Those need
-        # intra-window per-bar price context this rebalancing model doesn't evaluate per ticker,
-        # so they are NOT replicated. The portfolio backtest is therefore now CLOSER TO but
-        # still NOT IDENTICAL to live behaviour.
+        # Remaining divergence (intentional, not fixed here) — gates/inputs the live trader
+        # applies that this rebalancing model does NOT replicate:
+        #   - overextension and 3m/12m momentum-disagreement gates (need intra-window
+        #     per-bar price context this model doesn't evaluate per ticker)
+        #   - the volume_below_average confirmation gate and the volume-divergence
+        #     modifier inside the vol-trend factor (need point-in-time volume handling)
+        #   - the earnings/insider/sentiment factors and the earnings_within_2d and
+        #     sector_cap gates (need real-time data with no historical per-day source)
+        # The portfolio backtest is therefore CLOSER TO but still NOT IDENTICAL to live.
         test_start = TRAIN
         while test_start + TEST <= n_days - 1:
             ts = test_start - TRAIN
@@ -2586,25 +2685,25 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     continue
 
                 # Fix 4 — regime-adaptive threshold (issue 11). In a bear regime (SPY below
-                # its 200-day MA) the live trader raises the buy bar; mirror that with an 80
-                # threshold, falling back to the normal bull threshold otherwise. spy_above_ma
-                # may be None (data fail-open) → treat as bull regime.
+                # its 200-day MA) the live trader raises the buy bar to the adaptive bear
+                # threshold; mirror that exactly (same config key, no hardcoded 80).
+                # spy_above_ma may be None (data fail-open) → treat as bull regime.
                 bull_regime = (spy_above_ma is None) or bool(spy_above_ma[test_start])
-                regime_threshold = buy_threshold if bull_regime else 80.0
+                regime_threshold = buy_threshold if bull_regime else bear_threshold
                 is_buy = composite >= regime_threshold
                 # Re-entry cooldown: block a BUY within 2 trading days of a mid-window exit.
                 if is_buy and (test_start - last_exit_idx[t]) < 2:
                     is_buy = False
                 signals_window[t] = "BUY" if is_buy else "HOLD"
 
-            # Market-wide entry gates evaluated at this rebalance date. When either blocks,
-            # no new entries are taken and the portfolio holds cash for the window (we do NOT
-            # fall back to equal weight, which would defeat the gate).
-            macro_ok = (spy_above_ma is None) or bool(spy_above_ma[test_start])
-            # Fail open: only a real reading above 30 blocks (NaN > 30 is False), matching
-            # the single-ticker backtest so a VIX data gap never silently kills the run.
-            vix_ok = (vix_series_pb is None) or not (vix_series_pb[test_start] > 30.0)
-            entries_allowed = macro_ok and vix_ok
+            # Market-wide VIX gate at this rebalance date. When it blocks, no new entries
+            # are taken and the portfolio holds cash for the window (we do NOT fall back
+            # to equal weight, which would defeat the gate). The macro (SPY<200d) regime
+            # no longer blocks entries here — parity with live, where a bear regime
+            # raises the per-ticker buy threshold (applied above) instead of pausing.
+            # Parity with live: fails CLOSED when the VIX series is unavailable.
+            vix_ok = (vix_series_pb is not None) and not (vix_series_pb[test_start] > 30.0)
+            entries_allowed = vix_ok
             if not entries_allowed:
                 for t in valid:
                     signals_window[t] = "HOLD"
@@ -2669,17 +2768,23 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             # Change 1: live_weights tracks positions that haven't been exited mid-window
             live_weights = dict(weights)
 
-            # Profit-take bookkeeping: record each newly entered ticker's entry close (basis
-            # kept across windows while the name stays held), and drop the basis/flag for any
-            # name not held this window so a later re-entry is measured from a fresh entry.
+            # Profit-take / trailing-stop bookkeeping: record each newly entered ticker's
+            # entry close (basis kept across windows while the name stays held) and seed
+            # its trailing stop at entry − mult×ATR (parity with live / single-ticker
+            # backtest); drop basis, trim flag and stop for any name not held this window
+            # so a later re-entry starts fresh.
             for t in valid:
                 if weights.get(t, 0.0) > 0:
-                    entry_prices_bt.setdefault(
-                        t, float(combined_arr[test_start, valid.index(t)])
-                    )
+                    if t not in entry_prices_bt:
+                        _px = float(combined_arr[test_start, valid.index(t)])
+                        entry_prices_bt[t] = _px
+                        _a = atr_series_pb[t][test_start]
+                        _atr0 = float(_a) if not np.isnan(_a) and _a > 0 else _px * 0.02
+                        trail_stops_pb[t] = _px - atr_mult_pb * _atr0
                 else:
                     entry_prices_bt.pop(t, None)
                     profit_taken_bt.discard(t)
+                    trail_stops_pb.pop(t, None)
 
             # Simulate TEST days with these weights
             for idx in range(test_start, min(test_start + TEST, n_days - 1)):
@@ -2698,13 +2803,34 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     # profit-take which leaves the other half under the trailing stop).
                     if t not in profit_taken_bt:
                         entry_px = entry_prices_bt.get(t)
-                        if entry_px and (c_t[idx] - entry_px) / entry_px >= 0.15:
+                        if entry_px and (c_t[idx] - entry_px) / entry_px >= PROFIT_TAKE_PCT:
                             half_weight = live_weights[t] * 0.5
                             # Charge exit cost on the closed half only
                             portfolio_val *= (1.0 - TC_PER_SIDE_PB * half_weight)
                             live_weights[t] = half_weight
                             profit_taken_bt.add(t)
                             profit_takes_bt += 1
+                            continue
+
+                    # Trailing ATR stop (parity with live / single-ticker backtest): ratchet
+                    # the stop up as price rises; exit the remaining position when the close
+                    # falls below it. Arms the re-entry cooldown like a live stop_loss exit.
+                    stop = trail_stops_pb.get(t)
+                    if stop is not None:
+                        _a = atr_series_pb[t][idx]
+                        _atr_now = float(_a) if not np.isnan(_a) and _a > 0 else float(c_t[idx]) * 0.02
+                        candidate = float(c_t[idx]) - atr_mult_pb * _atr_now
+                        if candidate > stop:
+                            stop = candidate
+                            trail_stops_pb[t] = stop
+                        if c_t[idx] < stop:
+                            portfolio_val *= (1.0 - TC_PER_SIDE_PB * live_weights[t])
+                            live_weights[t] = 0.0
+                            stop_loss_exits += 1
+                            last_exit_idx[t] = idx  # arm the re-entry cooldown
+                            entry_prices_bt.pop(t, None)
+                            profit_taken_bt.discard(t)
+                            trail_stops_pb.pop(t, None)
                             continue
 
                     composite = _backtest_composite(c_t[: idx + 1])
@@ -2717,6 +2843,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         # Full exit: clear the profit-take basis so a re-entry starts fresh.
                         entry_prices_bt.pop(t, None)
                         profit_taken_bt.discard(t)
+                        trail_stops_pb.pop(t, None)
 
                 contrib_sum = 0.0
                 for i, t in enumerate(valid):
@@ -2789,13 +2916,20 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             "rebalance_events": rebalance_events,
             "efficient_frontier": ef_points,
             "profit_takes": profit_takes_bt,
+            "stop_loss_exits": stop_loss_exits,
             # Change 1: gate comparison showing mid-window exit impact and cost drag
             "gate_comparison": {
                 "total_rebalances": (n_days - TRAIN) // TEST,
                 "mid_window_exits": mid_window_exits,
+                "stop_loss_exits": stop_loss_exits,
                 "profit_takes": profit_takes_bt,
                 "transaction_cost_bps_per_side": int(TC_PER_SIDE_PB * 10000),
-                "notes": "mid_window_exits fired when a held ticker's composite fell below the deterioration threshold; profit_takes halved a position once it reached +15% above entry",
+                "notes": (
+                    "mid_window_exits fired when a held ticker's composite fell below the "
+                    "deterioration threshold; stop_loss_exits fired when a held ticker's "
+                    "close fell below its trailing ATR stop; profit_takes halved a position "
+                    "once it reached +15% above entry"
+                ),
             },
         }
     except HTTPException:
