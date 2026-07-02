@@ -128,6 +128,7 @@ const EXIT_LABELS: Record<string, string> = {
   max_hold_exit:           "Time Exit",
   score_deterioration:     "Score Drop",
   macro_drawdown_protection: "Macro Exit",
+  profit_take_half:        "Profit Take ½",
 };
 
 // snake_case gate/factor key → Title Case label

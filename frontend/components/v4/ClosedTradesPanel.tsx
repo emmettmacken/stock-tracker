@@ -8,6 +8,7 @@ const EXIT_LABELS: Record<string, string> = {
   max_hold_exit:             "Time Exit",
   score_deterioration:       "Score Drop",
   macro_drawdown_protection: "Macro Protect",
+  profit_take_half:          "Profit Take ½",
 };
 
 function ExitBadge({ reason }: { reason: string }) {
@@ -17,6 +18,7 @@ function ExitBadge({ reason }: { reason: string }) {
     max_hold_exit:             "text-amber-300 bg-amber-900/40 border-amber-700/40",
     score_deterioration:       "text-orange-300 bg-orange-900/40 border-orange-700/40",
     macro_drawdown_protection: "text-zinc-300 bg-zinc-800 border-zinc-700",
+    profit_take_half:          "text-emerald-300 bg-emerald-900/40 border-emerald-700/40",
   };
   return (
     <span className={`inline-flex px-1.5 py-0.5 rounded border text-[10px] font-medium ${styles[reason] ?? "text-zinc-400 bg-zinc-800 border-zinc-700"}`}>

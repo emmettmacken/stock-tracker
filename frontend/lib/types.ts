@@ -365,7 +365,9 @@ export interface TradeOutcome {
   entry_signal_id: number | null;
   entry_price: number;
   exit_price: number;
-  exit_reason: "sell_signal" | "stop_loss" | "max_hold_exit" | "score_deterioration" | "macro_drawdown_protection";
+  // profit_take_half = the +15% trimmed half of a position, recorded as its own leg;
+  // the remaining half closes later under one of the other reasons.
+  exit_reason: "sell_signal" | "stop_loss" | "max_hold_exit" | "score_deterioration" | "macro_drawdown_protection" | "profit_take_half";
   return_pct: number;
   holding_days: number;
   composite_score_at_entry: number | null;

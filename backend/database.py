@@ -134,6 +134,22 @@ def _run_migrations() -> None:
         # never captured this and must not fake it).
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN entry_dollars REAL"),
         ("signal_log",     "ALTER TABLE signal_log ADD COLUMN equity_at_entry REAL"),
+        # C4 fix (Jul 2026): a profit-take half-close now writes its own trade_outcomes
+        # row at trim time (leg='profit_take', half the entry dollars, the trim's own
+        # realized return); the eventual close of the rest writes a second row
+        # (leg='remainder', the other half). Both link to the same entry_signal_id, so
+        # that column is no longer a 1:1 key for trimmed positions. leg stays NULL for
+        # ordinary whole-position closes. entry_dollars is the dollars at risk for THIS
+        # row's leg (full size when leg is NULL).
+        #
+        # MIGRATION NOTE — historical rows: trades closed before this fix where a
+        # profit-take occurred have a single row whose return_pct describes only the
+        # remaining half (the banked +15% half was never recorded), so their win/loss
+        # classification can be wrong. These rows are NOT retroactively split; leg and
+        # entry_dollars stay NULL on them. Only rows written after this migration carry
+        # the corrected two-leg accounting.
+        ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN leg TEXT"),
+        ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN entry_dollars REAL"),
     ]
     # Auth tables (JWT login + email verification). Created here in _run_migrations
     # so they land on every existing deployment without needing a fresh init_db.
@@ -597,11 +613,27 @@ def record_close_transaction(
     entry_signal_id: Optional[int],
     composite_score_at_entry: Optional[float],
     regime_at_entry: Optional[str] = None,
+    leg: Optional[str] = None,
+    entry_dollars: Optional[float] = None,
+    log_reason: Optional[str] = None,
 ) -> None:
-    """Atomically write signal_log SELL + trade_outcomes + ticker_performance in one transaction."""
+    """Atomically write signal_log SELL + trade_outcomes + ticker_performance in one transaction.
+
+    `leg` distinguishes the two rows a profit-taken position produces against the same
+    entry_signal_id: 'profit_take' (the +15% trimmed half, written at trim time) and
+    'remainder' (the other half, written when the rest closes). None = ordinary
+    whole-position close (exactly one row, as before). `entry_dollars` is the dollars at
+    risk for this leg. `log_reason` overrides the signal_log skip_reason text when the
+    display string carries a suffix (e.g. "profit_take_half:+15.2%"); trade_outcomes
+    always stores the plain exit_reason so analytics group cleanly.
+
+    A profit_take_half leg updates ticker_performance (both legs are real win/loss
+    observations for Kelly and win-rate stats) but does NOT set last_exit_at — the
+    position is still open, so the re-entry cooldown must not be armed.
+    """
     now = datetime.utcnow().isoformat()
     is_win = 1.0 if return_pct > 0 else 0.0
-    set_exit_at = exit_reason != "sell_signal"
+    set_exit_at = exit_reason not in ("sell_signal", "profit_take_half")
     ticker = ticker.upper()
     with _conn() as conn:
         # If regime not passed, look it up from the BUY signal_log entry
@@ -620,16 +652,17 @@ def record_close_transaction(
                (ticker, timestamp, composite_score, signal, action,
                 skip_reason, price_at_signal, atr_at_signal)
                VALUES (?, ?, ?, 'SELL', 'closed', ?, ?, 0.0)""",
-            (ticker, now, score, exit_reason, current_price),
+            (ticker, now, score, log_reason or exit_reason, current_price),
         )
         conn.execute(
             """INSERT INTO trade_outcomes
                (ticker, entry_signal_id, entry_price, exit_price, exit_reason,
                 return_pct, holding_days, composite_score_at_entry, exit_timestamp,
-                regime_at_entry)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                regime_at_entry, leg, entry_dollars)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker, entry_signal_id, entry_price, current_price, exit_reason,
-             return_pct, holding_days, composite_score_at_entry, now, regime_at_entry),
+             return_pct, holding_days, composite_score_at_entry, now, regime_at_entry,
+             leg, entry_dollars),
         )
         row = conn.execute(
             "SELECT total_trades, win_rate, avg_return FROM ticker_performance WHERE ticker = ?",

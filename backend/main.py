@@ -3171,7 +3171,17 @@ def _record_close(ticker: str, current_price: float, entry_price: float,
                   exit_reason: str, entry_log: Optional[dict],
                   score: Optional[float] = None) -> None:
     """Write signal_log SELL + trade_outcomes + ticker_performance for a close that has
-    already executed at the broker, arming the re-entry cooldown.
+    already executed at the broker. Full closes arm the re-entry cooldown; a profit-take
+    half-close records its own leg without arming it (the position is still open).
+
+    A position that was profit-taken produces TWO trade_outcomes rows against the same
+    entry_signal_id: leg='profit_take' (the +15% trimmed half, written here at trim
+    time) and leg='remainder' (the other half, written when the rest closes). Each leg
+    carries half the original entry_dollars and its own realized return, so Kelly, edge
+    stats, ticker_performance and the adaptive-threshold job see the true per-leg
+    win/loss distribution — previously the banked +15% half was never recorded and a
+    trimmed trade could be logged as a single loss. Untrimmed positions still write
+    exactly one row (leg NULL, full entry_dollars).
 
     Retries transient DB failures (e.g. SQLite locks when the scheduler and a request
     handler hit the DB at once) up to 3 times before giving up, so a momentary lock does
@@ -3186,28 +3196,33 @@ def _record_close(ticker: str, current_price: float, entry_price: float,
         except Exception:
             pass
 
-    # Partial profit-take: the position is only halved, not flat. Record it in signal_log for
-    # visibility but do NOT call record_close_transaction — that would arm the re-entry
-    # cooldown and count the trim as a win/loss in ticker_performance. The remaining half is
-    # still open and managed by the trailing-stop / hold / deterioration logic.
+    entry_signal_id = entry_log["id"] if entry_log else None
+    score_at_entry  = entry_log.get("composite_score") if entry_log else None
+    full_dollars    = entry_log.get("entry_dollars") if entry_log else None
+
     if exit_reason == "profit_take_half":
-        try:
-            db.log_signal(
-                ticker, score, None, "closed",
-                f"profit_take_half:+{ret:.1f}%", current_price, None,
-            )
-        except Exception as db_err:
-            logger.error("profit-take log_signal failed for %s: %s", ticker, db_err)
-        logger.info("%s: profit-take half at %.2f (+%.1f%%)", ticker, current_price, ret)
-        return
+        # Trimmed half: its own outcome row, half the dollars, no cooldown (see
+        # record_close_transaction, which skips last_exit_at for this exit_reason).
+        # return_pct on entry_price is exactly the trimmed half's realized return.
+        leg = "profit_take"
+        leg_dollars = full_dollars / 2 if full_dollars else None
+        log_reason = f"profit_take_half:+{ret:.1f}%"
+    else:
+        # Full close. If this holding was already trimmed, this row is the remaining
+        # half (other half of the dollars); otherwise the whole position, as before.
+        trimmed = bool(
+            entry_log and db.has_partial_close_since(ticker, entry_log["timestamp"])
+        )
+        leg = "remainder" if trimmed else None
+        leg_dollars = (full_dollars / 2 if trimmed else full_dollars) if full_dollars else None
+        log_reason = None  # plain exit_reason in signal_log
 
     for attempt in range(3):
         try:
             db.record_close_transaction(
                 ticker, score, exit_reason, current_price, entry_price,
-                ret, hold,
-                entry_log["id"] if entry_log else None,
-                entry_log.get("composite_score") if entry_log else None,
+                ret, hold, entry_signal_id, score_at_entry,
+                leg=leg, entry_dollars=leg_dollars, log_reason=log_reason,
             )
             break
         except Exception as db_err:
@@ -3220,10 +3235,13 @@ def _record_close(ticker: str, current_price: float, entry_price: float,
             else:
                 logger.error(
                     "broker close SUCCEEDED but DB transaction FAILED after 3 attempts "
-                    "for %s — cooldown not set, trade unrecorded: %s",
+                    "for %s — trade leg unrecorded: %s",
                     ticker, db_err,
                 )
-    logger.info("%s: closed (%s) at %.2f (%.1f%%)", ticker, exit_reason, current_price, ret)
+    if exit_reason == "profit_take_half":
+        logger.info("%s: profit-take half at %.2f (+%.1f%%)", ticker, current_price, ret)
+    else:
+        logger.info("%s: closed (%s) at %.2f (%.1f%%)", ticker, exit_reason, current_price, ret)
 
 
 def _close_and_record(api, ticker: str, current_price: float, entry_price: float,
