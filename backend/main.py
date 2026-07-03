@@ -2670,14 +2670,54 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         # would otherwise sit 1 day from its prior window and never re-enter).
         last_exit_idx: dict[str, int] = {t: -100 for t in valid}
 
+        # Phase 4c (item 3): point-in-time win-rate performance multiplier, mirroring the
+        # ×1.2/×0.7 multiplier _position_dollars derives from ticker_performance. Live's
+        # historical win rate obviously can't be used here (it reflects trades this
+        # simulation never took, at dates that may postdate the window), so the backtest
+        # accumulates its OWN simulated per-leg outcomes as it walks forward:
+        # (exit_bar_index, return) per ticker, recorded at profit-take trims, trailing-stop
+        # exits, deterioration exits and window-boundary drops. The multiplier at a
+        # rebalance counts only legs with exit index STRICTLY BEFORE that rebalance bar —
+        # a leg closing on the rebalance bar itself is excluded, so no same-bar (let alone
+        # future) outcome can influence the sizing that produced it. Lookahead-free by
+        # construction.
+        sim_outcomes: dict[str, list[tuple[int, float]]] = {t: [] for t in valid}
+
+        def _pit_perf_multiplier(t: str, cutoff_idx: int) -> float:
+            closed = [ret for (xi, ret) in sim_outcomes[t] if xi < cutoff_idx]
+            if len(closed) < 3:
+                return 1.0
+            wr = sum(1 for r in closed if r > 0) / len(closed)
+            if wr > 0.6:
+                return 1.2
+            if wr < 0.4:
+                return 0.7
+            return 1.0
+
+        # Phase 4c (item 4): sector-slot reservation, mirroring live's MAX_SECTOR_POSITIONS
+        # cap. Sectors come from _get_sector's current classification applied across the
+        # whole window (sectors are effectively static at this horizon). Like live, a slot
+        # is consumed at ACCEPTANCE (in score order), not at fill — a candidate later
+        # dropped sub-floor keeps its slot for the window, blocking lower-score same-sector
+        # names, exactly like the intentional acceptance-time reservation in _run_signal_job.
+        max_sector_pb = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+        sectors_pb: dict[str, str] = {}
+        for _t in valid:
+            try:
+                sectors_pb[_t] = _get_sector(_t)
+            except Exception:
+                sectors_pb[_t] = "Unknown"
+
         # Remaining divergence (intentional, not fixed here) — gates/inputs the live trader
         # applies that this rebalancing model does NOT replicate:
         #   - overextension and 3m/12m momentum-disagreement gates (need intra-window
         #     per-bar price context this model doesn't evaluate per ticker)
         #   - the volume_below_average confirmation gate and the volume-divergence
         #     modifier inside the vol-trend factor (need point-in-time volume handling)
-        #   - the earnings/insider/sentiment factors and the earnings_within_2d and
-        #     sector_cap gates (need real-time data with no historical per-day source)
+        #   - the earnings/insider/sentiment factors and the earnings_within_2d gate
+        #     (need real-time data with no historical per-day source)
+        # The sector-concentration cap IS replicated as of Phase 4c (current sector
+        # classification applied across the window — see sectors_pb above).
         # The portfolio backtest is therefore CLOSER TO but still NOT IDENTICAL to live.
         test_start = TRAIN
         while test_start + TEST <= n_days - 1:
@@ -2751,31 +2791,61 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 
             sized: dict[str, float] = {}
             held_so_far: list[str] = []
+            sector_counts_pb: dict[str, int] = {}
             for t in buy_tickers_sorted:
+                # Phase 4c (item 4): sector-slot reservation at acceptance (cap 3, same
+                # MAX_SECTOR_POSITIONS config as live). Score order = acceptance order.
+                sec = sectors_pb.get(t, "Unknown")
+                if sec != "Unknown" and sector_counts_pb.get(sec, 0) >= max_sector_pb:
+                    continue
                 # Vol-target base weight (target ~1% vol contribution), matching _position_dollars.
                 rvol = rvols.get(t, 0.25)
                 base_weight = 0.01 / max(rvol, 0.001)
                 # Conviction multiplier from composite score (75→1×, 95→1.5×).
                 score = composites_window.get(t, buy_threshold)
                 conviction = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
+                # Phase 4c (item 3): point-in-time win-rate performance multiplier
+                # (×1.2 / ×0.7, ≥3 simulated legs — see sim_outcomes above).
+                perf_mult = _pit_perf_multiplier(t, test_start)
                 # Correlation penalty against already-sized (higher-conviction) names.
                 penalty, _, _ = _correlation_penalty(t, held_so_far, hist_prices)
-                # Per-position hard cap at 10% of the portfolio (matches _position_dollars).
-                weight = min(base_weight * conviction * penalty, 0.10)
+                # Per-position hard cap at 10%, sub-floor RAISED to the 0.5% floor —
+                # both matching _position_dollars (Phase 4c item 2: live raises to the
+                # floor at per-position sizing; only the post-normalization pass drops).
+                weight = max(min(base_weight * conviction * perf_mult * penalty, 0.10),
+                             POSITION_FLOOR_PCT)
                 sized[t] = weight
                 held_so_far.append(t)
+                if sec != "Unknown":
+                    sector_counts_pb[sec] = sector_counts_pb.get(sec, 0) + 1
 
-            # Normalize so aggregate exposure never exceeds 1.0 (PORTFOLIO_KELLY_CAP equivalent).
-            total_w = sum(sized.values())
-            if total_w > 1.0:
-                sized = {t: w / total_w for t, w in sized.items()}
-
-            # Fix 5 — drop sub-floor positions (POSITION_FLOOR_PCT = 0.5%) not worth opening,
-            # then re-normalize the survivors against the same cap.
-            weights = {t: w for t, w in sized.items() if w >= POSITION_FLOOR_PCT}
-            total_w = sum(weights.values())
-            if total_w > 1.0:
-                weights = {t: w / total_w for t, w in weights.items()}
+            # Phase 4c (item 2): normalize + drop sub-floor in the same convergence loop
+            # the live signal job runs (≤5 iterations, re-normalizing from the ORIGINAL
+            # per-position sizes each pass so headroom freed by a drop is redistributed
+            # to survivors, not lost). Shares _normalize_portfolio_sizing with live.
+            #
+            # KNOWN LIVE/BACKTEST DIVERGENCE (Phase 4c item 1 — intentional, do not
+            # "fix"): this caps TOTAL portfolio weight each window, including names
+            # carried over from previous windows, because every position is re-sized at
+            # every rebalance here. Live's normalization caps only the BUYs placed in
+            # the current run and ignores already-open positions, so live can exceed
+            # 100% aggregate intent across runs. The backtest's semantics are the more
+            # correct/conservative of the two; the discrepancy is a live-side bug kept
+            # out of Phase 4 scope. See the matching note above the normalization loop
+            # in _run_signal_job before changing either side.
+            survivors = list(sized)
+            normalized: dict[str, float] = {}
+            for _ in range(5):
+                if not survivors:
+                    break
+                normalized = _normalize_portfolio_sizing(
+                    {t: sized[t] for t in survivors}, 1.0
+                )
+                sub_floor = [t for t in survivors if normalized[t] < POSITION_FLOOR_PCT]
+                if not sub_floor:
+                    break
+                survivors = [t for t in survivors if normalized[t] >= POSITION_FLOOR_PCT]
+            weights = {t: normalized[t] for t in survivors}
             for t in valid:
                 if t not in weights:
                     weights[t] = 0.0
@@ -2809,6 +2879,16 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         _atr0 = float(_a) if not np.isnan(_a) and _a > 0 else _px * 0.02
                         trail_stops_pb[t] = _px - atr_mult_pb * _atr0
                 else:
+                    # Window-boundary drop: a previously-held name that wasn't re-sized
+                    # exits at this rebalance close. Record the leg for the point-in-time
+                    # win-rate multiplier (exit index = this rebalance bar, so it only
+                    # counts from the NEXT rebalance onward).
+                    _entry_px = entry_prices_bt.get(t)
+                    if _entry_px:
+                        _exit_px = float(combined_arr[test_start, valid.index(t)])
+                        sim_outcomes[t].append(
+                            (test_start, (_exit_px - _entry_px) / _entry_px)
+                        )
                     entry_prices_bt.pop(t, None)
                     profit_taken_bt.discard(t)
                     trail_stops_pb.pop(t, None)
@@ -2837,6 +2917,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                             live_weights[t] = half_weight
                             profit_taken_bt.add(t)
                             profit_takes_bt += 1
+                            # Trimmed half is its own leg (parity with live's two-leg
+                            # accounting) for the win-rate multiplier.
+                            sim_outcomes[t].append(
+                                (idx, (float(c_t[idx]) - entry_px) / entry_px)
+                            )
                             continue
 
                     # Trailing ATR stop (parity with live / single-ticker backtest): ratchet
@@ -2855,6 +2940,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                             live_weights[t] = 0.0
                             stop_loss_exits += 1
                             last_exit_idx[t] = idx  # arm the re-entry cooldown
+                            _entry_px = entry_prices_bt.get(t)
+                            if _entry_px:  # leg for the win-rate multiplier
+                                sim_outcomes[t].append(
+                                    (idx, (float(c_t[idx]) - _entry_px) / _entry_px)
+                                )
                             entry_prices_bt.pop(t, None)
                             profit_taken_bt.discard(t)
                             trail_stops_pb.pop(t, None)
@@ -2867,6 +2957,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         live_weights[t] = 0.0
                         mid_window_exits += 1
                         last_exit_idx[t] = idx  # arm the re-entry cooldown
+                        _entry_px = entry_prices_bt.get(t)
+                        if _entry_px:  # leg for the win-rate multiplier
+                            sim_outcomes[t].append(
+                                (idx, (float(c_t[idx]) - _entry_px) / _entry_px)
+                            )
                         # Full exit: clear the profit-take basis so a re-entry starts fresh.
                         entry_prices_bt.pop(t, None)
                         profit_taken_bt.discard(t)
@@ -3762,6 +3857,16 @@ def _run_signal_job() -> None:
     # across all BUYs in this run at PORTFOLIO_KELLY_CAP × equity, scaling each position
     # down proportionally when the sum would exceed it (the per-position 10% cap is already
     # applied inside _position_dollars; both constraints apply, whichever binds first).
+    #
+    # KNOWN LIVE/BACKTEST DIVERGENCE (Phase 4c item 1 — flagged, not fixed): this cap
+    # covers only the BUYs placed in THIS run and ignores already-open positions, so
+    # aggregate exposure across successive runs can exceed PORTFOLIO_KELLY_CAP × equity.
+    # The portfolio backtest instead caps TOTAL portfolio weight at every rebalance
+    # (including carried-over positions) — the more correct, more conservative
+    # semantics. The gap is a live-side bug, deliberately left out of Phase 4
+    # (backtest-only scope). If it ever gets fixed here, keep the backtest's total-weight
+    # behavior as the reference — see the matching note in portfolio_backtest's
+    # normalization loop; do not "align" the backtest down to this run-only cap.
     #
     # Proportional scaling can push a position below the POSITION_FLOOR_PCT floor; such
     # positions aren't worth opening, so we drop them and re-normalize the survivors against
