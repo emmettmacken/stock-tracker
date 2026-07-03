@@ -443,8 +443,13 @@ _T_STR = ("Expecting value", "JSONDecodeError", "ConnectionError",
 def _transient(e: Exception) -> bool:
     return isinstance(e, _T_EXC) or any(p in str(e) for p in _T_STR)
 
-def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: int = 3) -> pd.DataFrame:
-    end, start = datetime.now(), datetime.now() - timedelta(days=days)
+def fetch_ohlcv(ticker: str, days: int = 760, min_bars: int = 50, max_retries: int = 3,
+                as_of: Optional[datetime] = None) -> pd.DataFrame:
+    # Phase 4f: `as_of` pins the window END (inclusive — yfinance's `end` is exclusive,
+    # hence the +1 day) so a backtest can be reproduced later against the exact same
+    # window. None keeps the live behavior: window ends now.
+    end = (as_of + timedelta(days=1)) if as_of is not None else datetime.now()
+    start = end - timedelta(days=days)
     last_exc = None
     for attempt in range(max_retries):
         try:
@@ -749,10 +754,26 @@ def get_signal(ticker: str):
 # ── /api/backtest ─────────────────────────────────────────────────────────────
 
 @app.get("/api/backtest/{ticker}")
-def get_backtest(ticker: str):
+def get_backtest(ticker: str, as_of_date: Optional[str] = None):
     ticker = ticker.upper()
 
-    df = fetch_ohlcv(ticker, days=760, min_bars=260)
+    # Phase 4f: optional as-of anchor (YYYY-MM-DD) for reproducibility. When set, the
+    # 760-day lookback window ends at this date instead of "now", and every sub-fetch
+    # (ticker prices, SPY 200-day MA, VIX) is constrained to it — re-running with the
+    # same as_of_date later reproduces the same window. Omitted → current behavior.
+    # NOT constrained (parameters, not data — they use today's values regardless of
+    # as_of_date): config thresholds (bull/bear, ATR multiplier, overextension pct)
+    # and factor weights. Earnings/insider/sentiment aren't used here at all.
+    as_of: Optional[datetime] = None
+    if as_of_date:
+        try:
+            as_of = datetime.strptime(as_of_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="as_of_date must be YYYY-MM-DD")
+        if as_of > datetime.now():
+            raise HTTPException(status_code=400, detail="as_of_date cannot be in the future")
+
+    df = fetch_ohlcv(ticker, days=760, min_bars=260, as_of=as_of)
     closes, returns, _vol, _vol_20d = extract_features(df)
     dates = df.index.tolist()[1:]
     n = len(returns)  # = len(closes) - 1
@@ -807,7 +828,12 @@ def get_backtest(ticker: str):
     # fail-open skip of the gate.
     vix_series_bt: Optional[np.ndarray] = None
     try:
-        vix_df_bt = yf.Ticker("^VIX").history(period="2y")
+        # Phase 4f: explicit window ending at the as-of anchor (inclusive) instead of
+        # period="2y", so a pinned run never reads VIX bars after as_of_date.
+        _vix_end_bt = (as_of + timedelta(days=1)) if as_of else datetime.now()
+        vix_df_bt = yf.Ticker("^VIX").history(
+            start=_vix_end_bt - timedelta(days=760), end=_vix_end_bt
+        )
         if not vix_df_bt.empty:
             vix_by_date = {ts.date(): float(v) for ts, v in vix_df_bt["Close"].items()}
             vix_aligned = pd.Series(
@@ -822,7 +848,7 @@ def get_backtest(ticker: str):
     spy_above_ma: Optional[np.ndarray] = None
     if macro_filter:
         try:
-            spy_df = fetch_ohlcv("SPY", days=760, min_bars=260)
+            spy_df = fetch_ohlcv("SPY", days=760, min_bars=260, as_of=as_of)
             spy_arr = spy_df["Close"].reindex(df.index).ffill().bfill().values.astype(float)
             spy_ma200 = pd.Series(spy_arr).rolling(200, min_periods=1).mean().values
             spy_above_ma = (spy_arr > spy_ma200)
@@ -1100,8 +1126,16 @@ def get_backtest(ticker: str):
         sorted(gate_rejection_summary.items(), key=lambda kv: kv[1], reverse=True)
     )
 
+    # Phase 4f: self-documenting window bounds — any published number can name the
+    # exact window it was computed on and be re-verified with the same as_of_date.
+    _win_first = dates[0].strftime("%Y-%m-%d") if hasattr(dates[0], "strftime") else str(dates[0])[:10]
+    _win_last  = dates[-1].strftime("%Y-%m-%d") if hasattr(dates[-1], "strftime") else str(dates[-1])[:10]
+
     return {
         "ticker":                  ticker,
+        "as_of_date":              as_of_date,   # null = window anchored to run time
+        "window_start":            _win_first,
+        "window_end":              _win_last,
         "equity_curve":            equity_curve,
         "total_strategy_return":   round(strat_pct, 2),
         "total_bah_return":        round(bah_pct, 2),
@@ -2546,6 +2580,9 @@ def portfolio_sizing(req: SizingRequest):
 class PortfolioBacktestRequest(BaseModel):
     tickers: list[str]
     capital: float = 10000.0
+    # Phase 4f: optional YYYY-MM-DD anchor; the 760-day window ends here instead of
+    # "now", making the run reproducible. Omitted → current behavior (anchored to today).
+    as_of_date: Optional[str] = None
 
 
 @app.post("/api/portfolio/backtest")
@@ -2554,13 +2591,26 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         tickers = [t.upper() for t in req.tickers]
         TRAIN, TEST = 252, 21
 
+        # Phase 4f: as-of anchor threads into every data fetch (ticker prices, SPY,
+        # VIX) so a pinned run reads nothing after as_of_date. NOT constrained
+        # (parameters, not data): config thresholds, factor weights, and _get_sector's
+        # sector classification (yfinance has no historical point-in-time sectors).
+        as_of: Optional[datetime] = None
+        if req.as_of_date:
+            try:
+                as_of = datetime.strptime(req.as_of_date, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="as_of_date must be YYYY-MM-DD")
+            if as_of > datetime.now():
+                raise HTTPException(status_code=400, detail="as_of_date cannot be in the future")
+
         # Fetch all tickers + SPY in parallel
         all_tickers = list(set(tickers + ["SPY"]))
         dfs: dict[str, pd.DataFrame] = {}
 
         def _fetch_one(t: str):
             try:
-                return t, fetch_ohlcv(t, days=760, min_bars=TRAIN + TEST + 5)
+                return t, fetch_ohlcv(t, days=760, min_bars=TRAIN + TEST + 5, as_of=as_of)
             except Exception:
                 return t, None
 
@@ -2659,7 +2709,12 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         # all new buys) — vix_ok below is False when the series is missing.
         vix_series_pb: Optional[np.ndarray] = None
         try:
-            vix_df_pb = yf.Ticker("^VIX").history(period="2y")
+            # Phase 4f: explicit window ending at the as-of anchor (inclusive) instead
+            # of period="2y", so a pinned run never reads VIX bars after as_of_date.
+            _vix_end_pb = (as_of + timedelta(days=1)) if as_of else datetime.now()
+            vix_df_pb = yf.Ticker("^VIX").history(
+                start=_vix_end_pb - timedelta(days=760), end=_vix_end_pb
+            )
             if not vix_df_pb.empty:
                 vix_by_date = {ts.date(): float(v) for ts, v in vix_df_pb["Close"].items()}
                 vix_series_pb = pd.Series(
@@ -3051,6 +3106,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         return {
             "tickers": valid,
             "capital": req.capital,
+            # Phase 4f: self-documenting window bounds — any published number can name
+            # the exact window it used and be re-verified with the same as_of_date.
+            "as_of_date": req.as_of_date,   # null = window anchored to run time
+            "window_start": str(dates_idx[0])[:10],
+            "window_end": str(dates_idx[-1])[:10],
             "equity_curve": equity_curve,
             "total_return_pct": round(total_return, 2),
             "spy_return_pct": spy_return,
