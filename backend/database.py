@@ -150,6 +150,15 @@ def _run_migrations() -> None:
         # the corrected two-leg accounting.
         ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN leg TEXT"),
         ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN entry_dollars REAL"),
+        # Phase 5 (Jul 2026): annualized vol actually used to size an order, persisted on
+        # 'ordered' rows only (NULL on skipped rows and on all historical rows) — same
+        # nullable pattern as entry_dollars/equity_at_entry above.
+        ("signal_log",     "ALTER TABLE signal_log ADD COLUMN ann_vol_at_entry REAL"),
+        # Phase 5 (Jul 2026): composite score at exit, populated on exit paths that already
+        # have a composite in scope (the score-deterioration close). NULL on the
+        # stop-loss/profit-take/max-hold/macro/manual paths — the 09:35 job doesn't compute
+        # factors and we don't add a computation just to fill this — and on all historical rows.
+        ("trade_outcomes", "ALTER TABLE trade_outcomes ADD COLUMN composite_at_exit REAL"),
     ]
     # Auth tables (JWT login + email verification). Created here in _run_migrations
     # so they land on every existing deployment without needing a fresh init_db.
@@ -387,6 +396,7 @@ def log_signal(
     hmm_fit_failed: Optional[bool] = None,
     entry_dollars: Optional[float] = None,
     equity_at_entry: Optional[float] = None,
+    ann_vol_at_entry: Optional[float] = None,
 ) -> int:
     with _conn() as conn:
         cur = conn.execute(
@@ -395,8 +405,8 @@ def log_signal(
                 skip_reason, price_at_signal, atr_at_signal,
                 hmm_regime, sentiment_score, smoothed_bull_prob,
                 kelly_fraction, sizing_method, hmm_fit_failed,
-                entry_dollars, equity_at_entry)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                entry_dollars, equity_at_entry, ann_vol_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 datetime.utcnow().isoformat(),
@@ -414,6 +424,7 @@ def log_signal(
                 int(hmm_fit_failed) if hmm_fit_failed is not None else None,
                 entry_dollars,
                 equity_at_entry,
+                ann_vol_at_entry,
             ),
         )
         return cur.lastrowid  # type: ignore[return-value]
@@ -616,6 +627,7 @@ def record_close_transaction(
     leg: Optional[str] = None,
     entry_dollars: Optional[float] = None,
     log_reason: Optional[str] = None,
+    composite_at_exit: Optional[float] = None,
 ) -> None:
     """Atomically write signal_log SELL + trade_outcomes + ticker_performance in one transaction.
 
@@ -658,11 +670,11 @@ def record_close_transaction(
             """INSERT INTO trade_outcomes
                (ticker, entry_signal_id, entry_price, exit_price, exit_reason,
                 return_pct, holding_days, composite_score_at_entry, exit_timestamp,
-                regime_at_entry, leg, entry_dollars)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                regime_at_entry, leg, entry_dollars, composite_at_exit)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker, entry_signal_id, entry_price, current_price, exit_reason,
              return_pct, holding_days, composite_score_at_entry, now, regime_at_entry,
-             leg, entry_dollars),
+             leg, entry_dollars, composite_at_exit),
         )
         row = conn.execute(
             "SELECT total_trades, win_rate, avg_return FROM ticker_performance WHERE ticker = ?",

@@ -782,9 +782,14 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
     TEST  = int(db.get_config("BACKTEST_TEST", "21"))
     # Fix 2-E: align with live system — 21-day max hold and ATR trailing stop on by default
     HOLD  = int(db.get_config("BACKTEST_HOLD", "21"))
-    # Shared ATR-stop multiplier for BOTH backtests. Default 1.5 = the live trader's
-    # multiplier (hardcoded there); changing this config moves both backtests together.
-    atr_mult     = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
+    # Phase 5: single source of truth for the ATR-stop multiplier, shared with the live
+    # trader and the portfolio backtest (ATR_STOP_MULT, default 2.5). Consolidated from the
+    # former backtest-only BACKTEST_ATR_MULTIPLIER key so live and both backtests always
+    # move together.
+    atr_mult     = float(db.get_config("ATR_STOP_MULT", "2.5"))
+    # Phase 5: shared per-position vol-contribution target (default 0.025), same config the
+    # live _position_dollars path reads — keeps backtest sizing in parity with live.
+    vol_contribution = float(db.get_config("VOL_CONTRIBUTION_TARGET", "0.025"))
     use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "true").lower() == "true"
     macro_filter = db.get_config("BACKTEST_MACRO_FILTER", "true").lower() == "true"
     # Entry mirrors the live trader: enter when the composite clears the adaptive BUY
@@ -881,7 +886,7 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
     # the portfolio into every trade, exercising no sizing logic at all — its Sharpe
     # and drawdown were not comparable to what live would do with the same signal.
     # Entries are now sized like the live vol-target path (_position_dollars) and the
-    # portfolio backtest: base weight 0.01 / annualized 21-day vol, × the conviction
+    # portfolio backtest: base weight VOL_CONTRIBUTION_TARGET / annualized 21-day vol, × the conviction
     # multiplier from the composite score (75→1×, 95→1.5×), capped at 10% of the
     # portfolio and floored at POSITION_FLOOR_PCT (sub-floor sizes are raised to the
     # floor, exactly like _position_dollars — a single-ticker run has no portfolio
@@ -1079,7 +1084,7 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
                     # returns[idx-21:idx] are the 21 daily returns ending at this decision
                     # close — strictly point-in-time (returns[idx] is tomorrow's move).
                     ann_vol_entry = float(returns[idx - 21: idx].std()) * np.sqrt(252.0)
-                    base_weight = 0.01 / max(ann_vol_entry, 0.001)
+                    base_weight = vol_contribution / max(ann_vol_entry, 0.001)
                     conviction = min(1.0 + max(0.0, composite - 75.0) / 40.0, 1.5)
                     pos_weight = max(min(base_weight * conviction, 0.10), POSITION_FLOOR_PCT)
                     entry_weights.append(pos_weight)
@@ -1161,8 +1166,9 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
             "notes": (
                 "Entry mirrors live: composite ≥ buy threshold, composite ≥ 70 HMM "
                 "bull-confidence proxy, and the raised adaptive bear threshold when SPY "
-                "is below its 200-day MA. Positions are VOL-TARGET SIZED (0.01 / "
-                "annualized 21d vol × conviction, 10% cap, 0.5% floor) — NOT 100% of "
+                "is below its 200-day MA. Positions are VOL-TARGET SIZED "
+                "(VOL_CONTRIBUTION_TARGET / annualized 21d vol × conviction, 10% cap, "
+                "0.5% floor) — NOT 100% of "
                 "the portfolio per trade; the remainder sits in cash. "
                 "Profit-take halves the position at +15%. "
                 "Composite is computed from momentum + vol-adjusted trend only; "
@@ -2651,14 +2657,18 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         TC_PER_SIDE_PB = 0.0017
         # Entry/exit now mirror the live trader and the single-ticker backtest: allocate
         # to tickers whose composite clears the buy threshold, exit on score deterioration,
-        # trail a 1.5×ATR stop, and take half profit at +15%.
+        # trail an ATR_STOP_MULT×ATR stop, and take half profit at +15%.
         buy_threshold  = float(db.get_config("bull_threshold", "63"))
         # Parity with live: the same adaptive bear threshold the live trader raises the
         # bar to when SPY is below its 200-day MA (was hardcoded 80.0 here).
         bear_threshold = float(db.get_config("bear_threshold", "80"))
-        # Same shared ATR-stop multiplier as the single-ticker backtest; default 1.5 =
-        # the live trader's multiplier.
-        atr_mult_pb = float(db.get_config("BACKTEST_ATR_MULTIPLIER", "1.5"))
+        # Phase 5: same single-source ATR-stop multiplier as the live trader and the
+        # single-ticker backtest (ATR_STOP_MULT, default 2.5). Consolidated from the former
+        # BACKTEST_ATR_MULTIPLIER key.
+        atr_mult_pb = float(db.get_config("ATR_STOP_MULT", "2.5"))
+        # Phase 5: shared per-position vol-contribution target (default 0.025), same config
+        # the live _position_dollars path reads — parity with live sizing.
+        vol_contribution_pb = float(db.get_config("VOL_CONTRIBUTION_TARGET", "0.025"))
         exit_threshold = 40.0
         PROFIT_TAKE_PCT = 0.15
 
@@ -2875,9 +2885,10 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 sec = sectors_pb.get(t, "Unknown")
                 if sec != "Unknown" and sector_counts_pb.get(sec, 0) >= max_sector_pb:
                     continue
-                # Vol-target base weight (target ~1% vol contribution), matching _position_dollars.
+                # Vol-target base weight (VOL_CONTRIBUTION_TARGET annualized vol contribution),
+                # matching _position_dollars.
                 rvol = rvols.get(t, 0.25)
-                base_weight = 0.01 / max(rvol, 0.001)
+                base_weight = vol_contribution_pb / max(rvol, 0.001)
                 # Conviction multiplier from composite score (75→1×, 95→1.5×).
                 score = composites_window.get(t, buy_threshold)
                 conviction = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
@@ -2901,15 +2912,13 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             # per-position sizes each pass so headroom freed by a drop is redistributed
             # to survivors, not lost). Shares _normalize_portfolio_sizing with live.
             #
-            # KNOWN LIVE/BACKTEST DIVERGENCE (Phase 4c item 1 — intentional, do not
-            # "fix"): this caps TOTAL portfolio weight each window, including names
-            # carried over from previous windows, because every position is re-sized at
-            # every rebalance here. Live's normalization caps only the BUYs placed in
-            # the current run and ignores already-open positions, so live can exceed
-            # 100% aggregate intent across runs. The backtest's semantics are the more
-            # correct/conservative of the two; the discrepancy is a live-side bug kept
-            # out of Phase 4 scope. See the matching note above the normalization loop
-            # in _run_signal_job before changing either side.
+            # LIVE/BACKTEST DIVERGENCE (Phase 4c item 1) — RESOLVED in Phase 5: this caps
+            # TOTAL portfolio weight each window, including names carried over from previous
+            # windows, because every position is re-sized at every rebalance here. This
+            # total-weight-per-rebalance cap is the REFERENCE method; as of Phase 5 live
+            # matches it by normalizing new BUYs against available budget (cap × equity −
+            # open-position market value) rather than full equity. See the matching note
+            # above the normalization loop in _run_signal_job.
             survivors = list(sized)
             normalized: dict[str, float] = {}
             for _ in range(5):
@@ -3368,8 +3377,12 @@ def _normalize_portfolio_sizing(sizes: dict[str, float], cap: float) -> dict[str
 
 def _position_dollars(
     ticker: str, equity: float, score: float = 75.0, vol_21d: Optional[float] = None
-) -> tuple[float, float, str]:
-    """Returns (position_dollars, kelly_fraction, sizing_method).
+) -> tuple[float, float, str, float]:
+    """Returns (position_dollars, kelly_fraction, sizing_method, ann_vol).
+
+    `ann_vol` is the annualized vol actually used in sizing (0.0 when no vol data was
+    available and the flat fallback weight was used); persisted on the ordered signal_log
+    row as ann_vol_at_entry for post-hoc audit.
 
     Uses fractional Kelly when ≥10 ticker trades exist, portfolio-wide prior when
     the portfolio has ≥20 trades but the ticker has <10, otherwise vol-targeting.
@@ -3390,11 +3403,18 @@ def _position_dollars(
     # convention as the portfolio backtest and /api/portfolio/sizing. The old daily-vol
     # denominator made vol_weight ~16× too large, so vol-target sizes always slammed
     # into the 10% hard cap and the 3×-vol-target Kelly guard below could never bind.
+    #
+    # Phase 5 (Jul 2026): the per-position vol-contribution target is now config-backed
+    # (VOL_CONTRIBUTION_TARGET, default 0.025) and raised from the prior hardcoded 0.01.
+    # Derivation: portfolio vol target ~12% annualized, ~8 concurrent positions, stressed
+    # avg pairwise correlation 0.3 → k ≈ 0.12 / sqrt(8 + 8·7·0.3) ≈ 0.025. The no-vol-data
+    # fallback weight (0.05) is deliberately left unchanged.
+    vol_contribution = float(db.get_config("VOL_CONTRIBUTION_TARGET", "0.025"))
     ann_vol = daily_vol * math.sqrt(252.0) if daily_vol > 0 else 0.0
-    vol_weight = (0.01 / ann_vol) if ann_vol > 0 else 0.05
-    # Pre-fix (daily-vol) weight, kept ONLY for the one-cycle [SIZING_MIGRATION_CHECK]
-    # comparison logs below; remove together with them once the first post-deploy
-    # signal-job run has been reviewed.
+    vol_weight = (vol_contribution / ann_vol) if ann_vol > 0 else 0.05
+    # Pre-Phase-5 (daily-vol convention @ the old 0.01 target) weight, kept ONLY for the
+    # one-cycle [SIZING_MIGRATION_CHECK] comparison logs below; remove together with them
+    # once the first post-deploy signal-job run under the final constant has been reviewed.
     old_vol_weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
 
     # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5×
@@ -3487,9 +3507,11 @@ def _position_dollars(
         # Correlation penalty, then hard cap 10%, floor POSITION_FLOOR_PCT
         kelly_dollars = _penalize(kelly_dollars)
         kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * POSITION_FLOOR_PCT)
-        # One-cycle migration check: pre-fix (daily-vol) size alongside the new size so
-        # the first post-deploy signal run can be sanity-checked from Railway logs.
-        # Remove this block (and old_vol_weight/old_vol_base above) once reviewed.
+        # One-cycle migration check: pre-Phase-5 size (old daily-vol convention @ the 0.01
+        # target) alongside the new size (annualized vol @ the configured
+        # VOL_CONTRIBUTION_TARGET) so the first post-deploy signal run can be sanity-checked
+        # from Railway logs. Remove this block (and old_vol_weight/old_vol_base above) once
+        # reviewed — its one reviewed run should happen under the final constant.
         old_cap_3x = old_vol_base * 3.0
         old_dollars = max(
             min(min(kelly_raw, old_cap_3x) * penalty, equity * 0.10),
@@ -3501,7 +3523,7 @@ def _position_dollars(
             ticker, sizing_method, old_dollars, kelly_dollars,
             kelly_raw > old_cap_3x, cap_binds, ann_vol,
         )
-        return kelly_dollars, round(kelly_frac, 6), sizing_method
+        return kelly_dollars, round(kelly_frac, 6), sizing_method, ann_vol
 
     # Vol-targeting fallback
     raw_dollars = max(min(_penalize(vol_base), equity * 0.10), equity * POSITION_FLOOR_PCT)
@@ -3512,7 +3534,7 @@ def _position_dollars(
         "new_size=$%.0f ann_vol=%.4f",
         ticker, old_dollars, raw_dollars, ann_vol,
     )
-    return raw_dollars, 0.0, "vol_target_fallback"
+    return raw_dollars, 0.0, "vol_target_fallback", ann_vol
 
 
 def _trading_days_between(start: datetime, end: datetime) -> int:
@@ -3596,6 +3618,11 @@ def _record_close(ticker: str, current_price: float, entry_price: float,
                 ticker, score, exit_reason, current_price, entry_price,
                 ret, hold, entry_signal_id, score_at_entry,
                 leg=leg, entry_dollars=leg_dollars, log_reason=log_reason,
+                # Phase 5: `score` is the composite in scope for this close. The
+                # score-deterioration exit passes the live composite; the
+                # stop-loss/profit-take/max-hold/macro/manual paths pass None (no factor
+                # computation in those scopes), so composite_at_exit stays NULL there.
+                composite_at_exit=score,
             )
             break
         except Exception as db_err:
@@ -3909,7 +3936,7 @@ def _run_signal_job() -> None:
                               smoothed_bull_prob=smoothed_bull_prob)
                 continue
 
-            dollars, kelly_frac, sizing_method = _position_dollars(
+            dollars, kelly_frac, sizing_method, ann_vol_at_entry = _position_dollars(
                 ticker, equity, effective_composite, vol_21d=result.get("vol_21d")
             )
             # Candidate accepted: reserve its sector slot now (so later same-sector
@@ -3930,34 +3957,63 @@ def _run_signal_job() -> None:
                 "hmm_regime": hmm_regime, "sentiment": sentiment,
                 "smoothed_bull_prob": smoothed_bull_prob,
                 "hmm_fit_failed": hmm_fit_failed, "sector": sector,
-                "equity": equity,
+                "equity": equity, "ann_vol_at_entry": ann_vol_at_entry,
             })
         except Exception as e:
             logger.error("Signal job error for %s: %s", ticker, e)
 
-    # Portfolio-wide Kelly normalization with sub-floor dropping. Cap aggregate exposure
-    # across all BUYs in this run at PORTFOLIO_KELLY_CAP × equity, scaling each position
-    # down proportionally when the sum would exceed it (the per-position 10% cap is already
+    # Portfolio-wide exposure cap with sub-floor dropping. Cap aggregate exposure at
+    # PORTFOLIO_KELLY_CAP × equity, scaling each position down proportionally when the sum
+    # of new BUYs would exceed the AVAILABLE budget (the per-position 10% cap is already
     # applied inside _position_dollars; both constraints apply, whichever binds first).
     #
-    # KNOWN LIVE/BACKTEST DIVERGENCE (Phase 4c item 1 — flagged, not fixed): this cap
-    # covers only the BUYs placed in THIS run and ignores already-open positions, so
-    # aggregate exposure across successive runs can exceed PORTFOLIO_KELLY_CAP × equity.
-    # The portfolio backtest instead caps TOTAL portfolio weight at every rebalance
-    # (including carried-over positions) — the more correct, more conservative
-    # semantics. The gap is a live-side bug, deliberately left out of Phase 4
-    # (backtest-only scope). If it ever gets fixed here, keep the backtest's total-weight
-    # behavior as the reference — see the matching note in portfolio_backtest's
-    # normalization loop; do not "align" the backtest down to this run-only cap.
+    # LIVE/BACKTEST DIVERGENCE (Phase 4c item 1) — RESOLVED in Phase 5: the cap is now
+    # applied against AVAILABLE budget = PORTFOLIO_KELLY_CAP × equity − market value already
+    # tied up in open positions, so aggregate gross exposure across successive runs can no
+    # longer exceed the cap. This previously normalized against FULL equity and ignored open
+    # positions (a real >100%-gross path, worse now that positions are ~2.5× larger). The
+    # portfolio backtest's total-weight-per-rebalance cap remains the reference method — see
+    # the matching note in portfolio_backtest's normalization loop.
+    #
+    # Open position market values come from the same Alpaca `positions` fetch already used by
+    # the already_in_position gate above — no second API call.
     #
     # Proportional scaling can push a position below the POSITION_FLOOR_PCT floor; such
     # positions aren't worth opening, so we drop them and re-normalize the survivors against
-    # the same cap — dropping frees headroom the remaining positions should use. This
+    # the same budget — dropping frees headroom the remaining positions should use. This
     # converges in ≤2 iterations (dropping only shrinks the total, so survivors only grow
     # and never re-cross the floor), but we cap the loop and warn so a pathological input
     # can't hang the job. Normalize from each candidate's original size every pass so freed
     # headroom is redistributed rather than lost.
+    open_positions_mv = 0.0
+    for _p in positions.values():
+        try:
+            open_positions_mv += abs(float(_p.market_value))
+        except Exception:
+            pass  # a bad market_value on one position must not zero out the whole budget
+    available_budget = max(0.0, PORTFOLIO_KELLY_CAP * equity - open_positions_mv)
+
     floor = POSITION_FLOOR_PCT * equity
+    # Edge case: open positions already consume the entire cap → no room for new entries.
+    # Drop every candidate with an explicit exposure_cap_exhausted skip (a post-normalization
+    # skip reason, like below_floor_after_normalization — it surfaces in the signal_log skip
+    # breakdown without disturbing the pre-normalization gate analytics), then skip the loop.
+    if available_budget <= 0 and buy_candidates:
+        logger.warning(
+            "exposure_cap_exhausted: open positions ($%.0f) consume the full %.0f%% cap "
+            "($%.0f); dropping all %d new candidate(s)",
+            open_positions_mv, PORTFOLIO_KELLY_CAP * 100, PORTFOLIO_KELLY_CAP * equity,
+            len(buy_candidates),
+        )
+        for c in buy_candidates:
+            db.log_signal(
+                c["ticker"], c["effective_composite"], "BUY", "skipped",
+                "exposure_cap_exhausted", c["price"], c["atr"],
+                hmm_regime=c["hmm_regime"], sentiment_score=c["sentiment"],
+                smoothed_bull_prob=c["smoothed_bull_prob"],
+            )
+        buy_candidates = []
+
     raw_dollars = {c["ticker"]: c["dollars"] for c in buy_candidates}
     dropped: list[dict] = []
     converged = False
@@ -3966,7 +4022,7 @@ def _run_signal_job() -> None:
             converged = True
             break
         size_map = {c["ticker"]: raw_dollars[c["ticker"]] for c in buy_candidates}
-        normalized = _normalize_portfolio_sizing(size_map, PORTFOLIO_KELLY_CAP * equity)
+        normalized = _normalize_portfolio_sizing(size_map, available_budget)
         for c in buy_candidates:
             c["dollars"] = normalized[c["ticker"]]
         sub_floor = [c for c in buy_candidates if c["dollars"] < floor]
@@ -3991,6 +4047,10 @@ def _run_signal_job() -> None:
         logger.info("%s: skipped (below %.1f%% floor after portfolio normalization)",
                     c["ticker"], POSITION_FLOOR_PCT * 100)
 
+    # Phase 5: single-source trailing-stop multiplier (ATR_STOP_MULT, default 2.5), read
+    # once for the entry-seed writes below. Shared with the stop-loss job's ratchet and
+    # both backtests.
+    atr_stop_mult = float(db.get_config("ATR_STOP_MULT", "2.5"))
     for c in buy_candidates:
         ticker, dollars, price, atr = c["ticker"], c["dollars"], c["price"], c["atr"]
         # Automated-trading toggle: skip new entries when paused (both "all" and
@@ -4023,9 +4083,12 @@ def _run_signal_job() -> None:
                 # c["dollars"] is the actual amount risked (post-normalization + cap/floor);
                 # c["equity"] is the account equity used to size it.
                 entry_dollars=round(c["dollars"], 2), equity_at_entry=round(c["equity"], 2),
+                # Phase 5: annualized vol actually used to size this order (0.0 = no vol
+                # data, flat fallback weight). Persisted on 'ordered' rows only.
+                ann_vol_at_entry=round(c["ann_vol_at_entry"], 6),
             )
             if atr > 0:
-                db.update_trailing_stop(signal_id, price - 1.5 * atr)
+                db.update_trailing_stop(signal_id, price - atr_stop_mult * atr)
             logger.info(
                 "%s: BUY $%.0f score=%.1f regime=%s bull_prob=%.2f sizing=%s kelly=%.3f sector=%s",
                 ticker, dollars, c["effective_composite"], c["hmm_regime"],
@@ -4118,6 +4181,11 @@ def _run_stoploss_job() -> None:
         logger.warning("SPY 5-day check failed: %s", exc)
 
     now = datetime.utcnow()
+    # Phase 5: single-source trailing-stop multiplier (ATR_STOP_MULT, default 2.5), read
+    # once for both the seed and the ratchet recompute below. Existing stored stops are
+    # never lowered — the ratchet's never-lower rule (candidate > stored_stop) still holds,
+    # so a wider multiplier only widens NEW seeds and future ratchets, never tightens today.
+    atr_stop_mult = float(db.get_config("ATR_STOP_MULT", "2.5"))
     for pos in positions:
         ticker = pos.symbol
         try:
@@ -4160,9 +4228,9 @@ def _run_stoploss_job() -> None:
             atr_for_stop = current_atr if current_atr > 0 else atr_entry
             stored_stop  = entry_log.get("current_stop")
             if stored_stop is None and atr_entry > 0:
-                stored_stop = entry_price - 1.5 * atr_entry
+                stored_stop = entry_price - atr_stop_mult * atr_entry
             if atr_for_stop > 0:
-                candidate = price - 1.5 * atr_for_stop
+                candidate = price - atr_stop_mult * atr_for_stop
                 if stored_stop is None or candidate > stored_stop:
                     stored_stop = candidate
                     db.update_trailing_stop(entry_log["id"], stored_stop)
@@ -4583,6 +4651,10 @@ def api_paper_positions():
 
     result = []
     now = datetime.utcnow()
+    # Phase 5: display fallback uses the same single-source ATR_STOP_MULT (default 2.5) the
+    # trader seeds new stops with, so a position without a stored stop yet shows the level
+    # the system would actually place.
+    atr_stop_mult = float(db.get_config("ATR_STOP_MULT", "2.5"))
     for pos in positions:
         ticker      = pos.symbol
         entry_price = float(pos.avg_entry_price)
@@ -4595,7 +4667,7 @@ def api_paper_positions():
         trailing_stop = (entry_log.get("current_stop")) if entry_log else None
         # Fall back to fixed ATR stop if trailing stop hasn't been set yet
         if trailing_stop is None and atr_entry:
-            trailing_stop = entry_price - 1.5 * atr_entry
+            trailing_stop = entry_price - atr_stop_mult * atr_entry
         hold_days = 0
         if entry_log:
             try:
@@ -4611,7 +4683,7 @@ def api_paper_positions():
             "current_price":   round(curr_price, 4),
             "pnl_pct":         round(pnl_pct, 2),
             "composite_score": composite,
-            "atr_stop":        round(entry_price - 1.5 * atr_entry, 4) if atr_entry else None,
+            "atr_stop":        round(entry_price - atr_stop_mult * atr_entry, 4) if atr_entry else None,
             "trailing_stop":   round(trailing_stop, 4) if trailing_stop is not None else None,
             "days_held":       hold_days,
             "qty":             float(pos.qty),
@@ -5288,6 +5360,7 @@ _SKIP_LABELS: dict[str, str] = {
     "momentum_disagreement":  "Momentum disagreement",
     "reentry_cooldown":       "Re-entry cooldown",
     "sector_concentration":   "Sector at concentration cap",
+    "exposure_cap_exhausted": "Exposure cap exhausted by open positions",
     "order_failed":           "Order submission failed",
     "close_failed":           "Position close failed",
 }
