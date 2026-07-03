@@ -922,9 +922,16 @@ def get_backtest(ticker: str):
             # treated as unavailable and the surviving weights renormalise — the exact
             # mechanism the live engine uses when a factor is null. Entry mirrors live:
             # enter when this composite clears the buy threshold (no discrete Markov).
+            # Phase 4e: a None composite means "no data", not "score 0". It was
+            # previously coerced to 0.0, which fed the in-position deterioration check
+            # (composite < exit_threshold) and turned missing data into a forced exit —
+            # the dangerous default. Now, matching the portfolio backtest's is-not-None
+            # guard, a None composite skips the deterioration check for that bar and can
+            # never qualify as an entry; the profit-take / ATR-stop / max-hold exits
+            # still run on price alone. (In practice None can't occur here — idx starts
+            # at TRAIN=252 and vol_trend only needs 201 bars — but the guard keeps the
+            # two backtests on one convention.)
             composite = _backtest_composite(closes[: idx + 1], factor_weights_bt)
-            if composite is None:
-                composite = 0.0
 
             # Portfolio update: earn r_t if already in position BEFORE this decision
             if in_pos:
@@ -959,15 +966,16 @@ def get_backtest(ticker: str):
                     daily_strat.append(pos_weight * r_t)
                     hold_left -= 1
                     # Mid-window exit on score deterioration (mirrors the live
-                    # score-deterioration close) or max-hold expiry.
-                    if composite < exit_threshold or hold_left <= 0:
+                    # score-deterioration close) or max-hold expiry. None composite =
+                    # no data → no deterioration signal (Phase 4e).
+                    if (composite is not None and composite < exit_threshold) or hold_left <= 0:
                         portfolio *= (1.0 - TC_PER_SIDE * pos_weight)  # Change 1: exit transaction cost
                         trade_results.append(portfolio > trade_entry_val)
                         in_pos = False
                         last_exit_idx = idx
             else:
                 daily_strat.append(0.0)
-                if composite >= buy_threshold:
+                if composite is not None and composite >= buy_threshold:
                     # Diagnostic score for this BUY signal (0–100): the composite itself.
                     # Logging only, never affects trade decisions.
                     buy_score = composite
