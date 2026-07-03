@@ -70,6 +70,13 @@ else:
 del _ak, _sk
 
 import database as db
+from config import PRODUCTION_CONFIG, BACKTEST_CONFIG, resolve
+from config.base import DEFAULT_FACTOR_WEIGHTS
+
+# Single source of truth for every tunable strategy constant. Live paths read CFG
+# (PRODUCTION_CONFIG); the two backtests read BACKTEST_CONFIG. DB-overridable keys go
+# through resolve() so a system_config row still wins at runtime. See backend/config/.
+CFG = PRODUCTION_CONFIG
 
 # Initialize schema + run migrations unconditionally at process startup, at
 # import time — before any endpoint is registered/reachable, before the
@@ -297,18 +304,7 @@ _INSIDER_LOCK = threading.Lock()
 
 # ── Factor weight configuration ───────────────────────────────────────────────
 
-# Change 2: sentiment added at 12%; earnings reduced 25→18%, insider 10→5% to keep total=100%
-# Jun 2026: discrete-Markov factor removed. The five surviving factors kept their relative
-# proportions and were renormalised (each divided by the pre-removal non-Markov sum 0.9296)
-# so the weights again sum to exactly 1.0 with the same momentum/trend tilt as before.
-DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
-    "momentum":  0.33132530,
-    "vol_trend": 0.26506024,
-    "earnings":  0.20826162,
-    "insider":   0.06626506,
-    "sentiment": 0.12908778,
-}
-
+# DEFAULT_FACTOR_WEIGHTS now lives in config/base.py (imported above) — single source.
 _WEIGHT_OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "factor_weight_overrides.json")
 _WEIGHT_DRIFT_LOG_PATH = os.path.join(os.path.dirname(__file__), "weight_overrides.json")
 _FACTOR_CORR_PATH      = os.path.join(os.path.dirname(__file__), "factor_correlations.json")
@@ -332,7 +328,7 @@ def _load_ticker_weights(ticker: str) -> dict[str, float]:
                 "delta":    round(v - DEFAULT_FACTOR_WEIGHTS.get(k, 0.0), 4),
             }
             for k, v in per_ticker.items()
-            if abs(v - DEFAULT_FACTOR_WEIGHTS.get(k, 0.0)) > 0.05
+            if abs(v - DEFAULT_FACTOR_WEIGHTS.get(k, 0.0)) > CFG.factors.weight_drift_log_threshold
         }
         if drifts:
             _append_weight_drift(ticker, drifts)
@@ -377,7 +373,7 @@ def extract_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 # ── HMM regime detection ──────────────────────────────────────────────────────
 
-def _kalman_smooth(raw: np.ndarray, Q: float = 0.01, R: float = 0.1) -> np.ndarray:
+def _kalman_smooth(raw: np.ndarray, Q: float = CFG.hmm.kalman_q, R: float = CFG.hmm.kalman_r) -> np.ndarray:
     """1-D scalar Kalman filter for smoothing a 0-1 probability series."""
     n = len(raw)
     if n == 0:
@@ -403,8 +399,8 @@ def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int, hmm.GaussianHMM]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = hmm.GaussianHMM(
-            n_components=2, covariance_type="full",
-            n_iter=300, random_state=42,
+            n_components=CFG.hmm.n_components, covariance_type="full",
+            n_iter=CFG.hmm.n_iter, random_state=CFG.hmm.random_state,
         )
         model.fit(X)
     seq = model.predict(X)
@@ -412,7 +408,7 @@ def fit_regimes(returns: np.ndarray) -> tuple[np.ndarray, int, hmm.GaussianHMM]:
     return seq.astype(int), bull_id, model
 
 
-def _normalize_returns_for_hmm(returns: np.ndarray, window: int = 63) -> np.ndarray:
+def _normalize_returns_for_hmm(returns: np.ndarray, window: int = CFG.hmm.normalize_window) -> np.ndarray:
     """
     Normalize returns against rolling mean and std so the HMM sees directional
     deviation from trend rather than absolute level.  Prevents the volatility-split
@@ -570,7 +566,7 @@ def fetch_ohlcv_window(
     raise HTTPException(status_code=502, detail=f"Failed fetching '{ticker}': {last_exc}")
 
 
-def _wilder_atr(tr: np.ndarray, period: int = 21) -> np.ndarray:
+def _wilder_atr(tr: np.ndarray, period: int = CFG.factors.atr_period) -> np.ndarray:
     """Wilder's EMA of a true-range series, seeded with the SMA of the first `period`
     TRs. Returns an array the same length as `tr`; indices before the seed are NaN."""
     n = len(tr)
@@ -586,7 +582,7 @@ def _wilder_atr(tr: np.ndarray, period: int = 21) -> np.ndarray:
     return out
 
 
-def _atr_from_df(df: pd.DataFrame, period: int = 21) -> float:
+def _atr_from_df(df: pd.DataFrame, period: int = CFG.factors.atr_period) -> float:
     """Compute ATR using Wilder's EMA (seeded with SMA over first `period` bars)."""
     if len(df) < period + 1:
         return 0.0
@@ -778,36 +774,39 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
     dates = df.index.tolist()[1:]
     n = len(returns)  # = len(closes) - 1
 
-    TRAIN = int(db.get_config("BACKTEST_TRAIN", "252"))
-    TEST  = int(db.get_config("BACKTEST_TEST", "21"))
+    # Backtest paths read BACKTEST_CONFIG so experiments can override; DB-backed keys still
+    # resolve DB-first (resolve() warns if a DB pin shadows a backtest override).
+    bcfg = BACKTEST_CONFIG
+    TRAIN = int(resolve("BACKTEST_TRAIN", bcfg.backtest.train, baseline=CFG.backtest.train))
+    TEST  = int(resolve("BACKTEST_TEST", bcfg.backtest.test, baseline=CFG.backtest.test))
     # Fix 2-E: align with live system — 21-day max hold and ATR trailing stop on by default
-    HOLD  = int(db.get_config("BACKTEST_HOLD", "21"))
+    HOLD  = int(resolve("BACKTEST_HOLD", bcfg.gates.max_hold_days, baseline=CFG.gates.max_hold_days))
     # Phase 5: single source of truth for the ATR-stop multiplier, shared with the live
     # trader and the portfolio backtest (ATR_STOP_MULT, default 2.5). Consolidated from the
     # former backtest-only BACKTEST_ATR_MULTIPLIER key so live and both backtests always
     # move together.
-    atr_mult     = float(db.get_config("ATR_STOP_MULT", "2.5"))
+    atr_mult     = float(resolve("ATR_STOP_MULT", bcfg.factors.atr_stop_mult, baseline=CFG.factors.atr_stop_mult))
     # Phase 5: shared per-position vol-contribution target (default 0.025), same config the
     # live _position_dollars path reads — keeps backtest sizing in parity with live.
-    vol_contribution = float(db.get_config("VOL_CONTRIBUTION_TARGET", "0.025"))
-    use_atr_stop = db.get_config("BACKTEST_ATR_STOP", "true").lower() == "true"
-    macro_filter = db.get_config("BACKTEST_MACRO_FILTER", "true").lower() == "true"
+    vol_contribution = float(resolve("VOL_CONTRIBUTION_TARGET", bcfg.sizing.vol_contribution_target, baseline=CFG.sizing.vol_contribution_target))
+    use_atr_stop = resolve("BACKTEST_ATR_STOP", bcfg.backtest.use_atr_stop, baseline=CFG.backtest.use_atr_stop).lower() == "true"
+    macro_filter = resolve("BACKTEST_MACRO_FILTER", bcfg.backtest.macro_filter, baseline=CFG.backtest.macro_filter).lower() == "true"
     # Entry mirrors the live trader: enter when the composite clears the adaptive BUY
     # threshold (bull default 63). In a bear regime (SPY below its 200-day MA) the bar
     # rises to the adaptive bear threshold — exactly like live, a raised threshold, not
     # the full entry block this backtest previously applied.
-    buy_threshold  = float(db.get_config("bull_threshold", "63"))
-    bear_threshold = float(db.get_config("bear_threshold", "80"))
+    buy_threshold  = float(resolve("bull_threshold", bcfg.thresholds.bull, baseline=CFG.thresholds.bull))
+    bear_threshold = float(resolve("bear_threshold", bcfg.thresholds.bear, baseline=CFG.thresholds.bear))
     # Overextension gate reads the same config as the live gate (was hardcoded 1.25 here).
-    oe_ratio = 1.0 + float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
+    oe_ratio = 1.0 + float(resolve("OVEREXTENDED_THRESHOLD_PCT", bcfg.thresholds.overextended_pct, baseline=CFG.thresholds.overextended_pct))
     # Live requires smoothed HMM bull-prob >= 0.70 to enter. That per-bar smoothed state
     # can't be reconstructed point-in-time here, so composite >= 70 is used as a proxy —
     # the same stand-in the portfolio backtest applies.
-    HMM_PROXY_THRESHOLD = 70.0
+    HMM_PROXY_THRESHOLD = bcfg.gates.hmm_composite_proxy
     # Mid-window deterioration exit, mirroring the live score-deterioration close.
-    exit_threshold = 40.0
+    exit_threshold = bcfg.gates.deterioration_exit
     # Profit-take: close half at +15% above entry (parity with live + portfolio backtest).
-    PROFIT_TAKE_PCT = 0.15
+    PROFIT_TAKE_PCT = bcfg.gates.profit_take_trigger
     # Phase 4d: same weight source as live (per-ticker overrides merged over defaults),
     # loaded once per run. See _backtest_composite's docstring.
     factor_weights_bt = _load_ticker_weights(ticker)
@@ -822,7 +821,7 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
     l_bt  = df["Low"].values.astype(float)[1:]
     pc_bt = closes[:-1]
     tr_bt = np.maximum(h_bt - l_bt, np.maximum(np.abs(h_bt - pc_bt), np.abs(l_bt - pc_bt)))
-    atr_series = _wilder_atr(tr_bt, 21)
+    atr_series = _wilder_atr(tr_bt, bcfg.factors.atr_period)
 
     # Change 1: precompute VIX history aligned to ticker dates for the VIX>30 gate.
     # Align by calendar date: the ^VIX feed is tz-aware in a different zone (CT) than
@@ -860,27 +859,30 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
         except Exception:
             spy_above_ma = None  # fail open: don't block trades on SPY fetch failure
 
+    # Momentum-reconstruction horizons (parity with the live momentum config).
+    _mh, _ml, _msk = bcfg.factors.mom_short_horizon, bcfg.factors.mom_long_horizon, bcfg.factors.mom_skip_days
+    _mqwin, _mq = bcfg.factors.mom_quantile_window, bcfg.factors.mom_quantile
     # Change 1: rolling MA20 for overextension gate
-    ma20_series = pd.Series(closes).rolling(20, min_periods=1).mean().values
+    ma20_series = pd.Series(closes).rolling(bcfg.factors.vt_ma_short, min_periods=1).mean().values
 
     # Change 1: rolling 63-day returns for top-quartile momentum override on overextension
     ret_63d_bt = np.full(len(closes), np.nan)
-    for _i in range(63, len(closes)):
-        ret_63d_bt[_i] = closes[_i] / closes[_i - 63] - 1.0
-    mom_q75_bt = pd.Series(ret_63d_bt).rolling(252, min_periods=63).quantile(0.75).values
+    for _i in range(_mh, len(closes)):
+        ret_63d_bt[_i] = closes[_i] / closes[_i - _mh] - 1.0
+    mom_q75_bt = pd.Series(ret_63d_bt).rolling(_mqwin, min_periods=_mh).quantile(_mq).values
 
     # Change 1: pre-compute 3m/12m momentum for momentum-disagreement gate (skip 21 days)
     ret_3m_bt = np.full(len(closes), np.nan)
     ret_12m_bt = np.full(len(closes), np.nan)
     for _i in range(len(closes)):
-        _ci = _i - 21
-        if _ci >= 63:
-            ret_3m_bt[_i] = closes[_ci] / closes[_ci - 63] - 1.0
-        if _ci >= 252:
-            ret_12m_bt[_i] = closes[_ci] / closes[_ci - 252] - 1.0
+        _ci = _i - _msk
+        if _ci >= _mh:
+            ret_3m_bt[_i] = closes[_ci] / closes[_ci - _mh] - 1.0
+        if _ci >= _ml:
+            ret_12m_bt[_i] = closes[_ci] / closes[_ci - _ml] - 1.0
 
     # Change 1: 7bps commission + 0.1% slippage per trade side = 0.17% per side
-    TC_PER_SIDE = 0.0017
+    TC_PER_SIDE = bcfg.backtest.tc_per_side
 
     # Phase 4b: vol-targeted position sizing. This backtest previously went 100% of
     # the portfolio into every trade, exercising no sizing logic at all — its Sharpe
@@ -927,7 +929,7 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
     # Visibility change only — does not affect signals, gate logic, or trade outcomes.
     # Only signals scoring >= this threshold are logged (a qualifying BUY already clears
     # the buy threshold, so low-score days that were never going to trade are excluded).
-    REJECTION_SCORE_FLOOR = 40.0
+    REJECTION_SCORE_FLOOR = bcfg.backtest.rejection_score_floor
     rejection_events: list[dict] = []
 
     def _log_rejection(idx: int, gate: str, score: float, detail: str) -> None:
@@ -975,13 +977,14 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
                 # before the stop, mirroring the live stop-loss job's order.
                 if (not profit_taken and entry_price_bt > 0
                         and (cur_price - entry_price_bt) / entry_price_bt >= PROFIT_TAKE_PCT):
-                    portfolio *= (1.0 - TC_PER_SIDE * pos_weight * 0.5)  # exit cost on the closed half
-                    pos_weight *= 0.5
+                    _pt_frac = bcfg.gates.profit_take_fraction
+                    portfolio *= (1.0 - TC_PER_SIDE * pos_weight * _pt_frac)  # exit cost on the closed half
+                    pos_weight *= _pt_frac
                     profit_taken = True
                     profit_takes += 1
                 atr_exit = False
                 if use_atr_stop:
-                    atr_now = atr_series[idx] if atr_series[idx] > 0 else cur_price * 0.02
+                    atr_now = atr_series[idx] if atr_series[idx] > 0 else cur_price * bcfg.factors.atr_fallback_pct
                     candidate = cur_price - atr_mult * atr_now
                     trail_stop = max(trail_stop, candidate)
                     if cur_price < trail_stop:
@@ -1040,7 +1043,7 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
                                        "VIX data unavailable — failing closed (matches live)")
                         continue
                     if vix_series_bt is not None and idx < len(vix_series_bt):
-                        if vix_series_bt[idx] > 30.0:
+                        if vix_series_bt[idx] > bcfg.gates.vix_max:
                             gate_rejections["vix_too_high"] += 1
                             _log_rejection(idx, "vix_too_high", buy_score,
                                            f"VIX={vix_series_bt[idx]:.1f} > 30")
@@ -1065,14 +1068,15 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
                     r3  = ret_3m_bt[idx]
                     r12 = ret_12m_bt[idx]
                     if not np.isnan(r3) and not np.isnan(r12):
-                        if (r3 + r12) <= 0 or r3 < -0.10 or r12 < -0.10:
+                        _mleg = bcfg.gates.momentum_min_leg
+                        if (r3 + r12) <= 0 or r3 < _mleg or r12 < _mleg:
                             gate_rejections["momentum_disagreement"] += 1
                             _log_rejection(idx, "momentum_disagreement", buy_score,
                                            f"3m={r3:+.1%}, 12m={r12:+.1%}")
                             continue
 
                     # Change 1: re-entry cooldown (2 trading days after last exit)
-                    if idx - last_exit_idx < 2:
+                    if idx - last_exit_idx < bcfg.gates.reentry_cooldown_days:
                         gate_rejections["reentry_cooldown"] += 1
                         _log_rejection(idx, "reentry_cooldown", buy_score,
                                        f"{idx - last_exit_idx} days since last exit, cooldown=2")
@@ -1084,16 +1088,17 @@ def get_backtest(ticker: str, as_of_date: Optional[str] = None):
                     # returns[idx-21:idx] are the 21 daily returns ending at this decision
                     # close — strictly point-in-time (returns[idx] is tomorrow's move).
                     ann_vol_entry = float(returns[idx - 21: idx].std()) * np.sqrt(252.0)
-                    base_weight = vol_contribution / max(ann_vol_entry, 0.001)
-                    conviction = min(1.0 + max(0.0, composite - 75.0) / 40.0, 1.5)
-                    pos_weight = max(min(base_weight * conviction, 0.10), POSITION_FLOOR_PCT)
+                    base_weight = vol_contribution / max(ann_vol_entry, bcfg.sizing.ann_vol_floor)
+                    conviction = min(1.0 + max(0.0, composite - bcfg.sizing.conviction_pivot) / bcfg.sizing.conviction_slope,
+                                     bcfg.sizing.conviction_cap)
+                    pos_weight = max(min(base_weight * conviction, bcfg.sizing.position_cap_pct), bcfg.sizing.position_floor_pct)
                     entry_weights.append(pos_weight)
                     profit_taken = False
                     entry_price_bt = float(closes[idx])
                     portfolio *= (1.0 - TC_PER_SIDE * pos_weight)  # Change 1: entry transaction cost
                     trade_entry_val = portfolio
                     if use_atr_stop:
-                        atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * 0.02
+                        atr_entry = atr_series[idx] if atr_series[idx] > 0 else closes[idx] * bcfg.factors.atr_fallback_pct
                         trail_stop = closes[idx] - atr_mult * atr_entry
 
             bah_val = float(closes[idx + 1]) / bah_base if idx + 1 < len(closes) else float(closes[-1]) / bah_base
@@ -1194,28 +1199,30 @@ def health():
 
 def _momentum_score(closes: np.ndarray) -> float | None:
     """3m+12m momentum, skip last 21 days, each horizon z-scored against its own distribution."""
-    if len(closes) < 252 + 21 + 2:
+    short, long, skip = CFG.factors.mom_short_horizon, CFG.factors.mom_long_horizon, CFG.factors.mom_skip_days
+    zc = CFG.factors.mom_zclip
+    if len(closes) < long + skip + 2:
         return None
-    c = closes[:-21]
-    m3  = (c[-1] / c[-63]  - 1.0) if len(c) >= 63  else None
-    m12 = (c[-1] / c[-252] - 1.0) if len(c) >= 252 else None
+    c = closes[:-skip]
+    m3  = (c[-1] / c[-short] - 1.0) if len(c) >= short else None
+    m12 = (c[-1] / c[-long]  - 1.0) if len(c) >= long  else None
     if m3 is None and m12 is None:
         return None
 
     z_scores: list[float] = []
     if m3 is not None:
-        w3 = np.array([closes[i] / closes[i - 63] - 1.0 for i in range(63, len(closes) - 21)])
+        w3 = np.array([closes[i] / closes[i - short] - 1.0 for i in range(short, len(closes) - skip)])
         mu3, sig3 = float(w3.mean()), float(w3.std())
         z_scores.append((m3 - mu3) / sig3 if sig3 > 1e-10 else 0.0)
     if m12 is not None:
-        w12 = np.array([closes[i] / closes[i - 252] - 1.0 for i in range(252, len(closes) - 21)])
+        w12 = np.array([closes[i] / closes[i - long] - 1.0 for i in range(long, len(closes) - skip)])
         mu12, sig12 = float(w12.mean()), float(w12.std())
         z_scores.append((m12 - mu12) / sig12 if sig12 > 1e-10 else 0.0)
 
     if not z_scores:
         return None
-    z = float(np.clip(float(np.mean(z_scores)), -3, 3))
-    return (z + 3) / 6 * 100
+    z = float(np.clip(float(np.mean(z_scores)), -zc, zc))
+    return (z + zc) / (2 * zc) * 100
 
 
 def _volume_divergence_modifier(
@@ -1228,23 +1235,27 @@ def _volume_divergence_modifier(
     volume (confirmed selling); small bonus for price rising on rising volume (confirmed)
     or falling on declining volume (sellers exhausting). Fail-safe: any insufficient or
     missing volume data returns 0 so a volume failure can never affect the composite."""
-    if volumes is None or len(volumes) < 20 or len(closes) < 20:
+    ma_win, recent_win = CFG.factors.vt_vol_ma_window, CFG.factors.vt_vol_recent_window
+    band = CFG.factors.vt_price_trend_band
+    lo, hi = CFG.factors.vt_vol_ratio_low, CFG.factors.vt_vol_ratio_high
+    penalty, bonus = CFG.factors.vt_modifier_penalty, CFG.factors.vt_modifier_bonus
+    if volumes is None or len(volumes) < ma_win or len(closes) < ma_win:
         return 0
-    vol_ma20 = float(np.mean(volumes[-20:]))
+    vol_ma20 = float(np.mean(volumes[-ma_win:]))
     if vol_ma20 <= 0:
         return 0
-    vol_recent = float(np.mean(volumes[-5:]))  # 5-day average smooths noise
+    vol_recent = float(np.mean(volumes[-recent_win:]))  # smooths noise
     vol_ratio = vol_recent / vol_ma20
-    price_trend = (float(closes[-1]) - float(closes[-20])) / float(closes[-20])
+    price_trend = (float(closes[-1]) - float(closes[-ma_win])) / float(closes[-ma_win])
 
-    if price_trend > 0.02 and vol_ratio < 0.8:
-        modifier = -8   # price up, volume down — weak conviction
-    elif price_trend > 0.02 and vol_ratio > 1.2:
-        modifier = 5    # price up, volume up — confirmed move
-    elif price_trend < -0.02 and vol_ratio > 1.2:
-        modifier = -8   # price down, volume up — confirmed selling
-    elif price_trend < -0.02 and vol_ratio < 0.8:
-        modifier = 5    # price down, volume down — sellers exhausting
+    if price_trend > band and vol_ratio < lo:
+        modifier = penalty   # price up, volume down — weak conviction
+    elif price_trend > band and vol_ratio > hi:
+        modifier = bonus     # price up, volume up — confirmed move
+    elif price_trend < -band and vol_ratio > hi:
+        modifier = penalty   # price down, volume up — confirmed selling
+    elif price_trend < -band and vol_ratio < lo:
+        modifier = bonus     # price down, volume down — sellers exhausting
     else:
         modifier = 0
 
@@ -1264,20 +1275,21 @@ def _vol_trend_score(
     When ``volumes`` is supplied, a volume-divergence modifier nudges the score at the
     margin (see _volume_divergence_modifier). Omitting volumes (e.g. the price-only
     backtest path) leaves the base MA-alignment score unchanged."""
-    if len(closes) < 201:
+    short, mid, long = CFG.factors.vt_ma_short, CFG.factors.vt_ma_mid, CFG.factors.vt_ma_long
+    if len(closes) < long + 1:
         return None, None
-    ma20  = closes[-20:].mean()
-    ma50  = closes[-50:].mean()
-    ma200 = closes[-200:].mean()
+    ma20  = closes[-short:].mean()
+    ma50  = closes[-mid:].mean()
+    ma200 = closes[-long:].mean()
     price = closes[-1]
     alignment = sum([price > ma20, ma20 > ma50, ma50 > ma200])
     raw = alignment / 3.0  # 0, 1/3, 2/3, 1
     # Realised vol over last 21 days
     ret21 = np.diff(closes[-22:]) / closes[-22:-1]
     rvol = ret21.std() * np.sqrt(252)
-    inv_vol_weight = 1.0 / (rvol + 0.05)  # cap weight for very low vol
+    inv_vol_weight = 1.0 / (rvol + CFG.factors.vt_inv_vol_offset)  # cap weight for very low vol
     # Rescale: already 0-1, apply vol weight as a squeeze toward 50 for high-vol
-    vol_factor = min(inv_vol_weight / 5.0, 1.0)  # normalise so typical ~0.5 maps to 1
+    vol_factor = min(inv_vol_weight / CFG.factors.vt_inv_vol_norm, 1.0)  # normalise so typical ~0.5 maps to 1
     base_score = 50.0 + (raw - 0.5) * 100.0 * vol_factor
     # Volume divergence modifier (fail-safe: 0 when volume data is missing/insufficient)
     modifier = _volume_divergence_modifier(closes, volumes, ticker)
@@ -1365,7 +1377,7 @@ def _earnings_score(ticker_obj: yf.Ticker) -> tuple[float | None, dict | None]:
         try:
             report_date = most_recent.to_pydatetime().replace(tzinfo=None)
             days_since = (datetime.now() - report_date).days
-            if days_since > 120:  # older than ~1 quarter + 30 day buffer
+            if days_since > CFG.factors.earn_staleness_days:  # older than ~1 quarter + 30 day buffer
                 logger.debug("%s: earnings factor stale (%d days since last report) — nulling",
                              getattr(ticker_obj, "ticker", "?"), days_since)
                 return None, {"stale": True, "days": days_since}
@@ -1383,14 +1395,16 @@ def _earnings_score(ticker_obj: yf.Ticker) -> tuple[float | None, dict | None]:
         if len(surprises) < 2:
             return None, None
         detail = {"surprises": [float(s) for s in surprises]}  # oldest → newest
+        high, low = CFG.factors.earn_band_high, CFG.factors.earn_band_low
+        scale = CFG.factors.earn_surprise_scale
         pos = sum(s > 0 for s in surprises)
         if pos == 2:
             avg = np.mean(surprises)
-            return float(np.clip(70.0 + avg * 200.0, 70.0, 100.0)), detail
+            return float(np.clip(high + avg * scale, high, 100.0)), detail
         if pos == 0:
             avg = np.mean(surprises)
-            return float(np.clip(30.0 + avg * 200.0, 0.0, 30.0)), detail
-        return 50.0, detail
+            return float(np.clip(low + avg * scale, 0.0, low)), detail
+        return CFG.factors.earn_neutral, detail
     except Exception as e:
         logger.warning("Earnings score failed for %s: %s", getattr(ticker_obj, "ticker", "?"), e)
         return None, None
@@ -1497,7 +1511,9 @@ def _fetch_insider(ticker: str) -> dict:
             logger.info("EDGAR cache hit: %s", ticker)
             return cached[1]
 
-    ROLE_WEIGHTS = {"isOfficer": 1.0, "isDirector": 0.7, "isTenPercentOwner": 0.5}
+    ROLE_WEIGHTS = {"isOfficer": CFG.factors.insider_role_officer,
+                    "isDirector": CFG.factors.insider_role_director,
+                    "isTenPercentOwner": CFG.factors.insider_role_tenpct}
     ROLE_LABELS  = {"isOfficer": "Officer", "isDirector": "Director", "isTenPercentOwner": "10% owner"}
     headers = {"User-Agent": "stock-tracker emmettmacken@gmail.com"}
     blank = {
@@ -1633,7 +1649,8 @@ def _fetch_insider(ticker: str) -> dict:
             # Form 4s exist but all failed to parse → score None (drop weight, don't guess)
             return _store({**blank, "ok": True})
 
-        score = 70.0 if net_weighted > 0 else (30.0 if net_weighted < 0 else 50.0)
+        score = (CFG.factors.insider_band_high if net_weighted > 0
+                 else (CFG.factors.insider_band_low if net_weighted < 0 else CFG.factors.insider_neutral))
         direction = "buying" if net_weighted > 0 else ("selling" if net_weighted < 0 else "neutral")
         return _store({
             "ok": True, "score": score, "net_weighted": net_weighted,
@@ -1803,9 +1820,9 @@ def _composite_signal(score: Optional[float]) -> str:
     the macro-aware threshold, not this static mapping."""
     if score is None:
         return "HOLD"
-    if score >= 63.0:
+    if score >= CFG.thresholds.display_buy:
         return "BUY"
-    if score < 45.0:
+    if score < CFG.thresholds.display_sell:
         return "SELL"
     return "HOLD"
 
@@ -1850,9 +1867,9 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
         bull_id = 0
 
     # Regime label based on the Kalman-smoothed Gaussian-HMM bull probability.
-    if smoothed_bull_prob_last > 0.65:
+    if smoothed_bull_prob_last > CFG.hmm.regime_bull_prob:
         regime_label = "bull"
-    elif smoothed_bull_prob_last < 0.35:
+    elif smoothed_bull_prob_last < CFG.hmm.regime_bear_prob:
         regime_label = "bear"
     else:
         regime_label = "transition"
@@ -1869,22 +1886,24 @@ def _compute_factors(ticker: str, force: bool = False) -> Optional[dict]:
     current_vol  = float(vol[-2])     if len(vol)     >= 2 else (float(vol[-1])     if len(vol)     > 0 else 0.0)
     avg_vol_20d  = float(vol_20d[-2]) if len(vol_20d) >= 2 else (float(vol_20d[-1]) if len(vol_20d) > 0 else 1.0)
     volume_ratio = round(current_vol / avg_vol_20d, 3) if avg_vol_20d > 0 else None
-    vol_thresh   = float(db.get_config("VOLUME_THRESHOLD", "1.05"))
+    vol_thresh   = float(resolve("VOLUME_THRESHOLD", CFG.thresholds.volume_ratio))
     volume_ok    = current_vol > vol_thresh * avg_vol_20d if avg_vol_20d > 0 else True
-    ma20         = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes[-1])
+    _ma_short    = CFG.factors.vt_ma_short
+    ma20         = float(closes[-_ma_short:].mean()) if len(closes) >= _ma_short else float(closes[-1])
     price_ma20_ratio = float(closes[-1]) / ma20 if ma20 > 0 else 1.0
     # Fix 2-F: derive overextended from the same config the live gate uses (no hardcoded 1.25)
-    _oe_thresh_pct = float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
+    _oe_thresh_pct = float(resolve("OVEREXTENDED_THRESHOLD_PCT", CFG.thresholds.overextended_pct))
     overextended = price_ma20_ratio > (1.0 + _oe_thresh_pct)
 
     # Fix 2-B: true rolling 75th-percentile of 63-day returns, matching the backtest's
     # overextension override (ret_63d >= mom_q75) instead of the z-scored mom_score threshold.
-    if len(closes) > 63:
-        ret_63d_arr = closes[63:] / closes[:-63] - 1.0
+    _mom_h, _mom_qwin, _mom_q = CFG.factors.mom_short_horizon, CFG.factors.mom_quantile_window, CFG.factors.mom_quantile
+    if len(closes) > _mom_h:
+        ret_63d_arr = closes[_mom_h:] / closes[:-_mom_h] - 1.0
     else:
         ret_63d_arr = np.array([])
-    if len(ret_63d_arr) >= 63:
-        mom_q75_now = float(np.quantile(ret_63d_arr[-252:], 0.75))
+    if len(ret_63d_arr) >= _mom_h:
+        mom_q75_now = float(np.quantile(ret_63d_arr[-_mom_qwin:], _mom_q))
         top_quartile_mom = bool(float(ret_63d_arr[-1]) >= mom_q75_now)
     else:
         top_quartile_mom = False
@@ -2172,8 +2191,10 @@ def get_debug():
             if db_data:
                 out[key] = _sanitize_json(db_data)
     out["active_config"] = {
+        # MIN_FACTOR_FLOOR default is intentionally "disabled" here vs "" in the live gate —
+        # a known pre-existing inconsistency, flagged and deliberately NOT reconciled here.
         "MIN_FACTOR_FLOOR":           db.get_config("MIN_FACTOR_FLOOR", "disabled"),
-        "OVEREXTENDED_THRESHOLD_PCT": db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"),
+        "OVEREXTENDED_THRESHOLD_PCT": resolve("OVEREXTENDED_THRESHOLD_PCT", CFG.thresholds.overextended_pct),
         "DEFAULT_FACTOR_WEIGHTS":     DEFAULT_FACTOR_WEIGHTS,
     }
     return out
@@ -2447,17 +2468,17 @@ class SizingRequest(BaseModel):
 
 def _realised_vol(closes: np.ndarray, days: int = 21) -> float:
     if len(closes) < days + 1:
-        return 0.25  # default 25% annualised
+        return CFG.sizing.vol_prior_default  # default 25% annualised
     rets = np.diff(closes[-days - 1:]) / closes[-days - 1:-1]
     return float(rets.std() * np.sqrt(252))
 
 
 def _kelly_fraction(composite_score: float, rvol: float) -> float:
     """Edge ~ linear map score 50→0, 100→0.3. Variance = rvol^2."""
-    edge = max(0.0, (composite_score - 50.0) / 50.0 * 0.3)
-    variance = max(rvol ** 2, 0.01)
+    edge = max(0.0, (composite_score - 50.0) / 50.0 * CFG.sizing.kelly_edge_scale)
+    variance = max(rvol ** 2, CFG.sizing.kelly_variance_floor)
     kelly = edge / variance
-    return min(kelly * 0.5, 0.25)  # half-Kelly, cap at 25%
+    return min(kelly * CFG.sizing.kelly_fraction_mult, CFG.sizing.kelly_cap)  # half-Kelly, cap
 
 
 def _correlation_penalty(
@@ -2480,10 +2501,12 @@ def _correlation_penalty(
     Returns (penalty, max_corr, correlated_ticker), where correlated_ticker is the held
     name driving the penalty (None when none qualifies).
     """
+    win, min_overlap = CFG.sizing.corr_window, CFG.sizing.corr_min_overlap
+    thr, span, max_pen = CFG.sizing.corr_threshold, CFG.sizing.corr_span, CFG.sizing.corr_max_penalty
     cand_c = prices.get(candidate_ticker)
-    if cand_c is None or len(cand_c) < 61:
+    if cand_c is None or len(cand_c) < win:
         return 1.0, 0.0, None
-    cand_r = pd.Series(np.diff(cand_c[-61:]) / cand_c[-61:-1])
+    cand_r = pd.Series(np.diff(cand_c[-win:]) / cand_c[-win:-1])
 
     max_corr = 0.0
     correlated_ticker: Optional[str] = None
@@ -2491,19 +2514,19 @@ def _correlation_penalty(
         if held == candidate_ticker:
             continue
         held_c = prices.get(held)
-        if held_c is None or len(held_c) < 61:
+        if held_c is None or len(held_c) < win:
             continue
-        held_r = pd.Series(np.diff(held_c[-61:]) / held_c[-61:-1])
+        held_r = pd.Series(np.diff(held_c[-win:]) / held_c[-win:-1])
         pair = pd.DataFrame({"a": cand_r, "b": held_r}).dropna()
-        if len(pair) < 10:
+        if len(pair) < min_overlap:
             continue
         c_val = float(pair["a"].corr(pair["b"]))
         if not np.isnan(c_val) and c_val > max_corr:
             max_corr = c_val
             correlated_ticker = held
 
-    if max_corr > 0.7:
-        return 1.0 - (max_corr - 0.7) / 0.3 * 0.5, max_corr, correlated_ticker
+    if max_corr > thr:
+        return 1.0 - (max_corr - thr) / span * max_pen, max_corr, correlated_ticker
     return 1.0, max_corr, correlated_ticker
 
 
@@ -2517,7 +2540,7 @@ def portfolio_sizing(req: SizingRequest):
         # full watchlist). Every ticker still gets an entry in both maps — a failed fetch
         # falls back to an empty close series and a 0.25 vol prior, exactly as before.
         closes_map: dict[str, np.ndarray] = {t: np.array([]) for t in tickers}
-        vols_map: dict[str, float] = {t: 0.25 for t in tickers}
+        vols_map: dict[str, float] = {t: CFG.sizing.vol_prior_default for t in tickers}
 
         def _fetch_closes(t: str) -> tuple[str, Optional[np.ndarray]]:
             try:
@@ -2560,7 +2583,7 @@ def portfolio_sizing(req: SizingRequest):
         kelly_fracs = _normalize_portfolio_sizing(kelly_fracs, PORTFOLIO_KELLY_CAP)
 
         # Vol-targeted allocations: 1/vol weight, normalised
-        inv_vol = {t: (1.0 / max(vols_map[t], 0.01)) * corr_penalties[t] for t in tickers}
+        inv_vol = {t: (1.0 / max(vols_map[t], CFG.sizing.inv_vol_floor)) * corr_penalties[t] for t in tickers}
         total_inv_vol = sum(inv_vol.values())
         vol_alloc = {t: inv_vol[t] / total_inv_vol if total_inv_vol > 0 else 1.0 / len(tickers) for t in tickers}
 
@@ -2595,7 +2618,12 @@ class PortfolioBacktestRequest(BaseModel):
 def portfolio_backtest(req: PortfolioBacktestRequest):
     try:
         tickers = [t.upper() for t in req.tickers]
-        TRAIN, TEST = 252, 21
+        # Backtest paths read BACKTEST_CONFIG; DB-backed keys resolve DB-first. Decision 1:
+        # train/test now share the BACKTEST_TRAIN/BACKTEST_TEST keys with the single-ticker
+        # backtest (was hardcoded 252, 21 here — no system_config override present, unchanged).
+        bcfg = BACKTEST_CONFIG
+        TRAIN = int(resolve("BACKTEST_TRAIN", bcfg.backtest.train, baseline=CFG.backtest.train))
+        TEST  = int(resolve("BACKTEST_TEST", bcfg.backtest.test, baseline=CFG.backtest.test))
 
         # Phase 4f: as-of anchor threads into every data fetch (ticker prices, SPY,
         # VIX) so a pinned run reads nothing after as_of_date. NOT constrained
@@ -2654,23 +2682,23 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         }
 
         # Change 1: 7bps commission + 0.1% slippage per side
-        TC_PER_SIDE_PB = 0.0017
+        TC_PER_SIDE_PB = bcfg.backtest.tc_per_side
         # Entry/exit now mirror the live trader and the single-ticker backtest: allocate
         # to tickers whose composite clears the buy threshold, exit on score deterioration,
         # trail an ATR_STOP_MULT×ATR stop, and take half profit at +15%.
-        buy_threshold  = float(db.get_config("bull_threshold", "63"))
+        buy_threshold  = float(resolve("bull_threshold", bcfg.thresholds.bull, baseline=CFG.thresholds.bull))
         # Parity with live: the same adaptive bear threshold the live trader raises the
         # bar to when SPY is below its 200-day MA (was hardcoded 80.0 here).
-        bear_threshold = float(db.get_config("bear_threshold", "80"))
+        bear_threshold = float(resolve("bear_threshold", bcfg.thresholds.bear, baseline=CFG.thresholds.bear))
         # Phase 5: same single-source ATR-stop multiplier as the live trader and the
         # single-ticker backtest (ATR_STOP_MULT, default 2.5). Consolidated from the former
         # BACKTEST_ATR_MULTIPLIER key.
-        atr_mult_pb = float(db.get_config("ATR_STOP_MULT", "2.5"))
+        atr_mult_pb = float(resolve("ATR_STOP_MULT", bcfg.factors.atr_stop_mult, baseline=CFG.factors.atr_stop_mult))
         # Phase 5: shared per-position vol-contribution target (default 0.025), same config
         # the live _position_dollars path reads — parity with live sizing.
-        vol_contribution_pb = float(db.get_config("VOL_CONTRIBUTION_TARGET", "0.025"))
-        exit_threshold = 40.0
-        PROFIT_TAKE_PCT = 0.15
+        vol_contribution_pb = float(resolve("VOL_CONTRIBUTION_TARGET", bcfg.sizing.vol_contribution_target, baseline=CFG.sizing.vol_contribution_target))
+        exit_threshold = bcfg.gates.deterioration_exit
+        PROFIT_TAKE_PCT = bcfg.gates.profit_take_trigger
 
         # Walk-forward
         portfolio_val = req.capital
@@ -2745,7 +2773,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 _c = combined_arr[:, valid.index(_t)]
                 _tr = np.maximum(_h[1:] - _l[1:],
                                  np.maximum(np.abs(_h[1:] - _c[:-1]), np.abs(_l[1:] - _c[:-1])))
-                _atr_full[1:] = _wilder_atr(_tr, 21)
+                _atr_full[1:] = _wilder_atr(_tr, bcfg.factors.atr_period)
             except Exception:
                 pass  # missing High/Low → fallback ATR (2% of price) applies per bar
             atr_series_pb[_t] = _atr_full
@@ -2772,13 +2800,13 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
 
         def _pit_perf_multiplier(t: str, cutoff_idx: int) -> float:
             closed = [ret for (xi, ret) in sim_outcomes[t] if xi < cutoff_idx]
-            if len(closed) < 3:
+            if len(closed) < bcfg.sizing.perf_min_trades:
                 return 1.0
             wr = sum(1 for r in closed if r > 0) / len(closed)
-            if wr > 0.6:
-                return 1.2
-            if wr < 0.4:
-                return 0.7
+            if wr > bcfg.sizing.perf_winrate_high:
+                return bcfg.sizing.perf_mult_high
+            if wr < bcfg.sizing.perf_winrate_low:
+                return bcfg.sizing.perf_mult_low
             return 1.0
 
         # Phase 4c (item 4): sector-slot reservation, mirroring live's MAX_SECTOR_POSITIONS
@@ -2787,7 +2815,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         # is consumed at ACCEPTANCE (in score order), not at fill — a candidate later
         # dropped sub-floor keeps its slot for the window, blocking lower-score same-sector
         # names, exactly like the intentional acceptance-time reservation in _run_signal_job.
-        max_sector_pb = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+        max_sector_pb = int(resolve("MAX_SECTOR_POSITIONS", bcfg.gates.max_sector_positions, baseline=CFG.gates.max_sector_positions))
         sectors_pb: dict[str, str] = {}
         for _t in valid:
             try:
@@ -2822,7 +2850,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 c, ret = features[t]
                 tr_rets = ret[ts:te]
                 if len(tr_rets) < 22:
-                    rvols[t] = 0.25
+                    rvols[t] = bcfg.sizing.vol_prior_default
                     signals_window[t] = "HOLD"
                     composites_window[t] = 0.0
                     continue
@@ -2834,7 +2862,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 # can't be reconstructed point-in-time in this rebalancing model, so the
                 # composite is used as a conservative proxy: require composite >= 70,
                 # approximating the live trader's smoothed_bull_prob >= 0.70 entry gate.
-                if composite is None or composite < 70:
+                if composite is None or composite < bcfg.gates.hmm_composite_proxy:
                     signals_window[t] = "HOLD"
                     continue
 
@@ -2846,7 +2874,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 regime_threshold = buy_threshold if bull_regime else bear_threshold
                 is_buy = composite >= regime_threshold
                 # Re-entry cooldown: block a BUY within 2 trading days of a mid-window exit.
-                if is_buy and (test_start - last_exit_idx[t]) < 2:
+                if is_buy and (test_start - last_exit_idx[t]) < bcfg.gates.reentry_cooldown_days:
                     is_buy = False
                 signals_window[t] = "BUY" if is_buy else "HOLD"
 
@@ -2856,7 +2884,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             # no longer blocks entries here — parity with live, where a bear regime
             # raises the per-ticker buy threshold (applied above) instead of pausing.
             # Parity with live: fails CLOSED when the VIX series is unavailable.
-            vix_ok = (vix_series_pb is not None) and not (vix_series_pb[test_start] > 30.0)
+            vix_ok = (vix_series_pb is not None) and not (vix_series_pb[test_start] > bcfg.gates.vix_max)
             entries_allowed = vix_ok
             if not entries_allowed:
                 for t in valid:
@@ -2887,11 +2915,12 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     continue
                 # Vol-target base weight (VOL_CONTRIBUTION_TARGET annualized vol contribution),
                 # matching _position_dollars.
-                rvol = rvols.get(t, 0.25)
-                base_weight = vol_contribution_pb / max(rvol, 0.001)
+                rvol = rvols.get(t, bcfg.sizing.vol_prior_default)
+                base_weight = vol_contribution_pb / max(rvol, bcfg.sizing.ann_vol_floor)
                 # Conviction multiplier from composite score (75→1×, 95→1.5×).
                 score = composites_window.get(t, buy_threshold)
-                conviction = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
+                conviction = min(1.0 + max(0.0, score - bcfg.sizing.conviction_pivot) / bcfg.sizing.conviction_slope,
+                                 bcfg.sizing.conviction_cap)
                 # Phase 4c (item 3): point-in-time win-rate performance multiplier
                 # (×1.2 / ×0.7, ≥3 simulated legs — see sim_outcomes above).
                 perf_mult = _pit_perf_multiplier(t, test_start)
@@ -2900,8 +2929,8 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 # Per-position hard cap at 10%, sub-floor RAISED to the 0.5% floor —
                 # both matching _position_dollars (Phase 4c item 2: live raises to the
                 # floor at per-position sizing; only the post-normalization pass drops).
-                weight = max(min(base_weight * conviction * perf_mult * penalty, 0.10),
-                             POSITION_FLOOR_PCT)
+                weight = max(min(base_weight * conviction * perf_mult * penalty, bcfg.sizing.position_cap_pct),
+                             bcfg.sizing.position_floor_pct)
                 sized[t] = weight
                 held_so_far.append(t)
                 if sec != "Unknown":
@@ -2925,12 +2954,12 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                 if not survivors:
                     break
                 normalized = _normalize_portfolio_sizing(
-                    {t: sized[t] for t in survivors}, 1.0
+                    {t: sized[t] for t in survivors}, bcfg.sizing.portfolio_kelly_cap
                 )
-                sub_floor = [t for t in survivors if normalized[t] < POSITION_FLOOR_PCT]
+                sub_floor = [t for t in survivors if normalized[t] < bcfg.sizing.position_floor_pct]
                 if not sub_floor:
                     break
-                survivors = [t for t in survivors if normalized[t] >= POSITION_FLOOR_PCT]
+                survivors = [t for t in survivors if normalized[t] >= bcfg.sizing.position_floor_pct]
             weights = {t: normalized[t] for t in survivors}
             for t in valid:
                 if t not in weights:
@@ -2962,7 +2991,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         _px = float(combined_arr[test_start, valid.index(t)])
                         entry_prices_bt[t] = _px
                         _a = atr_series_pb[t][test_start]
-                        _atr0 = float(_a) if not np.isnan(_a) and _a > 0 else _px * 0.02
+                        _atr0 = float(_a) if not np.isnan(_a) and _a > 0 else _px * bcfg.factors.atr_fallback_pct
                         trail_stops_pb[t] = _px - atr_mult_pb * _atr0
                 else:
                     # Window-boundary drop: a previously-held name that wasn't re-sized
@@ -2997,7 +3026,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     if t not in profit_taken_bt:
                         entry_px = entry_prices_bt.get(t)
                         if entry_px and (c_t[idx] - entry_px) / entry_px >= PROFIT_TAKE_PCT:
-                            half_weight = live_weights[t] * 0.5
+                            half_weight = live_weights[t] * bcfg.gates.profit_take_fraction
                             # Charge exit cost on the closed half only
                             portfolio_val *= (1.0 - TC_PER_SIDE_PB * half_weight)
                             live_weights[t] = half_weight
@@ -3016,7 +3045,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     stop = trail_stops_pb.get(t)
                     if stop is not None:
                         _a = atr_series_pb[t][idx]
-                        _atr_now = float(_a) if not np.isnan(_a) and _a > 0 else float(c_t[idx]) * 0.02
+                        _atr_now = float(_a) if not np.isnan(_a) and _a > 0 else float(c_t[idx]) * bcfg.factors.atr_fallback_pct
                         candidate = float(c_t[idx]) - atr_mult_pb * _atr_now
                         if candidate > stop:
                             stop = candidate
@@ -3099,13 +3128,13 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         max_dd = float(((vals - peaks) / np.maximum(peaks, 1e-9)).min() * 100) if len(vals) > 0 else 0.0
 
         # Monte Carlo efficient frontier (500 random weightings)
-        n_mc = 500
+        n_mc = bcfg.backtest.monte_carlo_runs
         ef_points: list[dict] = []
         if n_stocks > 1 and len(equity_curve) > 10:
             combined_rets = np.diff(combined_arr, axis=0) / combined_arr[:-1]
             mu = combined_rets.mean(axis=0)
             cov = np.cov(combined_rets.T)
-            rng = np.random.default_rng(42)
+            rng = np.random.default_rng(bcfg.backtest.monte_carlo_seed)
             for _ in range(n_mc):
                 w = rng.dirichlet(np.ones(n_stocks))
                 port_ret = float(np.dot(w, mu) * 252 * 100)
@@ -3245,7 +3274,7 @@ def _macro_regime() -> tuple[bool, float]:
     return d["spy_above"], d["vix"]
 
 
-def _earnings_within_days(ticker: str, days: int = 2) -> bool:
+def _earnings_within_days(ticker: str, days: int = CFG.gates.earnings_within_days) -> bool:
     """Return True if earnings announcement is within `days` calendar days."""
     # Change 5: lock prevents TOCTOU race when multiple threads check the same ticker
     with _EARNINGS_LOCK:
@@ -3351,14 +3380,11 @@ def _compute_kelly_params(trades: list[dict]) -> Optional[tuple[float, float, fl
     return p, b, f_star
 
 
-# Maximum aggregate Kelly-derived exposure across all positions opened in a single
-# run, as a fraction of equity. 1.0 → total exposure capped at 100% of equity.
-PORTFOLIO_KELLY_CAP = 1.0
-
-# Minimum per-position size as a fraction of equity. A position sized below this
-# (including after portfolio normalization scales it down) is not worth opening and
-# is dropped from the run. Shared by _position_dollars and the live-job normalization.
-POSITION_FLOOR_PCT = 0.005
+# Maximum aggregate Kelly-derived exposure across all positions opened in a single run,
+# and minimum per-position size — both now live in config/base.py (Sizing). Aliased here
+# for the existing call sites; single source is CFG.sizing.
+PORTFOLIO_KELLY_CAP = CFG.sizing.portfolio_kelly_cap
+POSITION_FLOOR_PCT = CFG.sizing.position_floor_pct
 
 
 def _normalize_portfolio_sizing(sizes: dict[str, float], cap: float) -> dict[str, float]:
@@ -3376,7 +3402,7 @@ def _normalize_portfolio_sizing(sizes: dict[str, float], cap: float) -> dict[str
 
 
 def _position_dollars(
-    ticker: str, equity: float, score: float = 75.0, vol_21d: Optional[float] = None
+    ticker: str, equity: float, score: float = CFG.sizing.default_score, vol_21d: Optional[float] = None
 ) -> tuple[float, float, str, float]:
     """Returns (position_dollars, kelly_fraction, sizing_method, ann_vol).
 
@@ -3409,25 +3435,26 @@ def _position_dollars(
     # Derivation: portfolio vol target ~12% annualized, ~8 concurrent positions, stressed
     # avg pairwise correlation 0.3 → k ≈ 0.12 / sqrt(8 + 8·7·0.3) ≈ 0.025. The no-vol-data
     # fallback weight (0.05) is deliberately left unchanged.
-    vol_contribution = float(db.get_config("VOL_CONTRIBUTION_TARGET", "0.025"))
+    vol_contribution = float(resolve("VOL_CONTRIBUTION_TARGET", CFG.sizing.vol_contribution_target))
     ann_vol = daily_vol * math.sqrt(252.0) if daily_vol > 0 else 0.0
-    vol_weight = (vol_contribution / ann_vol) if ann_vol > 0 else 0.05
+    vol_weight = (vol_contribution / ann_vol) if ann_vol > 0 else CFG.sizing.no_vol_fallback_weight
     # Pre-Phase-5 (daily-vol convention @ the old 0.01 target) weight, kept ONLY for the
     # one-cycle [SIZING_MIGRATION_CHECK] comparison logs below; remove together with them
     # once the first post-deploy signal-job run under the final constant has been reviewed.
-    old_vol_weight = (0.01 / daily_vol) if daily_vol > 0 else 0.05
+    old_vol_weight = (0.01 / daily_vol) if daily_vol > 0 else CFG.sizing.no_vol_fallback_weight
 
     # Conviction multiplier: score 75→1×, 85→1.25×, 95→1.5×
-    multiplier = min(1.0 + max(0.0, score - 75.0) / 40.0, 1.5)
+    multiplier = min(1.0 + max(0.0, score - CFG.sizing.conviction_pivot) / CFG.sizing.conviction_slope,
+                     CFG.sizing.conviction_cap)
 
     # Performance multiplier
     perf = db.get_ticker_performance(ticker)
     perf_multiplier = 1.0
-    if perf and perf["total_trades"] >= 3:
-        if perf["win_rate"] > 0.6:
-            perf_multiplier = 1.2
-        elif perf["win_rate"] < 0.4:
-            perf_multiplier = 0.7
+    if perf and perf["total_trades"] >= CFG.sizing.perf_min_trades:
+        if perf["win_rate"] > CFG.sizing.perf_winrate_high:
+            perf_multiplier = CFG.sizing.perf_mult_high
+        elif perf["win_rate"] < CFG.sizing.perf_winrate_low:
+            perf_multiplier = CFG.sizing.perf_mult_low
 
     vol_base = vol_weight * equity * multiplier * perf_multiplier
     old_vol_base = old_vol_weight * equity * multiplier * perf_multiplier  # migration log only
@@ -3477,17 +3504,17 @@ def _position_dollars(
     kelly_frac: float = 0.0
     sizing_method = "vol_target_fallback"
 
-    if len(ticker_trades) >= 10:
+    if len(ticker_trades) >= CFG.sizing.kelly_ticker_min_trades:
         params = _compute_kelly_params(ticker_trades)
         if params is not None:
             _, _, f_star = params
-            kelly_frac = f_star * 0.5  # half-Kelly
+            kelly_frac = f_star * CFG.sizing.kelly_fraction_mult  # half-Kelly
             sizing_method = "kelly"
-    elif len(all_trades) >= 20:
+    elif len(all_trades) >= CFG.sizing.kelly_portfolio_min_trades:
         params = _compute_kelly_params(all_trades)
         if params is not None:
             _, _, f_star = params
-            kelly_frac = f_star * 0.5
+            kelly_frac = f_star * CFG.sizing.kelly_fraction_mult
             sizing_method = "kelly_portfolio_prior"
 
     if sizing_method != "vol_target_fallback":
@@ -3495,7 +3522,7 @@ def _position_dollars(
         # If Kelly is more than 3× vol-target, warn and cap. With the annualized
         # vol-target reference this cap can now genuinely bind (against the old
         # daily-vol reference, ~16× too high, it never did).
-        cap_3x = vol_base * 3.0
+        cap_3x = vol_base * CFG.sizing.kelly_vol_target_cap_mult
         cap_binds = kelly_raw > cap_3x
         kelly_dollars = kelly_raw
         if cap_binds:
@@ -3506,15 +3533,15 @@ def _position_dollars(
             kelly_dollars = cap_3x
         # Correlation penalty, then hard cap 10%, floor POSITION_FLOOR_PCT
         kelly_dollars = _penalize(kelly_dollars)
-        kelly_dollars = max(min(kelly_dollars, equity * 0.10), equity * POSITION_FLOOR_PCT)
+        kelly_dollars = max(min(kelly_dollars, equity * CFG.sizing.position_cap_pct), equity * POSITION_FLOOR_PCT)
         # One-cycle migration check: pre-Phase-5 size (old daily-vol convention @ the 0.01
         # target) alongside the new size (annualized vol @ the configured
         # VOL_CONTRIBUTION_TARGET) so the first post-deploy signal run can be sanity-checked
         # from Railway logs. Remove this block (and old_vol_weight/old_vol_base above) once
         # reviewed — its one reviewed run should happen under the final constant.
-        old_cap_3x = old_vol_base * 3.0
+        old_cap_3x = old_vol_base * CFG.sizing.kelly_vol_target_cap_mult
         old_dollars = max(
-            min(min(kelly_raw, old_cap_3x) * penalty, equity * 0.10),
+            min(min(kelly_raw, old_cap_3x) * penalty, equity * CFG.sizing.position_cap_pct),
             equity * POSITION_FLOOR_PCT,
         )
         logger.info(
@@ -3526,9 +3553,9 @@ def _position_dollars(
         return kelly_dollars, round(kelly_frac, 6), sizing_method, ann_vol
 
     # Vol-targeting fallback
-    raw_dollars = max(min(_penalize(vol_base), equity * 0.10), equity * POSITION_FLOOR_PCT)
+    raw_dollars = max(min(_penalize(vol_base), equity * CFG.sizing.position_cap_pct), equity * POSITION_FLOOR_PCT)
     # One-cycle migration check — see the note on the Kelly path above.
-    old_dollars = max(min(old_vol_base * penalty, equity * 0.10), equity * POSITION_FLOOR_PCT)
+    old_dollars = max(min(old_vol_base * penalty, equity * CFG.sizing.position_cap_pct), equity * POSITION_FLOOR_PCT)
     logger.info(
         "[SIZING_MIGRATION_CHECK] %s method=vol_target_fallback old_size=$%.0f "
         "new_size=$%.0f ann_vol=%.4f",
@@ -3704,11 +3731,14 @@ def _run_signal_job() -> None:
         return
 
     spy_above, vix = _macro_regime()
-    high_vix = vix > 30
-    bull_threshold = float(db.get_config("bull_threshold", "63"))
-    bear_threshold = float(db.get_config("bear_threshold", "80"))
+    high_vix = vix > CFG.gates.vix_max
+    bull_threshold = float(resolve("bull_threshold", CFG.thresholds.bull))
+    bear_threshold = float(resolve("bear_threshold", CFG.thresholds.bear))
     buy_threshold  = bear_threshold if not spy_above else bull_threshold
-    oe_thresh        = float(db.get_config("OVEREXTENDED_THRESHOLD_PCT", "0.25"))
+    oe_thresh        = float(resolve("OVEREXTENDED_THRESHOLD_PCT", CFG.thresholds.overextended_pct))
+    # MIN_FACTOR_FLOOR default is intentionally left as "" here (vs "disabled" in the
+    # /api/debug endpoint) — a known pre-existing inconsistency, flagged for a separate
+    # future fix and deliberately NOT reconciled by the config-consolidation refactor.
     _mff_cfg         = db.get_config("MIN_FACTOR_FLOOR", "")
     min_factor_floor = float(_mff_cfg) if _mff_cfg else None
     logger.info("Macro: SPY>200d=%s VIX=%.1f threshold=%.0f",
@@ -3816,7 +3846,7 @@ def _run_signal_job() -> None:
             if min_factor_floor is not None:
                 mfs = result.get("min_factor_score")
                 if mfs is not None and mfs < min_factor_floor:
-                    effective_composite = min(composite, buy_threshold - 5.0)
+                    effective_composite = min(composite, buy_threshold - CFG.gates.min_factor_floor_penalty)
 
             # Minimum factor coverage before acting on a deterioration SELL: require at
             # least 3 of the 5 factors to have valid (non-null) scores. A composite built
@@ -3825,8 +3855,8 @@ def _run_signal_job() -> None:
             factor_coverage = sum(1 for v in result.get("factors", {}).values() if not v["null"])
 
             # Score deterioration exit — skip for transition regime (smoothed_bull_prob in [0.35, 0.65])
-            if in_pos and composite < 40.0 and hmm_regime != "transition":
-                if factor_coverage < 3:
+            if in_pos and composite < CFG.gates.deterioration_exit and hmm_regime != "transition":
+                if factor_coverage < CFG.gates.factor_coverage_min:
                     db.log_signal(ticker, composite, signal_label, "skipped",
                                   "insufficient_factor_coverage", price, atr,
                                   hmm_regime=hmm_regime, sentiment_score=sentiment,
@@ -3855,7 +3885,7 @@ def _run_signal_job() -> None:
                 continue
 
             # Gaussian-HMM regime gate: require ≥70% confidence in a bull regime to enter.
-            if smoothed_bull_prob < 0.70:
+            if smoothed_bull_prob < CFG.gates.hmm_bull_prob_min:
                 db.log_signal(ticker, composite, signal_label, "skipped", "bull_prob_below_threshold", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob, hmm_fit_failed=hmm_fit_failed)
@@ -3869,7 +3899,7 @@ def _run_signal_job() -> None:
                 continue
 
             # Negative sentiment hard filter
-            if sentiment is not None and sentiment < 35.0:
+            if sentiment is not None and sentiment < CFG.gates.sentiment_min:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
                               f"sentiment_too_low:{sentiment:.1f}", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
@@ -3898,7 +3928,7 @@ def _run_signal_job() -> None:
             price_ma20_ratio = result.get("price_ma20_ratio", 1.0)
             # Fix 2-B: use the true rolling-percentile momentum flag (matches backtest), not mom_score>=75
             top_quartile_mom = bool(result.get("top_quartile_mom", False))
-            if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):
+            if not top_quartile_mom and price_ma20_ratio > (1.0 + oe_thresh):  # oe_thresh resolved above
                 db.log_signal(ticker, effective_composite, "BUY", "skipped", "overextended", price, atr,
                               hmm_regime=hmm_regime, sentiment_score=sentiment,
                               smoothed_bull_prob=smoothed_bull_prob)
@@ -3907,7 +3937,8 @@ def _run_signal_job() -> None:
             ret_3m  = result.get("ret_3m_skip")
             ret_12m = result.get("ret_12m_skip")
             if ret_3m is not None and ret_12m is not None:
-                if (ret_3m + ret_12m) <= 0 or ret_3m < -0.10 or ret_12m < -0.10:
+                _mleg = CFG.gates.momentum_min_leg
+                if (ret_3m + ret_12m) <= 0 or ret_3m < _mleg or ret_12m < _mleg:
                     db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                   "momentum_disagreement", price, atr,
                                   hmm_regime=hmm_regime, sentiment_score=sentiment,
@@ -3919,7 +3950,7 @@ def _run_signal_job() -> None:
                 try:
                     last_exit = datetime.fromisoformat(perf["last_exit_at"])
                     days_since = _trading_days_between(last_exit, datetime.utcnow())
-                    if days_since < 2:
+                    if days_since < CFG.gates.reentry_cooldown_days:
                         db.log_signal(ticker, effective_composite, "BUY", "skipped",
                                       "reentry_cooldown", price, atr,
                                       hmm_regime=hmm_regime, sentiment_score=sentiment,
@@ -3928,7 +3959,7 @@ def _run_signal_job() -> None:
                 except Exception:
                     pass
             sector = _get_sector(ticker)
-            max_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+            max_sector = int(resolve("MAX_SECTOR_POSITIONS", CFG.gates.max_sector_positions))
             if sector != "Unknown" and open_sector_counts.get(sector, 0) >= max_sector:
                 db.log_signal(ticker, effective_composite, "BUY", "skipped",
                               "sector_concentration", price, atr,
@@ -4050,7 +4081,7 @@ def _run_signal_job() -> None:
     # Phase 5: single-source trailing-stop multiplier (ATR_STOP_MULT, default 2.5), read
     # once for the entry-seed writes below. Shared with the stop-loss job's ratchet and
     # both backtests.
-    atr_stop_mult = float(db.get_config("ATR_STOP_MULT", "2.5"))
+    atr_stop_mult = float(resolve("ATR_STOP_MULT", CFG.factors.atr_stop_mult))
     for c in buy_candidates:
         ticker, dollars, price, atr = c["ticker"], c["dollars"], c["price"], c["atr"]
         # Automated-trading toggle: skip new entries when paused (both "all" and
@@ -4161,7 +4192,7 @@ def _run_stoploss_job() -> None:
         spy_hist = yf.Ticker("SPY").history(period="10d")
         if len(spy_hist) >= 6:
             spy_5d_ret = (float(spy_hist["Close"].iloc[-1]) / float(spy_hist["Close"].iloc[-6]) - 1.0) * 100
-            if spy_5d_ret < -3.0:
+            if spy_5d_ret < CFG.gates.macro_drawdown_pct:
                 logger.warning("SPY 5-day return %.2f%% — macro_drawdown_protection, closing all", spy_5d_ret)
                 for pos in positions:
                     try:
@@ -4185,7 +4216,7 @@ def _run_stoploss_job() -> None:
     # once for both the seed and the ratchet recompute below. Existing stored stops are
     # never lowered — the ratchet's never-lower rule (candidate > stored_stop) still holds,
     # so a wider multiplier only widens NEW seeds and future ratchets, never tightens today.
-    atr_stop_mult = float(db.get_config("ATR_STOP_MULT", "2.5"))
+    atr_stop_mult = float(resolve("ATR_STOP_MULT", CFG.factors.atr_stop_mult))
     for pos in positions:
         ticker = pos.symbol
         try:
@@ -4200,12 +4231,13 @@ def _run_stoploss_job() -> None:
             # the position is user-locked, or when we already trimmed this holding — entry_log
             # is the current BUY, so a later re-entry resets the basis and re-arms the trim.
             current_return = (price - entry_price) / entry_price
-            if (current_return >= 0.15
+            if (current_return >= CFG.gates.profit_take_trigger
                     and not db.is_position_locked(ticker)
                     and not db.has_partial_close_since(ticker, entry_log["timestamp"])):
                 try:
+                    _pt_pct = str(int(CFG.gates.profit_take_fraction * 100))
                     api.close_position(
-                        ticker, close_options=AlpacaClosePositionRequest(percentage="50")
+                        ticker, close_options=AlpacaClosePositionRequest(percentage=_pt_pct)
                     )
                     _record_close(ticker, price, entry_price, "profit_take_half",
                                   entry_log, score=None)
@@ -4236,9 +4268,13 @@ def _run_stoploss_job() -> None:
                     db.update_trailing_stop(entry_log["id"], stored_stop)
 
             exit_reason = None
+            # Live max-hold now shares the BACKTEST_HOLD key with both backtests (decision 1;
+            # value unchanged at 21, no system_config override present). Python field is
+            # gates.max_hold_days; DB key name BACKTEST_HOLD is a flagged future rename.
+            max_hold_days = int(resolve("BACKTEST_HOLD", CFG.gates.max_hold_days))
             if stored_stop is not None and price < stored_stop:
                 exit_reason = "stop_loss"
-            elif hold_days > 21:
+            elif hold_days > max_hold_days:
                 exit_reason = "max_hold_exit"
             if exit_reason:
                 if _skip_if_locked(
@@ -4267,21 +4303,23 @@ def _run_adaptive_thresholds_job() -> None:
     """
     logger.info("▶ Adaptive thresholds job starting")
 
-    BULL_MIN, BULL_MAX = 63.0, 80.0
-    BEAR_MIN, BEAR_MAX = 75.0, 85.0
-    EWA_ALPHA = 0.15  # new = old * 0.85 + target * 0.15
-    MIN_TRADES = 5
+    BULL_MIN, BULL_MAX = CFG.adaptive.bull_min, CFG.adaptive.bull_max
+    BEAR_MIN, BEAR_MAX = CFG.adaptive.bear_min, CFG.adaptive.bear_max
+    EWA_ALPHA = CFG.adaptive.ewa_alpha  # new = old * 0.85 + target * 0.15
+    MIN_TRADES = CFG.adaptive.min_trades
 
-    bull_old = float(db.get_config("bull_threshold", "63"))
-    bear_old = float(db.get_config("bear_threshold", "80"))
+    bull_old = float(resolve("bull_threshold", CFG.thresholds.bull))
+    bear_old = float(resolve("bear_threshold", CFG.thresholds.bear))
+
+    _wr_lo, _wr_hi = CFG.adaptive.winrate_clip_low, CFG.adaptive.winrate_clip_high
 
     def _target_threshold(win_rate: float, t_min: float, t_max: float) -> float:
         """Linear map: 40% win rate → t_max (tighten), 60% win rate → t_min (loosen)."""
-        clipped = max(0.4, min(0.6, win_rate))
-        return t_max - (clipped - 0.4) / 0.2 * (t_max - t_min)
+        clipped = max(_wr_lo, min(_wr_hi, win_rate))
+        return t_max - (clipped - _wr_lo) / CFG.adaptive.winrate_span * (t_max - t_min)
 
-    bull_trades = db.get_last_n_trades_by_regime(50, regime="bull")
-    bear_trades = db.get_last_n_trades_by_regime(50, regime="bear")
+    bull_trades = db.get_last_n_trades_by_regime(CFG.adaptive.lookback_trades, regime="bull")
+    bear_trades = db.get_last_n_trades_by_regime(CFG.adaptive.lookback_trades, regime="bear")
 
     bull_new = bull_old
     bull_win_rate = None
@@ -4335,8 +4373,8 @@ def _run_adaptive_thresholds_job() -> None:
 @app.get("/api/analytics")
 def get_analytics():
     stats = db.get_analytics_data()
-    bull_threshold = float(db.get_config("bull_threshold", "63"))
-    bear_threshold = float(db.get_config("bear_threshold", "80"))
+    bull_threshold = float(resolve("bull_threshold", CFG.thresholds.bull))
+    bear_threshold = float(resolve("bear_threshold", CFG.thresholds.bear))
     thresholds_updated = db.get_config("thresholds_last_updated", "") or None
     last_signal_job    = db.get_config("last_signal_job_at", "") or None
     last_stoploss_job  = db.get_config("last_stoploss_job_at", "") or None
@@ -4654,7 +4692,7 @@ def api_paper_positions():
     # Phase 5: display fallback uses the same single-source ATR_STOP_MULT (default 2.5) the
     # trader seeds new stops with, so a position without a stored stop yet shows the level
     # the system would actually place.
-    atr_stop_mult = float(db.get_config("ATR_STOP_MULT", "2.5"))
+    atr_stop_mult = float(resolve("ATR_STOP_MULT", CFG.factors.atr_stop_mult))
     for pos in positions:
         ticker      = pos.symbol
         entry_price = float(pos.avg_entry_price)
@@ -4709,7 +4747,7 @@ def api_paper_sector_exposure():
     except Exception as e:
         return {"available": False, "error": str(e)}
 
-    max_per_sector = int(db.get_config("MAX_SECTOR_POSITIONS", "3"))
+    max_per_sector = int(resolve("MAX_SECTOR_POSITIONS", CFG.gates.max_sector_positions))
     # Bucket per sector, tracking just the ticker list (slot usage, not dollars).
     buckets: dict[str, list[str]] = {}
     for pos in positions:
@@ -5261,8 +5299,8 @@ def _build_decision_trail(ticker: str) -> dict:
     }
     try:
         # Display context only: the thresholds the gate uses (read from config, not recomputed).
-        bull_thr = float(db.get_config("bull_threshold", "63"))
-        bear_thr = float(db.get_config("bear_threshold", "80"))
+        bull_thr = float(resolve("bull_threshold", CFG.thresholds.bull))
+        bear_thr = float(resolve("bear_threshold", CFG.thresholds.bear))
         # Without re-running the macro check we can't know which applied; show the lower
         # (bull) threshold as the optimistic bar a passing score cleared.
         ctx["threshold"] = bull_thr

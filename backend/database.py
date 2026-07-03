@@ -727,6 +727,18 @@ def get_config(key: str, default: str = "") -> str:
     return row["value"] if row else default
 
 
+def get_config_opt(key: str) -> Optional[str]:
+    """Return the stored value for `key`, or None when the key isn't set.
+
+    Distinguishes "absent" from "set to empty string" — used by config.resolve to decide
+    whether a DB override shadows a config default."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM system_config WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else None
+
+
 def set_config(key: str, value: str) -> None:
     with _conn() as conn:
         conn.execute(
