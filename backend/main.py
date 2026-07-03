@@ -782,6 +782,9 @@ def get_backtest(ticker: str):
     exit_threshold = 40.0
     # Profit-take: close half at +15% above entry (parity with live + portfolio backtest).
     PROFIT_TAKE_PCT = 0.15
+    # Phase 4d: same weight source as live (per-ticker overrides merged over defaults),
+    # loaded once per run. See _backtest_composite's docstring.
+    factor_weights_bt = _load_ticker_weights(ticker)
 
     if n < TRAIN + TEST:
         raise HTTPException(status_code=400, detail="Need at least 2 years of history for backtest")
@@ -919,7 +922,7 @@ def get_backtest(ticker: str):
             # treated as unavailable and the surviving weights renormalise — the exact
             # mechanism the live engine uses when a factor is null. Entry mirrors live:
             # enter when this composite clears the buy threshold (no discrete Markov).
-            composite = _backtest_composite(closes[: idx + 1])
+            composite = _backtest_composite(closes[: idx + 1], factor_weights_bt)
             if composite is None:
                 composite = 0.0
 
@@ -1240,20 +1243,25 @@ def _vol_trend_score(
     return float(np.clip(score, 0, 100)), detail
 
 
-def _backtest_composite(closes: np.ndarray) -> float | None:
+def _backtest_composite(closes: np.ndarray, weights: dict[str, float]) -> float | None:
     """Composite score for the walk-forward backtests, from the factors that *can* be
     reconstructed point-in-time from price history alone: momentum and vol-adjusted
     trend. Earnings, insider, and sentiment have no historical per-day source, so they
     are treated as unavailable and the two surviving weights are renormalised — the same
     null-factor renormalisation the live composite (_compute_factors) applies. Returns
-    None when neither factor has enough history yet."""
+    None when neither factor has enough history yet.
+
+    Phase 4d: `weights` is required and callers must pass _load_ticker_weights(ticker)
+    (loaded once per ticker per run), so a future factor_weight_overrides.json is picked
+    up here exactly as live does — previously this read DEFAULT_FACTOR_WEIGHTS directly,
+    which guaranteed silent live/backtest divergence the day an override file appeared."""
     available: list[tuple[float, float]] = []  # (weight, score)
     mom = _momentum_score(closes)
     if mom is not None:
-        available.append((DEFAULT_FACTOR_WEIGHTS["momentum"], mom))
+        available.append((weights["momentum"], mom))
     vt, _ = _vol_trend_score(closes)
     if vt is not None:
-        available.append((DEFAULT_FACTOR_WEIGHTS["vol_trend"], vt))
+        available.append((weights["vol_trend"], vt))
     total_w = sum(w for w, _ in available)
     if total_w <= 0:
         return None
@@ -2575,6 +2583,12 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
             ret = np.diff(c) / c[:-1]
             features[t] = (c, ret)
 
+        # Phase 4d: same weight source as live (per-ticker overrides merged over
+        # defaults), loaded once per ticker per run. See _backtest_composite's docstring.
+        factor_weights_pb: dict[str, dict[str, float]] = {
+            t: _load_ticker_weights(t) for t in valid
+        }
+
         # Change 1: 7bps commission + 0.1% slippage per side
         TC_PER_SIDE_PB = 0.0017
         # Entry/exit now mirror the live trader and the single-ticker backtest: allocate
@@ -2740,7 +2754,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     composites_window[t] = 0.0
                     continue
                 rvols[t] = tr_rets[-21:].std() * np.sqrt(252)
-                composite = _backtest_composite(c[: te + 1])
+                composite = _backtest_composite(c[: te + 1], factor_weights_pb[t])
                 composites_window[t] = composite if composite is not None else 0.0
 
                 # Fix 3 — HMM bull-confidence gate (issue 10). Per-bar smoothed HMM state
@@ -2950,7 +2964,7 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                             trail_stops_pb.pop(t, None)
                             continue
 
-                    composite = _backtest_composite(c_t[: idx + 1])
+                    composite = _backtest_composite(c_t[: idx + 1], factor_weights_pb[t])
                     if composite is not None and composite < exit_threshold:
                         # Apply exit cost proportional to this position's weight
                         portfolio_val *= (1.0 - TC_PER_SIDE_PB * live_weights[t])
