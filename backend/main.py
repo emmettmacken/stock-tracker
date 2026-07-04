@@ -21,7 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import yfinance as yf
-from yfinance.exceptions import YFTzMissingError, YFRateLimitError, YFTickerMissingError
+from yfinance.exceptions import (
+    YFTzMissingError, YFRateLimitError, YFTickerMissingError, YFPricesMissingError,
+)
 from hmmlearn import hmm
 import httpx
 from bs4 import BeautifulSoup
@@ -518,6 +520,7 @@ def fetch_ohlcv_window(
     prepost: bool = False,
     min_bars: int = 2,
     max_retries: int = 3,
+    empty_ok: bool = False,
 ) -> pd.DataFrame:
     """Fetch OHLCV at a given interval/window for the stock-chart price-history endpoint.
 
@@ -526,7 +529,13 @@ def fetch_ohlcv_window(
     15m ≤ 60d), which is fine since 1D/1W are recent by definition. Separate from fetch_ohlcv
     (the 760-day signal window) and fetch_ohlcv_max (full daily history) so none constrains
     the others. Pass either `start`/`end` (e.g. 1D's rolling 24h window, or YTD's Jan 1) or
-    `yf_period` (e.g. "1mo"). `prepost=True` includes pre-market/after-hours bars (intraday)."""
+    `yf_period` (e.g. "1mo"). `prepost=True` includes pre-market/after-hours bars (intraday).
+
+    `empty_ok=True` distinguishes "valid ticker, no bars in this window" (market closed / empty
+    range → yfinance's YFPricesMissingError) from "ticker doesn't exist": the former returns an
+    empty frame instead of raising, letting the 1D caller fall back to the last session rather
+    than surfacing a spurious 404. A genuinely missing ticker (YFTzMissingError / YFTickerMissingError
+    proper, or "Quote not found") still raises 404 regardless of this flag."""
     last_exc = None
     for attempt in range(max_retries):
         try:
@@ -552,6 +561,16 @@ def fetch_ohlcv_window(
             raise
         except Exception as exc:
             last_exc = exc
+            # YFPricesMissingError = valid ticker but zero bars in the requested window
+            # (market closed / empty range). It subclasses YFTickerMissingError, so it MUST be
+            # checked first — otherwise an empty window is misreported as "ticker not found".
+            # With empty_ok the caller (1D) wants an empty frame to trigger its last-session
+            # fallback; without it, keep the legacy "insufficient data" 404.
+            if isinstance(exc, YFPricesMissingError):
+                if empty_ok:
+                    return pd.DataFrame(columns=["High", "Low", "Close", "Volume"],
+                                        index=pd.DatetimeIndex([]))
+                raise HTTPException(status_code=404, detail=f"Insufficient data for '{ticker}'")
             if "Quote not found" in str(exc) or isinstance(exc, YFTickerMissingError):
                 raise HTTPException(status_code=404, detail=f"'{ticker}' not found")
             if _transient(exc):
@@ -642,6 +661,11 @@ _CHART_DAILY_DAYS = {"1M": 31, "3M": 92, "1Y": 366}
 # from the very first visible bar. 200 trading days ≈ 290 calendar days (weekends/holidays);
 # this lead-in is returned in `points` but trimmed from the chart via `visible_from`.
 _MA_LEAD_IN_DAYS = 290
+# When 1D's rolling-24h window is empty (weekend / holiday / before the open), look back up to
+# this many calendar days of intraday bars and show the most recent session that has data, so the
+# chart renders "last session" instead of hard-failing. 7 days spans any long-weekend/holiday
+# gap while staying inside yfinance's ~8-day-per-request cap on 1-minute bars.
+_CHART_1D_FALLBACK_DAYS = 7
 
 
 @app.get("/api/price-history/{ticker}")
@@ -678,15 +702,36 @@ def get_price_history(ticker: str, days: int = 760, period: Optional[str] = None
         spec = _CHART_INTRADAY_SPEC.get(period)
         if spec:
             if spec.get("window_hours"):
+                # 1D: rolling 24h intraday window. When it's empty (weekend / holiday / pre-open)
+                # yfinance raises YFPricesMissingError — empty_ok=True turns that into an empty
+                # frame so we fall back to the most recent session that has bars instead of 404ing.
                 end = datetime.now(timezone.utc)
                 start = end - timedelta(hours=spec["window_hours"])
+                prepost = spec.get("prepost", False)
                 df = fetch_ohlcv_window(ticker, interval=spec["interval"],
                                         start=start, end=end,
-                                        prepost=spec.get("prepost", False), min_bars=2)
-            else:
-                df = fetch_ohlcv_window(ticker, interval=spec["interval"],
-                                        yf_period=spec["yf_period"],
-                                        prepost=spec.get("prepost", False), min_bars=2)
+                                        prepost=prepost, min_bars=2, empty_ok=True)
+                if df.empty:
+                    wide = fetch_ohlcv_window(
+                        ticker, interval=spec["interval"],
+                        start=end - timedelta(days=_CHART_1D_FALLBACK_DAYS), end=end,
+                        prepost=prepost, min_bars=2, empty_ok=True)
+                    if wide.empty:
+                        # No bars in the last week either: resolvable ticker with no recent
+                        # trading. Return an explicit empty payload rather than fabricating data.
+                        return {"ticker": ticker, "period": period, "intraday": True,
+                                "market_closed": True, "session_date": None, "points": []}
+                    last_session = wide.index[-1].date()
+                    df = wide[[ts.date() == last_session for ts in wide.index]]
+                    return {"ticker": ticker, "period": period, "intraday": True,
+                            "market_closed": True, "session_date": last_session.isoformat(),
+                            "points": _project_points(df, intraday=True)}
+                return {"ticker": ticker, "period": period, "intraday": True,
+                        "market_closed": False,
+                        "points": _project_points(df, intraday=True)}
+            df = fetch_ohlcv_window(ticker, interval=spec["interval"],
+                                    yf_period=spec["yf_period"],
+                                    prepost=spec.get("prepost", False), min_bars=2)
             return {"ticker": ticker, "period": period, "intraday": True,
                     "points": _project_points(df, intraday=True)}
 

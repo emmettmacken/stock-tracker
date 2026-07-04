@@ -246,6 +246,10 @@ export interface PriceHistory {
   intraday?: boolean;   // true for 1D/1W — `date` carries a full ISO timestamp, not YYYY-MM-DD
   visible_from?: string; // daily periods only: ISO date where the chart should start drawing
                          // (points before it are MA lead-in and must be trimmed from the axis)
+  market_closed?: boolean; // 1D only: true when the rolling-24h window was empty and `points`
+                           // are the most recent completed session instead of live intraday.
+  session_date?: string | null; // 1D + market_closed: ISO date of the session being shown (null
+                                 // if no recent session had any bars).
   points: PricePoint[];
 }
 

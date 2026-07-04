@@ -74,6 +74,9 @@ export function PriceChart({
   // ISO date the chart should start drawing from (daily periods only). Points before it are
   // MA lead-in: used to compute MA50/MA200 but trimmed off the axis. null = draw everything.
   const [visibleFrom, setVisibleFrom] = useState<string | null>(null);
+  // 1D only: set when the live rolling-24h window was empty (weekend / holiday / pre-open) and
+  // the chart is instead showing the most recent completed session (`marketClosedDate`).
+  const [marketClosedDate, setMarketClosedDate] = useState<string | null>(null);
   const [trades, setTrades] = useState<TradeOutcome[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -97,7 +100,12 @@ export function PriceChart({
     setError(null);
     setActiveIndex(null);
     fetchPriceHistory(ticker, { period })
-      .then((d) => { if (!cancelled) { setPoints(d.points); setVisibleFrom(d.visible_from ?? null); } })
+      .then((d) => {
+        if (cancelled) return;
+        setPoints(d.points);
+        setVisibleFrom(d.visible_from ?? null);
+        setMarketClosedDate(d.market_closed ? (d.session_date ?? null) : null);
+      })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load prices"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -238,6 +246,12 @@ export function PriceChart({
               <span className={periodChange >= 0 ? "text-emerald-400" : "text-red-400"}>
                 {periodChange >= 0 ? "+" : ""}{periodChange.toFixed(1)}%
               </span>
+            </span>
+          )}
+          {marketClosedDate && (
+            <span className="inline-flex items-center gap-1.5 rounded-md bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-400">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
+              Markets closed — showing last session ({fmtShortDate(marketClosedDate)})
             </span>
           )}
         </div>
