@@ -2606,6 +2606,15 @@ def portfolio_sizing(req: SizingRequest):
 # PORTFOLIO BACKTEST
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Optional, default-OFF observability tap for the portfolio backtest. Production leaves this
+# None, so the guarded call sites below are inert and the backtest is untouched. The local
+# diagnostics tooling (scripts/diagnostics.py) sets it to a collector to reconstruct a
+# per-trade log; ALL derived-metric computation (hold, MFE, mult-to-hold, …) lives there, not
+# here — main.py only emits raw entry/exit primitives. Not thread-safe (set it for a single
+# in-process run); the live API never touches it.
+TRADE_TAP = None  # object with .context(...), .entry(...), .exit(...) or None
+
+
 class PortfolioBacktestRequest(BaseModel):
     tickers: list[str]
     capital: float = 10000.0
@@ -2784,6 +2793,11 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
         # rebalance is not a "non-signal exit" and must not trigger a cooldown (every ticker
         # would otherwise sit 1 day from its prior window and never re-enter).
         last_exit_idx: dict[str, int] = {t: -100 for t in valid}
+
+        # Dormant diagnostics tap (no-op in production; see module-level TRADE_TAP). Hands the
+        # collector the read-only arrays it needs to compute per-trade metrics after the run.
+        if TRADE_TAP is not None:
+            TRADE_TAP.context(features, atr_series_pb, dates_idx, PROFIT_TAKE_PCT)
 
         # Phase 4c (item 3): point-in-time win-rate performance multiplier, mirroring the
         # ×1.2/×0.7 multiplier _position_dollars derives from ticker_performance. Live's
@@ -2990,6 +3004,8 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                     if t not in entry_prices_bt:
                         _px = float(combined_arr[test_start, valid.index(t)])
                         entry_prices_bt[t] = _px
+                        if TRADE_TAP is not None:
+                            TRADE_TAP.entry(t, test_start, _px)
                         _a = atr_series_pb[t][test_start]
                         _atr0 = float(_a) if not np.isnan(_a) and _a > 0 else _px * bcfg.factors.atr_fallback_pct
                         trail_stops_pb[t] = _px - atr_mult_pb * _atr0
@@ -3004,6 +3020,8 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                         sim_outcomes[t].append(
                             (test_start, (_exit_px - _entry_px) / _entry_px)
                         )
+                        if TRADE_TAP is not None:
+                            TRADE_TAP.exit(t, test_start, _exit_px, "window_boundary")
                     entry_prices_bt.pop(t, None)
                     profit_taken_bt.discard(t)
                     trail_stops_pb.pop(t, None)
@@ -3037,6 +3055,8 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                             sim_outcomes[t].append(
                                 (idx, (float(c_t[idx]) - entry_px) / entry_px)
                             )
+                            if TRADE_TAP is not None:
+                                TRADE_TAP.exit(t, idx, float(c_t[idx]), "profit_take")
                             continue
 
                     # Trailing ATR stop (parity with live / single-ticker backtest): ratchet
@@ -3060,6 +3080,8 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                                 sim_outcomes[t].append(
                                     (idx, (float(c_t[idx]) - _entry_px) / _entry_px)
                                 )
+                                if TRADE_TAP is not None:
+                                    TRADE_TAP.exit(t, idx, float(c_t[idx]), "stop_loss")
                             entry_prices_bt.pop(t, None)
                             profit_taken_bt.discard(t)
                             trail_stops_pb.pop(t, None)
@@ -3077,6 +3099,8 @@ def portfolio_backtest(req: PortfolioBacktestRequest):
                             sim_outcomes[t].append(
                                 (idx, (float(c_t[idx]) - _entry_px) / _entry_px)
                             )
+                            if TRADE_TAP is not None:
+                                TRADE_TAP.exit(t, idx, float(c_t[idx]), "mid_window")
                         # Full exit: clear the profit-take basis so a re-entry starts fresh.
                         entry_prices_bt.pop(t, None)
                         profit_taken_bt.discard(t)
