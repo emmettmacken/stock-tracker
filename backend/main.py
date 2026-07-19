@@ -4363,19 +4363,45 @@ def _run_stoploss_job() -> None:
     logger.info("◀ Stop-loss job done")
 
 
+# Phase-5 deploy (commit 82c041b, 2026-07-03) changed sizing, stops, and exits enough
+# that trades entered before it don't represent the current system. The adaptive job must
+# tune only on trades whose ENTRY is on/after this date — using the pre-Phase-5 cohort is
+# what tightened the bar into the freeze trap in the first place.
+ADAPTIVE_COHORT_START = "2026-07-03"
+# Minimum qualifying (post-cohort) closed trades before a win-rate is trusted to move the
+# bar. Higher than CFG.adaptive.min_trades because excluding the legacy cohort shrinks the
+# admissible sample — we'd rather hold the bar steady than tune on a handful of trades.
+ADAPTIVE_MIN_POST_PHASE5_TRADES = 10
+# No-fill relaxation: if the strategy has placed zero entries over this many trading days
+# while the bull bar sits above its floor, step the bar down. This is the escape hatch from
+# the freeze trap — win-rate tuning alone can only react to CLOSED trades, so with no
+# entries the bar would otherwise stay frozen forever.
+ADAPTIVE_NOFILL_TRADING_DAYS = 10
+ADAPTIVE_NOFILL_STEP = 1.0
+
+
 def _run_adaptive_thresholds_job() -> None:
     """
     Change 4: Weekly job — adjust buy thresholds using last 50 trades per regime.
     Uses continuous EWA update (not discrete ±5 steps) to avoid threshold jumps.
     Bull and bear thresholds adapt independently using trades from matching regime.
     Old and new thresholds are logged to diagnostic_snapshots for audit.
+
+    Gated behind the DB flag ``adaptive_thresholds_enabled`` (default false) so it can be
+    paused/re-enabled by a config flip, not a deploy. When it runs, it tunes only on the
+    post-Phase-5 cohort (>= ADAPTIVE_COHORT_START), requires a minimum sample, and applies
+    a no-fill relaxation guardrail — see the freeze-trap fix.
     """
+    if db.get_config("adaptive_thresholds_enabled", "false").lower() != "true":
+        logger.info("adaptive thresholds: disabled, skipping")
+        return
+
     logger.info("▶ Adaptive thresholds job starting")
 
     BULL_MIN, BULL_MAX = CFG.adaptive.bull_min, CFG.adaptive.bull_max
     BEAR_MIN, BEAR_MAX = CFG.adaptive.bear_min, CFG.adaptive.bear_max
     EWA_ALPHA = CFG.adaptive.ewa_alpha  # new = old * 0.85 + target * 0.15
-    MIN_TRADES = CFG.adaptive.min_trades
+    MIN_TRADES = ADAPTIVE_MIN_POST_PHASE5_TRADES  # post-Phase-5 min sample (legacy cohort excluded)
 
     bull_old = float(resolve("bull_threshold", CFG.thresholds.bull))
     bear_old = float(resolve("bear_threshold", CFG.thresholds.bear))
@@ -4387,8 +4413,11 @@ def _run_adaptive_thresholds_job() -> None:
         clipped = max(_wr_lo, min(_wr_hi, win_rate))
         return t_max - (clipped - _wr_lo) / CFG.adaptive.winrate_span * (t_max - t_min)
 
-    bull_trades = db.get_last_n_trades_by_regime(CFG.adaptive.lookback_trades, regime="bull")
-    bear_trades = db.get_last_n_trades_by_regime(CFG.adaptive.lookback_trades, regime="bear")
+    # Cohort filter: only trades that entered on/after the Phase-5 deploy are admissible.
+    bull_trades = db.get_last_n_trades_by_regime(
+        CFG.adaptive.lookback_trades, regime="bull", entry_since=ADAPTIVE_COHORT_START)
+    bear_trades = db.get_last_n_trades_by_regime(
+        CFG.adaptive.lookback_trades, regime="bear", entry_since=ADAPTIVE_COHORT_START)
 
     bull_new = bull_old
     bull_win_rate = None
@@ -4400,7 +4429,8 @@ def _run_adaptive_thresholds_job() -> None:
         logger.info("Bull: win_rate=%.2f target=%.1f old=%.2f new=%.2f (n=%d)",
                     bull_win_rate, bull_target, bull_old, bull_new, len(bull_trades))
     else:
-        logger.info("Bull: skipping — only %d trades (need %d)", len(bull_trades), MIN_TRADES)
+        logger.info("adaptive thresholds: insufficient post-Phase-5 sample (n=%d), bull unchanged",
+                    len(bull_trades))
 
     bear_new = bear_old
     bear_win_rate = None
@@ -4412,7 +4442,25 @@ def _run_adaptive_thresholds_job() -> None:
         logger.info("Bear: win_rate=%.2f target=%.1f old=%.2f new=%.2f (n=%d)",
                     bear_win_rate, bear_target, bear_old, bear_new, len(bear_trades))
     else:
-        logger.info("Bear: skipping — only %d trades (need %d)", len(bear_trades), MIN_TRADES)
+        logger.info("adaptive thresholds: insufficient post-Phase-5 sample (n=%d), bear unchanged",
+                    len(bear_trades))
+
+    # No-fill relaxation guardrail: break the freeze trap. If no entries have been placed
+    # over the recent trading-day window and the bull bar is above its floor, step it down.
+    # Runs regardless of the win-rate path above — the frozen case is precisely when there
+    # are no closed trades to move the bar, so this is the only lever that still works.
+    nofill_cutoff = np.datetime_as_string(
+        np.busday_offset(np.datetime64(datetime.utcnow().date(), "D"),
+                         -ADAPTIVE_NOFILL_TRADING_DAYS, roll="backward"),
+        unit="D",
+    )
+    orders_in_window = db.count_ordered_since(nofill_cutoff)
+    nofill_relaxed = False
+    if orders_in_window == 0 and bull_new > BULL_MIN:
+        bull_new = max(BULL_MIN, round(bull_new - ADAPTIVE_NOFILL_STEP, 2))
+        nofill_relaxed = True
+        logger.info("adaptive thresholds: no fills since %s (%d trading days) — relaxing bull bar to %.2f",
+                    nofill_cutoff, ADAPTIVE_NOFILL_TRADING_DAYS, bull_new)
 
     now = datetime.utcnow().isoformat()
     db.set_config("bull_threshold", str(bull_new))
@@ -4429,6 +4477,10 @@ def _run_adaptive_thresholds_job() -> None:
         "bull_win_rate":    round(bull_win_rate, 4) if bull_win_rate is not None else None,
         "bear_win_rate":    round(bear_win_rate, 4) if bear_win_rate is not None else None,
         "ewa_alpha":        EWA_ALPHA,
+        "cohort_start":     ADAPTIVE_COHORT_START,
+        "min_sample":       ADAPTIVE_MIN_POST_PHASE5_TRADES,
+        "orders_in_window": orders_in_window,
+        "nofill_relaxed":   nofill_relaxed,
     }
     db.save_diagnostic("threshold_audit", audit)
     logger.info("◀ Adaptive thresholds done: bull %.2f→%.2f bear %.2f→%.2f",

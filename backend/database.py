@@ -212,6 +212,7 @@ def _run_migrations() -> None:
         if purged:
             print(f"[migrations] purged {purged} invalid (<=0) equity_snapshots rows")
     _migrate_config_baselines()
+    _migrate_threshold_freeze_trap_reset()
 
 
 def _migrate_config_baselines() -> None:
@@ -231,6 +232,37 @@ def _migrate_config_baselines() -> None:
     set_config("bear_threshold", "80")
     set_config(MARKER, datetime.utcnow().isoformat())
     print("[migrations] reset threshold baseline → bull 63 / bear 80 (one-time)")
+
+
+def _migrate_threshold_freeze_trap_reset() -> None:
+    """One-time reset of the adaptive-threshold freeze trap.
+
+    The weekly adaptive-thresholds job tightened bull_threshold 63→66→68 using the
+    win-rate of trades that all ENTERED before the Phase-5 deploy (commit 82c041b,
+    2026-07-03). Those trades are methodologically inadmissible for tuning the
+    post-Phase-5 system, and the tightening created a deadlock: a higher bar produced
+    zero entries, so no new trades closed, so the win-rate input froze and the bar
+    could never relax. Reset bull/bear to the Phase-5 baseline once — guarded by its
+    own marker key (independent of threshold_baseline_v2_applied) so a later legitimate
+    adaptive adjustment isn't clobbered on every restart.
+    """
+    MARKER = "threshold_freeze_trap_reset_v1_applied"
+    if get_config(MARKER):
+        return
+    bull_old = get_config("bull_threshold", "")
+    bear_old = get_config("bear_threshold", "")
+    now = datetime.utcnow().isoformat()
+    set_config("bull_threshold", "63")
+    set_config("bear_threshold", "80")
+    set_config(MARKER, now)
+    save_diagnostic("threshold_audit", {
+        "timestamp": now,
+        "event":     "freeze_trap_reset",
+        "bull_old":  bull_old, "bull_new": "63",
+        "bear_old":  bear_old, "bear_new": "80",
+        "reason":    "reset: adaptive job tightened on pre-Phase-5 legacy cohort; freeze-trap",
+    })
+    print(f"[migrations] freeze-trap reset → bull {bull_old or '?'}/{bear_old or '?'} → 63/80 (one-time)")
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -594,20 +626,37 @@ def get_trade_history() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_last_n_trades_by_regime(n: int = 50, regime: Optional[str] = None) -> list[dict]:
-    """Return last n closed trades, optionally filtered to a specific HMM regime (bull/bear)."""
+def get_last_n_trades_by_regime(
+    n: int = 50, regime: Optional[str] = None, entry_since: Optional[str] = None
+) -> list[dict]:
+    """Return last n closed trades, optionally filtered to a specific HMM regime (bull/bear).
+
+    ``entry_since`` (an ISO date/timestamp) restricts to trades whose ENTRY — the
+    timestamp of the referenced signal_log row — is on/after the cutoff. The adaptive
+    threshold job uses this to exclude the pre-Phase-5 legacy cohort. Trades whose entry
+    row can't be resolved (null/missing entry_signal_id) have a NULL entry_timestamp and
+    are excluded by the comparison, which is the intended conservative behavior: a trade
+    whose entry date can't be confirmed is not admitted to tuning.
+    """
+    clauses: list[str] = []
+    params: list = []
+    if regime:
+        clauses.append("t.regime_at_entry = ?")
+        params.append(regime)
+    if entry_since:
+        clauses.append("sl.timestamp >= ?")
+        params.append(entry_since)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(n)
     with _conn() as conn:
-        if regime:
-            rows = conn.execute(
-                """SELECT * FROM trade_outcomes
-                   WHERE regime_at_entry = ?
-                   ORDER BY exit_timestamp DESC LIMIT ?""",
-                (regime, n),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC LIMIT ?", (n,)
-            ).fetchall()
+        rows = conn.execute(
+            f"""SELECT t.*, sl.timestamp AS entry_timestamp
+                FROM trade_outcomes t
+                LEFT JOIN signal_log sl ON t.entry_signal_id = sl.id
+                {where}
+                ORDER BY t.exit_timestamp DESC LIMIT ?""",
+            params,
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -775,6 +824,18 @@ def set_automated_trading_mode(mode: str) -> None:
 
 
 # ── Gate stats queries ───────────────────────────────────────────────────────
+
+def count_ordered_since(cutoff_iso: str) -> int:
+    """Count filled entries (signal_log rows with action='ordered') since the cutoff.
+
+    Used by the adaptive-threshold job's no-fill relaxation guardrail to detect a
+    stretch with zero entries (the freeze-trap condition)."""
+    with _conn() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM signal_log WHERE action = 'ordered' AND timestamp >= ?",
+            (cutoff_iso,),
+        ).fetchone()[0])
+
 
 def count_buy_evaluations(cutoff: str) -> int:
     # Fix 2-G: exclude stop-loss 'closed' rows so ticker-days with only a close don't
